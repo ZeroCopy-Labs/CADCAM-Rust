@@ -1,0 +1,5 @@
+# Pin the GNU toolchain used by Cargo and wgpu/Bevy.
+[toolchain]
+channel = "1.99.1-x86_64-pc-windows-gnu"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

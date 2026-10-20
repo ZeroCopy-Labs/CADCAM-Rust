@@ -1,0 +1,4 @@
+{
+    // Keep rust-analyzer's check/build artifacts inside the project build tree.
+    "rust-analyzer.cargo.targetDir": "build/cargo/rust-analyzer"
+}

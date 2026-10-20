@@ -1,0 +1,10 @@
+[package]
+name = "cad-app"
+version = "0.1.0"
+edition = "2021"
+description = "Bevy + wgpu viewer for the CAD core"
+
+[dependencies]
+cad-core = { path = "../cad-core" }
+bevy = { version = "0.20.0", default-features = false, features = ["2d"] }
+bevy_egui = "0.43.1"

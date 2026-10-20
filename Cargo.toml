@@ -1,0 +1,5 @@
+# Rust workspace: CAD core + Bevy/wgpu viewer.
+[workspace]
+resolver = "2"
+members = ["crates/cad-core", "crates/cad-app"]
+default-members = ["crates/cad-app"]

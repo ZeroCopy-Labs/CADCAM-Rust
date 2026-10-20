@@ -1,0 +1,9 @@
+# Pure Rust core. Keep this crate free of UI and rendering dependencies.
+[package]
+name = "cad-core"
+version = "0.1.0"
+edition = "2021"
+description = "DXF/DWG import and the internal CAD document model (pure Rust, no UI)"
+
+[dependencies]
+acadrust = "0.6.5"

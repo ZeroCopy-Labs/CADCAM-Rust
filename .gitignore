@@ -1,0 +1,5 @@
+# Build outputs and local-only files.
+/build/
+/target/
+/Cargo.lock
+/temp/
