@@ -13,8 +13,8 @@ pub struct RotaryConfig {
     pub a_offset_degrees: f64,
     pub machining_z_offset: f64,
     pub rotation_safety_clearance: f64,
+    pub same_zone_clearance: f64,
     pub overcut_distance: f64,
-    pub feed: f64,
 }
 
 impl Default for RotaryConfig {
@@ -23,8 +23,8 @@ impl Default for RotaryConfig {
             a_offset_degrees: 0.0,
             machining_z_offset: 0.0,
             rotation_safety_clearance: 5.0,
+            same_zone_clearance: 0.0,
             overcut_distance: 0.0,
-            feed: 1000.0,
         }
     }
 }
@@ -75,9 +75,17 @@ pub struct TrajectoryUnitRange {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct UnitRuleKeys {
+    pub entity_type: String,
+    pub layer: String,
+    pub color: String,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct MachineTrajectory {
     pub moves: Vec<MachineMove>,
     pub unit_ranges: Vec<TrajectoryUnitRange>,
+    pub unit_rules: Vec<UnitRuleKeys>,
     pub cutting_move_count: usize,
     pub safe_z: f64,
     pub unit_count: usize,
@@ -113,9 +121,12 @@ pub fn build_trajectory(
     let safe_z = center_z + max_radius + config.rotation_safety_clearance;
     let mut moves = Vec::new();
     let mut unit_ranges = Vec::new();
+    let mut unit_rules = Vec::new();
     let mut cutting_move_count = 0usize;
     let mut unit_count = 0usize;
     let mut previous_a = 0.0f64;
+    let mut previous_end: Option<MachinePose> = None;
+    let mut previous_zone: Option<TubeZone> = None;
 
     for group in &analysis.plan.groups {
         for unit in &group.units {
@@ -209,21 +220,83 @@ pub fn build_trajectory(
             let last = poses.last().copied().unwrap_or(first);
             let start_index = moves.len();
 
-            // Rotate at a safe height, approach, cut, then retract before the
-            // next unit can perform a rapid transfer.
-            moves.push(MachineMove {
-                kind: MachineMoveKind::Rapid,
-                pose: MachinePose {
-                    x: first.x,
-                    y: first.y,
-                    z: safe_z,
-                    a: first.a,
-                },
-            });
-            moves.push(MachineMove {
-                kind: MachineMoveKind::Rapid,
-                pose: first,
-            });
+            let same_zone = previous_end
+                .map(|previous| {
+                    previous_zone == Some(unit.zone) && (previous.a - first.a).abs() <= 1.0e-6
+                })
+                .unwrap_or(false);
+            if let Some(previous) = previous_end {
+                if same_zone && config.same_zone_clearance <= 1.0e-9 {
+                    // Same face, same A, zero clearance: rapid on the surface.
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: first,
+                    });
+                } else if same_zone {
+                    // Same face with a small clearance: local lift, lateral
+                    // move at the clearance height, then drop.
+                    let lift_z = (previous.z + config.same_zone_clearance).min(safe_z);
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: MachinePose {
+                            x: previous.x,
+                            y: previous.y,
+                            z: lift_z,
+                            a: previous.a,
+                        },
+                    });
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: MachinePose {
+                            x: first.x,
+                            y: first.y,
+                            z: lift_z,
+                            a: first.a,
+                        },
+                    });
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: first,
+                    });
+                } else {
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: MachinePose {
+                            x: previous.x,
+                            y: previous.y,
+                            z: safe_z,
+                            a: previous.a,
+                        },
+                    });
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: MachinePose {
+                            x: first.x,
+                            y: first.y,
+                            z: safe_z,
+                            a: first.a,
+                        },
+                    });
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Rapid,
+                        pose: first,
+                    });
+                }
+            } else {
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: MachinePose {
+                        x: first.x,
+                        y: first.y,
+                        z: safe_z,
+                        a: first.a,
+                    },
+                });
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: first,
+                });
+            }
             if let Some(arc) = arc_cut_info(
                 display,
                 cam,
@@ -280,21 +353,30 @@ pub fn build_trajectory(
                     cutting_move_count += 1;
                 }
             }
-            moves.push(MachineMove {
-                kind: MachineMoveKind::Rapid,
-                pose: MachinePose {
-                    x: last.x,
-                    y: last.y,
-                    z: safe_z,
-                    a: last.a,
-                },
-            });
             unit_ranges.push(TrajectoryUnitRange {
                 order: unit.order,
                 start: start_index,
                 end: moves.len(),
             });
+            unit_rules.push(unit_rule_keys(display, cam, unit));
+            previous_end = Some(last);
+            previous_zone = Some(unit.zone);
             unit_count += 1;
+        }
+    }
+
+    if let Some(previous) = previous_end {
+        moves.push(MachineMove {
+            kind: MachineMoveKind::Rapid,
+            pose: MachinePose {
+                x: previous.x,
+                y: previous.y,
+                z: safe_z,
+                a: previous.a,
+            },
+        });
+        if let Some(last_range) = unit_ranges.last_mut() {
+            last_range.end = moves.len();
         }
     }
 
@@ -310,11 +392,33 @@ pub fn build_trajectory(
     MachineTrajectory {
         moves,
         unit_ranges,
+        unit_rules,
         cutting_move_count,
         safe_z,
         unit_count,
         a_min: if a_min.is_finite() { a_min } else { 0.0 },
         a_max: if a_max.is_finite() { a_max } else { 0.0 },
+    }
+}
+
+fn unit_rule_keys(
+    display: &DisplayData,
+    cam: &CamModel,
+    unit: &crate::cam_analysis::PlanUnit,
+) -> UnitRuleKeys {
+    let Some(member) = cam
+        .unit(unit.unit_id)
+        .and_then(|machining_unit| machining_unit.members.first())
+    else {
+        return UnitRuleKeys::default();
+    };
+    let Some(entity) = display.entities.iter().find(|entity| entity.id == *member) else {
+        return UnitRuleKeys::default();
+    };
+    UnitRuleKeys {
+        entity_type: entity.kind.to_string(),
+        layer: entity.layer.clone(),
+        color: entity.color_key.clone(),
     }
 }
 

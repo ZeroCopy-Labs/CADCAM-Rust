@@ -89,7 +89,6 @@ pub enum SectionSource {
 /// A candidate automatically fitted from the drawing's machining units.
 #[derive(Clone, Debug)]
 pub struct TubeCandidate {
-    pub unit_id: Option<UnitId>,
     pub center_y: f64,
     pub center_z: f64,
     pub size_y: f64,
@@ -107,7 +106,6 @@ impl TubeCandidate {
             size_z: self.size_z,
             radius: self.radius,
             source: source,
-            source_unit: self.unit_id,
         }
     }
 }
@@ -121,7 +119,6 @@ pub struct TubeSection {
     pub size_z: f64,
     pub radius: f64,
     pub source: SectionSource,
-    pub source_unit: Option<UnitId>,
 }
 
 impl TubeSection {
@@ -355,7 +352,6 @@ pub struct MachiningSectionCandidate {
     pub maximum_deviation: f64,
     pub coverage_gap_bins: usize,
     pub zone_mask: [bool; 16],
-    pub score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -366,7 +362,6 @@ pub struct MachiningSection {
     pub x_max: f64,
     pub winding: i32,
     pub zone_mask: [bool; 16],
-    pub source: SectionSource,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -432,7 +427,6 @@ pub struct CamPlan {
 
 #[derive(Clone, Debug)]
 pub struct UnitZoneProfile {
-    pub unit_id: UnitId,
     pub zone_lengths: [f64; 16],
     pub touched_zones: [bool; 16],
     pub owner_zone: Option<TubeZone>,
@@ -500,7 +494,6 @@ impl CamAnalysis {
             x_max: candidate.x_max,
             winding: candidate.winding,
             zone_mask: candidate.zone_mask,
-            source: SectionSource::Auto,
         });
         self.machining_sections.sort_by(|left, right| {
             left.x_min
@@ -562,7 +555,6 @@ impl CamAnalysis {
                     x_max: candidate.x_max,
                     winding: candidate.winding,
                     zone_mask: candidate.zone_mask,
-                    source: SectionSource::Auto,
                 });
             }
         }
@@ -832,7 +824,6 @@ pub fn detect_tube_candidates(display: &DisplayData, cam: &CamModel) -> Vec<Tube
     let radius = estimate_corner_radius(&points, center_y, center_z, size_y, size_z);
 
     let mut candidates = vec![TubeCandidate {
-        unit_id: None,
         center_y,
         center_z,
         size_y,
@@ -883,19 +874,6 @@ fn estimate_corner_radius(
         let average = estimates.iter().sum::<f64>() / estimates.len() as f64;
         average.clamp(0.0, half_y.min(half_z) * 0.49)
     }
-}
-
-fn unit_yz_points(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Vec<(f64, f64)> {
-    let mut points = Vec::new();
-    for path in &display.paths {
-        if cam.unit_for_entity(path.entity_id) != Some(unit_id) {
-            continue;
-        }
-        for point in &path.points {
-            points.push((point[1], point[2]));
-        }
-    }
-    points
 }
 
 pub fn detect_machining_candidates(
@@ -965,7 +943,6 @@ pub fn detect_machining_candidates(
         if coverage_gap_bins > 3 {
             continue;
         }
-        let score = 1.0 / (1.0 + max_deviation + coverage_gap_bins as f64);
         candidates.push(MachiningSectionCandidate {
             unit_id: unit.id,
             x_min,
@@ -974,7 +951,6 @@ pub fn detect_machining_candidates(
             maximum_deviation: max_deviation,
             coverage_gap_bins,
             zone_mask,
-            score,
         });
     }
     candidates.sort_by(|left, right| {
@@ -1190,7 +1166,6 @@ pub fn classify_units(
         profiles.insert(
             unit.id,
             UnitZoneProfile {
-                unit_id: unit.id,
                 zone_lengths,
                 touched_zones,
                 owner_zone,

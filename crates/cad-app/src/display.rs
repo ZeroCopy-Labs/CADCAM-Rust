@@ -30,6 +30,14 @@ pub struct DisplayPath {
     pub points: Vec<[f64; 3]>,
 }
 
+/// One drawing layer, retained so configuration UIs can list every layer.
+#[derive(Clone, Debug)]
+pub struct DisplayLayer {
+    pub name: String,
+    pub color: [f32; 3],
+    pub color_index: Option<u8>,
+}
+
 /// Basic display metadata for one CAD entity.
 #[derive(Clone, Debug)]
 pub struct DisplayEntity {
@@ -38,6 +46,7 @@ pub struct DisplayEntity {
     pub layer: String,
     pub color: [f32; 3],
     pub layer_color: [f32; 3],
+    pub color_key: String,
     /// Geometry-specific table rows, independent of the common entity fields.
     pub properties: Vec<(&'static str, String)>,
 }
@@ -47,8 +56,6 @@ pub struct DisplayEntity {
 pub struct DisplayArc {
     pub center: [f64; 3],
     pub normal: [f64; 3],
-    pub start_angle: f64,
-    pub sweep_angle: f64,
     pub full_circle: bool,
 }
 
@@ -57,6 +64,7 @@ pub struct DisplayArc {
 pub struct DisplayData {
     pub paths: Vec<DisplayPath>,
     pub entities: Vec<DisplayEntity>,
+    pub layers: Vec<DisplayLayer>,
     pub arcs: BTreeMap<u32, DisplayArc>,
     pub bounds: Option<Bounds>,
 }
@@ -121,8 +129,6 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
                             circle.plane.normal.y,
                             circle.plane.normal.z,
                         ],
-                        start_angle: 0.0,
-                        sweep_angle: TAU,
                         full_circle: true,
                     },
                 );
@@ -133,8 +139,6 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
                     DisplayArc {
                         center: [arc.center.x, arc.center.y, arc.center.z],
                         normal: [arc.plane.normal.x, arc.plane.normal.y, arc.plane.normal.z],
-                        start_angle: arc.start_angle,
-                        sweep_angle: arc.sweep_angle,
                         full_circle: false,
                     },
                 );
@@ -151,12 +155,19 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
         let layer_color = layer
             .map(|layer| color_to_rgb(layer.color))
             .unwrap_or([0.86, 0.89, 0.94]);
+        let color_key = match entity.color {
+            Color::ByLayer | Color::None => "BYLAYER".to_string(),
+            Color::ByBlock => "BYBLOCK".to_string(),
+            Color::Aci(index) => format!("ACI:{index}"),
+            Color::Rgb { r, g, b } => format!("#{r:02X}{g:02X}{b:02X}"),
+        };
         entities.push(DisplayEntity {
             id: entity.id.0,
             kind: entity.geometry.kind(),
             layer: layer_name,
             color,
             layer_color,
+            color_key,
             properties: entity_properties(&entity.geometry),
         });
     }
@@ -169,10 +180,23 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
         max_y,
         max_z,
     });
+    let layers = document
+        .layers
+        .iter()
+        .map(|layer| DisplayLayer {
+            name: layer.name.clone(),
+            color: color_to_rgb(layer.color),
+            color_index: match layer.color {
+                Color::Aci(index) => Some(index),
+                _ => None,
+            },
+        })
+        .collect();
 
     DisplayData {
         paths,
         entities,
+        layers,
         arcs,
         bounds,
     }
@@ -207,7 +231,7 @@ fn color_to_rgb(color: Color) -> [f32; 3] {
 }
 
 /// Small ACI lookup used by the viewer. Unknown indices fall back to gray.
-fn aci_color(index: u8) -> [f32; 3] {
+pub fn aci_color(index: u8) -> [f32; 3] {
     match index {
         1 => [1.00, 0.32, 0.32],
         2 => [1.00, 0.84, 0.28],

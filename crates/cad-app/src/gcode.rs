@@ -3,14 +3,23 @@
 //! The renderer consumes the semantic machine trajectory. It never changes the
 //! machining order, directions or starts.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::cam_trajectory::{
-    ArcPlane, MachineMove, MachineMoveKind, MachinePose, MachineTrajectory,
+    ArcPlane, MachineMove, MachineMoveKind, MachinePose, MachineTrajectory, UnitRuleKeys,
 };
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeRule {
+    pub header: String,
+    pub footer: String,
+    pub comment: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,10 +38,28 @@ pub struct GCodeProfile {
     pub a_offset_degrees: f64,
     pub machining_z_offset: f64,
     pub rotation_safety_clearance: f64,
+    pub same_zone_clearance: f64,
+    pub arc_output: bool,
+    pub entity_type_rules: BTreeMap<String, CodeRule>,
+    pub color_rules: BTreeMap<String, CodeRule>,
+    pub layer_rules: BTreeMap<String, CodeRule>,
 }
 
 impl Default for GCodeProfile {
     fn default() -> Self {
+        let mut entity_type_rules = BTreeMap::new();
+        for key in ["LINE", "ARC", "CIRCLE", "ELLIPSE", "POLYLINE", "SPLINE"] {
+            entity_type_rules.insert(key.to_string(), CodeRule::default());
+        }
+        let mut color_rules = BTreeMap::new();
+        for key in [
+            "BYLAYER", "BYBLOCK", "ACI:1", "ACI:2", "ACI:3", "ACI:4", "ACI:5", "ACI:6", "ACI:7",
+        ] {
+            color_rules.insert(key.to_string(), CodeRule::default());
+        }
+        let mut layer_rules = BTreeMap::new();
+        layer_rules.insert("0".to_string(), CodeRule::default());
+
         Self {
             name: "default".to_string(),
             header: "G90\nG21".to_string(),
@@ -48,6 +75,11 @@ impl Default for GCodeProfile {
             a_offset_degrees: 0.0,
             machining_z_offset: 0.0,
             rotation_safety_clearance: 5.0,
+            same_zone_clearance: 0.0,
+            arc_output: true,
+            entity_type_rules,
+            color_rules,
+            layer_rules,
         }
     }
 }
@@ -58,8 +90,8 @@ impl GCodeProfile {
             a_offset_degrees: self.a_offset_degrees,
             machining_z_offset: self.machining_z_offset,
             rotation_safety_clearance: self.rotation_safety_clearance,
+            same_zone_clearance: self.same_zone_clearance,
             overcut_distance: self.overcut,
-            feed: self.feed,
         }
     }
 
@@ -95,12 +127,17 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
     push_block(&mut lines, &profile.header);
     let mut previous_pose: Option<MachinePose> = None;
 
-    for range in &trajectory.unit_ranges {
+    for (index, range) in trajectory.unit_ranges.iter().enumerate() {
         let start = range.start.min(trajectory.moves.len());
         let end = range.end.min(trajectory.moves.len());
         if start >= end {
             continue;
         }
+        let keys = trajectory
+            .unit_rules
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
         let moves = &trajectory.moves[start..end];
         let first_cut = moves.iter().position(|movement| movement.kind.is_cutting());
         let last_cut = moves
@@ -112,11 +149,13 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
         }
 
         if let (Some(first_cut), Some(last_cut)) = (first_cut, last_cut) {
+            push_rule_headers(&mut lines, profile, &keys);
             push_block(&mut lines, &profile.unit_start);
             for movement in &moves[first_cut..=last_cut] {
                 push_movement(&mut lines, movement, profile, &mut previous_pose);
             }
             push_block(&mut lines, &profile.unit_end);
+            push_rule_footers(&mut lines, profile, &keys);
             for movement in moves.iter().skip(last_cut + 1) {
                 push_movement(&mut lines, movement, profile, &mut previous_pose);
             }
@@ -144,6 +183,28 @@ fn push_block(lines: &mut Vec<String>, block: &str) {
     }
 }
 
+fn push_rule_headers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &UnitRuleKeys) {
+    let rules = [
+        profile.entity_type_rules.get(&keys.entity_type),
+        profile.layer_rules.get(&keys.layer),
+        profile.color_rules.get(&keys.color),
+    ];
+    for rule in rules.into_iter().flatten() {
+        push_block(lines, &rule.header);
+    }
+}
+
+fn push_rule_footers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &UnitRuleKeys) {
+    let rules = [
+        profile.color_rules.get(&keys.color),
+        profile.layer_rules.get(&keys.layer),
+        profile.entity_type_rules.get(&keys.entity_type),
+    ];
+    for rule in rules.into_iter().flatten() {
+        push_block(lines, &rule.footer);
+    }
+}
+
 fn push_movement(
     lines: &mut Vec<String>,
     movement: &MachineMove,
@@ -158,6 +219,11 @@ fn push_movement(
             plane,
             center,
         } => {
+            if !profile.arc_output {
+                lines.push(cutting_line(movement, profile));
+                *previous_pose = Some(movement.pose);
+                return;
+            }
             let Some(start) = *previous_pose else {
                 lines.push(cutting_line(movement, profile));
                 *previous_pose = Some(movement.pose);

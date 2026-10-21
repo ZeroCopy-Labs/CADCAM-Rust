@@ -3,7 +3,7 @@
 //! cad-core owns parsing/model data, this crate tessellates it into 2D display
 //! paths, Bevy renders them with gizmos, and egui provides the desktop UI.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 use std::fs;
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use bevy::{
     gizmos::config::{GizmoConfigStore, GizmoLineStyle},
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+    log::{Level, LogPlugin},
     prelude::*,
     window::{PrimaryWindow, WindowPlugin, WindowTheme},
 };
@@ -51,6 +52,10 @@ struct ViewerState {
     gcode_profile: gcode::GCodeProfile,
     gcode_preview: String,
     gcode_settings_open: bool,
+    gcode_settings_tab: usize,
+    gcode_selected_type: String,
+    gcode_selected_color: String,
+    gcode_selected_layer: String,
     fit_dirty: bool,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
@@ -156,15 +161,22 @@ fn main() {
 
     App::new()
         .insert_resource(ClearColor(BACKGROUND))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "CAD/CAM — Bevy Viewer".to_string(),
-                resolution: (1280, 800).into(),
-                window_theme: Some(WindowTheme::Dark),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(LogPlugin {
+                    level: Level::WARN,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "CAD/CAM — Bevy Viewer".to_string(),
+                        resolution: (1280, 800).into(),
+                        window_theme: Some(WindowTheme::Dark),
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_plugins(EguiPlugin::default())
         .insert_resource(state)
         .insert_resource(CameraRig::default())
@@ -1869,108 +1881,249 @@ fn drawing_ui(
         let mut reload_profile = false;
         let config_path = gcode_config_path();
         egui::Window::new("G代码配置")
-            .default_width(560.0)
+            .fixed_size(egui::vec2(960.0, 540.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut window_open)
             .show(context, |ui| {
                 ui.label(format!("配置文件：{}", config_path.display()));
                 ui.separator();
+                let tabs = [
+                    "文件级",
+                    "图元类型",
+                    "图元颜色",
+                    "所属图层",
+                    "加工安全",
+                    "加工规划",
+                ];
+                ui.horizontal_wrapped(|ui| {
+                    for (index, title) in tabs.iter().enumerate() {
+                        if ui
+                            .selectable_label(state.gcode_settings_tab == index, *title)
+                            .clicked()
+                        {
+                            state.gcode_settings_tab = index;
+                        }
+                    }
+                });
+                ui.separator();
+                let body_height = (ui.available_height() - 90.0).max(180.0);
                 egui::ScrollArea::vertical()
-                    .max_height(520.0)
+                    .id_salt("gcode_settings_body")
+                    .max_height(body_height)
                     .show(ui, |ui| {
-                        ui.label("文件头");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut state.gcode_profile.header)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.label("文件尾");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut state.gcode_profile.footer)
-                                .desired_rows(1)
-                                .desired_width(f32::INFINITY),
-                        );
-                        egui::Grid::new("gcode_profile_fields")
-                            .num_columns(4)
-                            .spacing([10.0, 4.0])
+                        ui.set_min_height(body_height);
+                        match state.gcode_settings_tab {
+                            0 => {
+                                egui::Grid::new("gcode_file_tab")
+                                    .num_columns(4)
+                                    .spacing([10.0, 5.0])
+                                    .show(ui, |ui| {
+                                        ui.label("配置名称");
+                                        ui.text_edit_singleline(&mut state.gcode_profile.name);
+                                        ui.label("单元开始");
+                                        ui.text_edit_singleline(
+                                            &mut state.gcode_profile.unit_start,
+                                        );
+                                        ui.end_row();
+                                        ui.label("单元结束");
+                                        ui.text_edit_singleline(&mut state.gcode_profile.unit_end);
+                                        ui.label("快速代码");
+                                        ui.text_edit_singleline(&mut state.gcode_profile.rapid);
+                                        ui.end_row();
+                                        ui.label("切削代码");
+                                        ui.text_edit_singleline(&mut state.gcode_profile.cutting);
+                                        ui.label("进给");
+                                        ui.add(
+                                            egui::DragValue::new(&mut state.gcode_profile.feed)
+                                                .speed(1.0),
+                                        );
+                                        ui.end_row();
+                                        ui.label("小数位");
+                                        ui.add(
+                                            egui::DragValue::new(&mut state.gcode_profile.decimals)
+                                                .range(0..=6),
+                                        );
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.end_row();
+                                    });
+                                ui.checkbox(
+                                    &mut state.gcode_profile.arc_output,
+                                    "输出圆弧 G02/G03",
+                                );
+                                let available = ui.available_height();
+                                let label_height = 18.0;
+                                let gap = 6.0;
+                                let editor_height =
+                                    ((available - 2.0 * label_height - 2.0 * gap) / 2.0).max(40.0);
+                                ui.label("文件头");
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width(), editor_height),
+                                    egui::TextEdit::multiline(&mut state.gcode_profile.header)
+                                        .desired_rows(1),
+                                );
+                                ui.add_space(gap);
+                                ui.label("文件尾");
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width(), editor_height),
+                                    egui::TextEdit::multiline(&mut state.gcode_profile.footer)
+                                        .desired_rows(1),
+                                );
+                            }
+                            1 => {
+                                let mut selected = state.gcode_selected_type.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.entity_type_rules,
+                                    &mut selected,
+                                    &[],
+                                    &BTreeMap::new(),
+                                    &BTreeMap::new(),
+                                    RuleTab::EntityType,
+                                );
+                                state.gcode_selected_type = selected;
+                            }
+                            2 => {
+                                let mut available =
+                                    vec!["BYLAYER".to_string(), "BYBLOCK".to_string()];
+                                for index in 1..=9 {
+                                    available.push(format!("ACI:{index}"));
+                                }
+                                let mut colors = BTreeMap::new();
+                                for key in state.gcode_profile.color_rules.keys() {
+                                    if let Some(color) = color_rule_swatch(key) {
+                                        colors.insert(key.clone(), color);
+                                    }
+                                }
+                                let mut selected = state.gcode_selected_color.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.color_rules,
+                                    &mut selected,
+                                    &available,
+                                    &colors,
+                                    &BTreeMap::new(),
+                                    RuleTab::Color,
+                                );
+                                state.gcode_selected_color = selected;
+                            }
+                            3 => {
+                                let mut layers: Vec<String> = Vec::new();
+                                let mut colors = BTreeMap::new();
+                                let mut indices = BTreeMap::new();
+                                for layer in &state.display.layers {
+                                    layers.push(layer.name.clone());
+                                    colors.insert(layer.name.clone(), layer.color);
+                                    if let Some(index) = layer.color_index {
+                                        indices.insert(layer.name.clone(), index);
+                                    }
+                                }
+                                layers.push("0".to_string());
+                                layers.sort();
+                                layers.dedup();
+                                let mut selected = state.gcode_selected_layer.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.layer_rules,
+                                    &mut selected,
+                                    &layers,
+                                    &colors,
+                                    &indices,
+                                    RuleTab::Layer,
+                                );
+                                state.gcode_selected_layer = selected;
+                            }
+                            4 => {
+                                egui::Grid::new("gcode_safety_tab")
+                                    .num_columns(2)
+                                    .spacing([10.0, 5.0])
+                                    .show(ui, |ui| {
+                                        ui.label("旋转安全抬刀");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut state.gcode_profile.rotation_safety_clearance,
+                                            )
+                                            .speed(0.1),
+                                        );
+                                        ui.end_row();
+                                        ui.label("同区离面");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut state.gcode_profile.same_zone_clearance,
+                                            )
+                                            .speed(0.1),
+                                        );
+                                        ui.end_row();
+                                    });
+                                ui.label("同区离面为 0 时，同区位、同 A 角直接在表面快速转移。");
+                                ui.label(
+                                "大于 0 时执行局部抬刀、平移、落刀；跨区始终先抬到旋转安全高度。",
+                            );
+                            }
+                            5 => {
+                                egui::Grid::new("gcode_planning_tab")
+                                    .num_columns(2)
+                                    .spacing([10.0, 5.0])
+                                    .show(ui, |ui| {
+                                        ui.label("过切距离");
+                                        ui.add(
+                                            egui::DragValue::new(&mut state.gcode_profile.overcut)
+                                                .speed(0.1),
+                                        );
+                                        ui.end_row();
+                                        ui.label("A 轴偏移");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut state.gcode_profile.a_offset_degrees,
+                                            )
+                                            .speed(0.1),
+                                        );
+                                        ui.end_row();
+                                        ui.label("加工面 Z 修正");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut state.gcode_profile.machining_z_offset,
+                                            )
+                                            .speed(0.1),
+                                        );
+                                        ui.end_row();
+                                    });
+                                ui.label(
+                                    "加工规划参数会改变四轴姿态或轨迹，保存后会重新计算轨迹。",
+                                );
+                            }
+                            _ => {}
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("保存配置并重算").clicked() {
+                        save_profile = true;
+                    }
+                    if ui.button("重新加载").clicked() {
+                        reload_profile = true;
+                    }
+                    if ui.button("刷新预览").clicked() {
+                        refresh_gcode_preview(&mut state);
+                    }
+                });
+                ui.separator();
+                let preview: String = state
+                    .gcode_preview
+                    .lines()
+                    .take(300)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                egui::CollapsingHeader::new("G代码预览（前 300 行）")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("gcode_preview")
+                            .max_height(220.0)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.label("单元开始");
-                                ui.text_edit_singleline(&mut state.gcode_profile.unit_start);
-                                ui.label("单元结束");
-                                ui.text_edit_singleline(&mut state.gcode_profile.unit_end);
-                                ui.end_row();
-                                ui.label("快速代码");
-                                ui.text_edit_singleline(&mut state.gcode_profile.rapid);
-                                ui.label("切削代码");
-                                ui.text_edit_singleline(&mut state.gcode_profile.cutting);
-                                ui.end_row();
-                                ui.label("进给");
-                                ui.add(
-                                    egui::DragValue::new(&mut state.gcode_profile.feed).speed(1.0),
-                                );
-                                ui.label("小数位");
-                                ui.add(
-                                    egui::DragValue::new(&mut state.gcode_profile.decimals)
-                                        .range(0..=6),
-                                );
-                                ui.end_row();
-                                ui.label("换行");
-                                ui.text_edit_singleline(&mut state.gcode_profile.line_ending);
-                                ui.label("过切");
-                                ui.add(
-                                    egui::DragValue::new(&mut state.gcode_profile.overcut)
-                                        .speed(0.1),
-                                );
-                                ui.end_row();
-                                ui.label("A 偏移");
-                                ui.add(
-                                    egui::DragValue::new(&mut state.gcode_profile.a_offset_degrees)
-                                        .speed(0.1),
-                                );
-                                ui.label("Z 修正");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut state.gcode_profile.machining_z_offset,
-                                    )
-                                    .speed(0.1),
-                                );
-                                ui.end_row();
-                                ui.label("安全抬刀");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut state.gcode_profile.rotation_safety_clearance,
-                                    )
-                                    .speed(0.1),
-                                );
-                                ui.label("");
-                                ui.label("");
-                                ui.end_row();
+                                ui.monospace(preview);
                             });
-                        ui.horizontal(|ui| {
-                            if ui.button("保存配置并重算").clicked() {
-                                save_profile = true;
-                            }
-                            if ui.button("重新加载").clicked() {
-                                reload_profile = true;
-                            }
-                            if ui.button("刷新预览").clicked() {
-                                refresh_gcode_preview(&mut state);
-                            }
-                        });
-                        ui.separator();
-                        let preview: String = state
-                            .gcode_preview
-                            .lines()
-                            .take(300)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ui.collapsing("G代码预览（前 300 行）", |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(260.0)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.monospace(preview);
-                                });
-                        });
                     });
             });
         state.gcode_settings_open = window_open;
@@ -2224,6 +2377,133 @@ fn refresh_gcode_preview(state: &mut ViewerState) {
         .as_ref()
         .map(|trajectory| gcode::render_gcode(trajectory, &state.gcode_profile))
         .unwrap_or_default();
+}
+
+fn color_rule_swatch(key: &str) -> Option<[f32; 3]> {
+    match key {
+        "BYLAYER" => Some([0.86, 0.89, 0.94]),
+        "BYBLOCK" => Some([0.36, 0.40, 0.46]),
+        _ => key
+            .strip_prefix("ACI:")
+            .and_then(|index| index.parse().ok())
+            .map(display::aci_color),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleTab {
+    EntityType,
+    Color,
+    Layer,
+}
+
+fn entity_type_label(key: &str) -> String {
+    let name = match key {
+        "LINE" => "直线",
+        "ARC" => "圆弧",
+        "CIRCLE" => "圆",
+        "ELLIPSE" => "椭圆",
+        "POLYLINE" | "LWPOLYLINE" => "多段线",
+        "SPLINE" => "样条曲线",
+        "POINT" => "点",
+        _ => "未知类型",
+    };
+    format!("{key}  {name}")
+}
+
+fn color_key_label(key: &str) -> String {
+    let name = match key {
+        "BYLAYER" => "随层",
+        "BYBLOCK" => "随块",
+        "ACI:1" => "红色",
+        "ACI:2" => "黄色",
+        "ACI:3" => "绿色",
+        "ACI:4" => "青色",
+        "ACI:5" => "蓝色",
+        "ACI:6" => "洋红",
+        "ACI:7" => "白色",
+        "ACI:8" => "深灰",
+        "ACI:9" => "浅灰",
+        _ => "索引色",
+    };
+    format!("{key}  {name}")
+}
+
+fn gcode_rule_tab(
+    ui: &mut egui::Ui,
+    rules: &mut BTreeMap<String, gcode::CodeRule>,
+    selected: &mut String,
+    available: &[String],
+    key_colors: &BTreeMap<String, [f32; 3]>,
+    key_indices: &BTreeMap<String, u8>,
+    tab: RuleTab,
+) {
+    for name in available {
+        rules.entry(name.clone()).or_default();
+    }
+    let keys: Vec<String> = rules.keys().cloned().collect();
+    if keys.is_empty() {
+        ui.label("暂无规则");
+        return;
+    }
+    if selected.is_empty() || !rules.contains_key(selected) {
+        *selected = keys[0].clone();
+    }
+    let panel_height = ui.available_height();
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_min_width(190.0);
+            for key in &keys {
+                let mut label = match tab {
+                    RuleTab::EntityType => entity_type_label(key),
+                    RuleTab::Color => color_key_label(key),
+                    RuleTab::Layer => key.clone(),
+                };
+                if tab == RuleTab::Layer {
+                    if let Some(index) = key_indices.get(key) {
+                        label = format!("{label}  ACI {index}");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if let Some(color) = key_colors.get(key) {
+                        ui.colored_label(color32(*color), "■");
+                    }
+                    if ui
+                        .selectable_label(selected.as_str() == key.as_str(), label)
+                        .clicked()
+                    {
+                        *selected = key.clone();
+                    }
+                });
+            }
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.set_min_width(360.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(format!("规则：{selected}"));
+            if let Some(rule) = rules.get_mut(selected) {
+                let editor_height =
+                    ((panel_height - 4.0 * 18.0 - 3.0 * 5.0 - 22.0) / 2.0).max(45.0);
+                ui.label("头部代码");
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), editor_height),
+                    egui::TextEdit::multiline(&mut rule.header).desired_rows(1),
+                );
+                ui.label("尾部代码");
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), editor_height),
+                    egui::TextEdit::multiline(&mut rule.footer).desired_rows(1),
+                );
+                ui.label("说明");
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), 22.0),
+                    egui::TextEdit::singleline(&mut rule.comment),
+                );
+            }
+        });
+    });
 }
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
