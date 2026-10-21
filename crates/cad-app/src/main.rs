@@ -21,6 +21,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use cad_core::read_document;
 
 mod cam;
+mod cam_analysis;
 mod display;
 
 const BACKGROUND: Color = Color::srgb(0.035, 0.045, 0.060);
@@ -43,6 +44,7 @@ struct ViewerState {
     warning_count: usize,
     display: display::DisplayData,
     cam: cam::CamModel,
+    analysis: cam_analysis::CamAnalysis,
     fit_dirty: bool,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
@@ -215,6 +217,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
         Ok(document) => {
             let display = display::build_display(&document);
             let cam_model = cam::build_cam_model(&document);
+            let analysis = cam_analysis::CamAnalysis::build(&display, &cam_model);
             state.file_name = document.source.file_name.clone();
             state.format = document.source.format.to_string();
             state.version = document.source.version.clone();
@@ -227,6 +230,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.warning_count = document.import_report.warnings.len();
             state.display = display;
             state.cam = cam_model;
+            state.analysis = analysis;
             state.load_version += 1;
             state.fit_dirty = true;
 
@@ -565,10 +569,19 @@ fn selection_input(
         return Ok(());
     };
     let context = contexts.ctx_mut()?;
-    let over_ui = ui_state.pointer_over_ui || context.egui_wants_pointer_input();
+    let ui_active = ui_state.pointer_over_ui
+        || context.egui_wants_pointer_input()
+        || context.egui_is_using_pointer();
+    if ui_active {
+        // A click that starts on the panel resize handle must be owned by the
+        // panel, even if the first press frame already reached this system.
+        selection.drag_start = None;
+        selection.drag_current = None;
+        return Ok(());
+    }
     let (camera, camera_transform) = camera.into_inner();
 
-    if mouse.just_pressed(MouseButton::Left) && !over_ui {
+    if mouse.just_pressed(MouseButton::Left) {
         selection.drag_start = Some(cursor);
         selection.drag_current = Some(cursor);
     }
@@ -850,10 +863,176 @@ fn entity_info_ui(ui: &mut egui::Ui, entity: &display::DisplayEntity, scope: &st
         });
 }
 
+#[derive(Default)]
+struct CamAnalysisUiAction {
+    apply_tube: Option<usize>,
+    manual_tube: Option<cam_analysis::TubeSection>,
+    clear_tube: bool,
+    apply_machining: Option<usize>,
+}
+
+fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> CamAnalysisUiAction {
+    let mut action = CamAnalysisUiAction::default();
+
+    egui::CollapsingHeader::new("方管截面")
+        .default_open(true)
+        .show(ui, |ui| {
+            if let Some(section) = &analysis.tube_section {
+                egui::Grid::new("tube_section_table")
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([8.0, 3.0])
+                    .show(ui, |ui| {
+                        ui.label("中心 Y");
+                        ui.label(format!("{:.3}", section.center_y));
+                        ui.end_row();
+                        ui.label("中心 Z");
+                        ui.label(format!("{:.3}", section.center_z));
+                        ui.end_row();
+                        ui.label("Y 尺寸");
+                        ui.label(format!("{:.3}", section.size_y));
+                        ui.end_row();
+                        ui.label("Z 尺寸");
+                        ui.label(format!("{:.3}", section.size_z));
+                        ui.end_row();
+                        ui.label("圆角");
+                        ui.label(format!("{:.3}", section.radius));
+                        ui.end_row();
+                        ui.label("来源");
+                        ui.label(match section.source {
+                            cam_analysis::SectionSource::Auto => "自动",
+                            cam_analysis::SectionSource::Manual => "手动",
+                        });
+                        ui.end_row();
+                    });
+                if ui.small_button("清除/重新识别").clicked() {
+                    action.clear_tube = true;
+                }
+                ui.separator();
+                ui.label("手动参数");
+                let mut edited = section.clone();
+                ui.horizontal(|ui| {
+                    ui.label("中心 Y");
+                    ui.add(egui::DragValue::new(&mut edited.center_y).speed(0.1));
+                    ui.label("Z");
+                    ui.add(egui::DragValue::new(&mut edited.center_z).speed(0.1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("尺寸 Y");
+                    ui.add(egui::DragValue::new(&mut edited.size_y).speed(0.1));
+                    ui.label("Z");
+                    ui.add(egui::DragValue::new(&mut edited.size_z).speed(0.1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("圆角");
+                    ui.add(egui::DragValue::new(&mut edited.radius).speed(0.1));
+                    if ui.small_button("应用手动参数").clicked() {
+                        action.manual_tube = Some(edited);
+                    }
+                });
+            } else if analysis.tube_candidates.is_empty() {
+                ui.label("未识别到方管截面候选");
+            } else {
+                ui.label(format!(
+                    "候选 {} 个，请选择",
+                    analysis.tube_candidates.len()
+                ));
+                for (index, candidate) in analysis.tube_candidates.iter().take(8).enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Y{:.2} Z{:.2} {:.2}×{:.2} R{:.2}",
+                            candidate.center_y,
+                            candidate.center_z,
+                            candidate.size_y,
+                            candidate.size_z,
+                            candidate.radius
+                        ));
+                        if ui.small_button("应用").clicked() {
+                            action.apply_tube = Some(index);
+                        }
+                    });
+                }
+            }
+        });
+
+    if analysis.tube_section.is_some() {
+        egui::CollapsingHeader::new("加工截面与区间")
+            .default_open(true)
+            .show(ui, |ui| {
+                if analysis.machining_candidates.is_empty() {
+                    ui.label("未识别到加工截面候选");
+                } else {
+                    let existing: BTreeSet<cam::UnitId> = analysis
+                        .machining_sections
+                        .iter()
+                        .map(|section| section.unit_id)
+                        .collect();
+                    for (index, candidate) in
+                        analysis.machining_candidates.iter().take(8).enumerate()
+                    {
+                        if existing.contains(&candidate.unit_id) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "X {:.2}..{:.2} 绕数 {} 缺口 {} 偏差 {:.2}",
+                                candidate.x_min,
+                                candidate.x_max,
+                                candidate.winding,
+                                candidate.coverage_gap_bins,
+                                candidate.maximum_deviation
+                            ));
+                            if ui.small_button("应用").clicked() {
+                                action.apply_machining = Some(index);
+                            }
+                        });
+                    }
+                }
+
+                if !analysis.machining_sections.is_empty() {
+                    ui.separator();
+                    ui.label(format!(
+                        "已应用加工截面 {} 个",
+                        analysis.machining_sections.len()
+                    ));
+                    for section in &analysis.machining_sections {
+                        let covered = section.zone_mask.iter().filter(|value| **value).count();
+                        ui.label(format!(
+                            "X {:.2}..{:.2}  绕数 {}  成员 {}  区位 {}",
+                            section.x_min,
+                            section.x_max,
+                            section.winding,
+                            section.boundary_units.len(),
+                            covered
+                        ));
+                    }
+                }
+
+                if !analysis.intervals.is_empty() {
+                    ui.separator();
+                    ui.label("加工区间");
+                    for interval in &analysis.intervals {
+                        ui.label(format!(
+                            "{}: X {:.2}..{:.2}  {} 个单元",
+                            interval.id + 1,
+                            interval.x_start,
+                            interval.x_end,
+                            interval.units.len()
+                        ));
+                    }
+                }
+            });
+    }
+
+    action
+}
+
 fn cam_unit_info_ui(
     ui: &mut egui::Ui,
     unit: &cam::MachiningUnit,
     display: &display::DisplayData,
+    zone_profile: Option<&cam_analysis::UnitZoneProfile>,
+    machining_section_index: Option<usize>,
     scope: &str,
 ) {
     ui.horizontal(|ui| {
@@ -875,10 +1054,58 @@ fn cam_unit_info_ui(
             ui.label("成员数");
             ui.label(unit.members.len().to_string());
             ui.end_row();
+            ui.label("加工截面");
+            ui.label(match machining_section_index {
+                Some(index) => format!("是（#{}）", index),
+                None => "否".to_string(),
+            });
+            ui.end_row();
             ui.label("显示颜色");
             ui.label("跟随成员图元");
             ui.end_row();
         });
+
+    if let Some(profile) = zone_profile {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("加工区位").strong());
+        egui::Grid::new(format!("unit_zones_{scope}_{:016X}", unit.id.0))
+            .num_columns(2)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("主区位");
+                ui.label(
+                    profile
+                        .owner_zone
+                        .map(|zone| zone.label())
+                        .unwrap_or("未判定"),
+                );
+                ui.end_row();
+                ui.label("主区位投影长度");
+                ui.label(
+                    profile
+                        .owner_zone
+                        .map(|zone| format!("{:.3}", profile.zone_lengths[zone.index()]))
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+                ui.end_row();
+            });
+
+        let touched: Vec<&'static str> = cam_analysis::TubeZone::ALL
+            .iter()
+            .filter(|zone| profile.touched_zones[zone.index()])
+            .map(|zone| zone.label())
+            .collect();
+        ui.label("经过区位");
+        ui.add(
+            egui::Label::new(if touched.is_empty() {
+                "—".to_string()
+            } else {
+                touched.join("、")
+            })
+            .wrap(),
+        );
+    }
 
     ui.add_space(6.0);
     ui.label(egui::RichText::new("成员图元").strong());
@@ -918,12 +1145,92 @@ fn color32(rgb: [f32; 3]) -> egui::Color32 {
     )
 }
 
+fn draw_machining_section_labels(
+    context: &egui::Context,
+    state: &ViewerState,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    blocked: &[egui::Rect],
+) {
+    if state.analysis.machining_sections.is_empty() {
+        return;
+    }
+    let painter = context.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("machining_section_labels"),
+    ));
+    let viewport = context.viewport_rect();
+
+    for (index, section) in state.analysis.machining_sections.iter().enumerate() {
+        let Some(center) = unit_center(&state.display, &state.cam, section.unit_id) else {
+            continue;
+        };
+        let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
+        let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
+            continue;
+        };
+        let position = egui::pos2(screen.x, screen.y);
+        if !viewport.contains(position)
+            || blocked
+                .iter()
+                .any(|rect| rect.expand(4.0).contains(position))
+        {
+            continue;
+        }
+
+        painter.circle_filled(position, 3.0, egui::Color32::from_rgb(255, 214, 80));
+        let text = format!("#{index}");
+        let galley =
+            painter.layout_no_wrap(text, egui::FontId::monospace(14.0), egui::Color32::WHITE);
+        let anchor = position + egui::vec2(7.0, -9.0);
+        let background = egui::Rect::from_min_size(
+            anchor - egui::vec2(3.0, 2.0),
+            galley.size() + egui::vec2(6.0, 4.0),
+        );
+        painter.rect_filled(
+            background,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(8, 12, 18, 210),
+        );
+        painter.galley(anchor, galley, egui::Color32::WHITE);
+    }
+}
+
+fn unit_center(
+    display: &display::DisplayData,
+    cam: &cam::CamModel,
+    unit_id: cam::UnitId,
+) -> Option<[f64; 3]> {
+    let mut sum = [0.0f64; 3];
+    let mut count = 0usize;
+    for path in &display.paths {
+        if cam.unit_for_entity(path.entity_id) != Some(unit_id) {
+            continue;
+        }
+        for point in &path.points {
+            sum[0] += point[0];
+            sum[1] += point[1];
+            sum[2] += point[2];
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some([
+        sum[0] / count as f64,
+        sum[1] / count as f64,
+        sum[2] / count as f64,
+    ])
+}
+
 fn drawing_ui(
     mut contexts: EguiContexts,
     mut state: ResMut<ViewerState>,
     mut camera: ResMut<CameraRig>,
     mut selection: ResMut<SelectionState>,
     mut space: ResMut<SpaceState>,
+    view_camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut fonts_loaded: Local<bool>,
     mut ui_state: ResMut<UiState>,
 ) -> Result {
@@ -1097,6 +1404,7 @@ fn drawing_ui(
     });
     let command_rect = command_panel.response.rect;
 
+    let mut cam_action = CamAnalysisUiAction::default();
     let feature_panel = egui::Panel::left("feature_info")
         .default_size(300.0)
         .resizable(true)
@@ -1139,23 +1447,40 @@ fn drawing_ui(
                     }
                 }
                 SpaceMode::Cam => {
-                    let selected_units: Vec<&cam::MachiningUnit> = state
-                        .cam
-                        .units
-                        .iter()
-                        .filter(|unit| selection.cam_selected.contains(&unit.id))
-                        .collect();
-
-                    if selected_units.is_empty() {
-                        ui.label("未选择加工单元");
-                        ui.label("左键点选 / 拖拽框选");
-                        ui.label("Shift + 左键追加选择");
-                    } else {
-                        ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        cam_action = cam_analysis_ui(ui, &state.analysis);
                         ui.separator();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+
+                        let selected_units: Vec<&cam::MachiningUnit> = state
+                            .cam
+                            .units
+                            .iter()
+                            .filter(|unit| selection.cam_selected.contains(&unit.id))
+                            .collect();
+
+                        if selected_units.is_empty() {
+                            ui.label("未选择加工单元");
+                            ui.label("左键点选 / 拖拽框选");
+                            ui.label("Shift + 左键追加选择");
+                        } else {
+                            ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
+                            ui.separator();
                             if selected_units.len() == 1 {
-                                cam_unit_info_ui(ui, selected_units[0], &state.display, "single");
+                                let zone_profile =
+                                    state.analysis.zone_profiles.get(&selected_units[0].id);
+                                let section_index = state
+                                    .analysis
+                                    .machining_sections
+                                    .iter()
+                                    .position(|section| section.unit_id == selected_units[0].id);
+                                cam_unit_info_ui(
+                                    ui,
+                                    selected_units[0],
+                                    &state.display,
+                                    zone_profile,
+                                    section_index,
+                                    "single",
+                                );
                             } else {
                                 for unit in selected_units {
                                     egui::CollapsingHeader::new(format!(
@@ -1165,17 +1490,52 @@ fn drawing_ui(
                                     .id_salt(unit.id)
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        cam_unit_info_ui(ui, unit, &state.display, "multi")
+                                        let zone_profile =
+                                            state.analysis.zone_profiles.get(&unit.id);
+                                        let section_index = state
+                                            .analysis
+                                            .machining_sections
+                                            .iter()
+                                            .position(|section| section.unit_id == unit.id);
+                                        cam_unit_info_ui(
+                                            ui,
+                                            unit,
+                                            &state.display,
+                                            zone_profile,
+                                            section_index,
+                                            "multi",
+                                        )
                                     });
                                 }
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             }
         });
 
     let feature_rect = feature_panel.response.rect;
+
+    if cam_action.clear_tube {
+        state.analysis.clear_tube_section();
+    }
+    {
+        let ViewerState {
+            display,
+            cam,
+            analysis,
+            ..
+        } = &mut *state;
+        if let Some(index) = cam_action.apply_tube {
+            analysis.apply_tube_candidate(index, display, cam);
+        }
+        if let Some(section) = cam_action.manual_tube {
+            analysis.apply_manual_tube(section, display, cam);
+        }
+        if let Some(index) = cam_action.apply_machining {
+            analysis.apply_machining_candidate(index, display, cam);
+        }
+    }
 
     if let (Some(start), Some(current)) = (selection.drag_start, selection.drag_current) {
         if (current - start).length() > 2.0 {
@@ -1223,17 +1583,30 @@ fn drawing_ui(
     if fit_clicked {
         state.fit_dirty = true;
     }
+
+    if space.mode == SpaceMode::Cam {
+        let (view_camera, view_transform) = view_camera.into_inner();
+        draw_machining_section_labels(
+            context,
+            &state,
+            view_camera,
+            view_transform,
+            &[menu_rect, feature_rect, command_rect],
+        );
+    }
+
     view_cube_ui(context, &mut camera);
 
     let pointer = context.input(|input| input.pointer.hover_pos());
     let over_panels = pointer
         .map(|position| {
-            menu_rect.contains(position)
-                || feature_rect.contains(position)
-                || command_rect.contains(position)
+            menu_rect.expand(6.0).contains(position)
+                || feature_rect.expand(8.0).contains(position)
+                || command_rect.expand(6.0).contains(position)
         })
         .unwrap_or(false);
-    ui_state.pointer_over_ui = over_panels || context.egui_wants_pointer_input();
+    ui_state.pointer_over_ui =
+        over_panels || context.egui_is_using_pointer() || context.egui_wants_pointer_input();
     Ok(())
 }
 
