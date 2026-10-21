@@ -5,17 +5,20 @@ param(
     [string[]] $AppArguments
 )
 
-# One-click run: build on demand, then launch the Bevy viewer.
+# One-click run: always rebuild first so a stale executable is never launched.
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $exe = Join-Path $root "build\cargo\debug\cad-app.exe"
 
-if (-not (Test-Path -LiteralPath $exe)) {
-    & (Join-Path $root "build.ps1")
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
+& (Join-Path $root "build.ps1")
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
 
+if (-not (Test-Path -LiteralPath $exe)) {
+    throw "Build succeeded but $exe was not found"
+}
+
+Write-Host "==> Running $exe"
 & $exe @AppArguments
 exit $LASTEXITCODE

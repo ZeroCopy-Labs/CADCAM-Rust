@@ -12,10 +12,17 @@ if (-not $cargo) {
     throw "cargo was not found in PATH"
 }
 
+Write-Host "==> Building Bevy viewer from $root"
+
 Push-Location $root
 try {
     & $cargo.Source build -p cad-app
-    exit $LASTEXITCODE
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        throw "cargo build failed with exit code $code"
+    }
+    $exe = Join-Path $root "build\cargo\debug\cad-app.exe"
+    Write-Host "==> Built $exe"
 }
 finally {
     Pop-Location
