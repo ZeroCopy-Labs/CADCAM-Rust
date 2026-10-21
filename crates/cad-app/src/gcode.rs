@@ -217,6 +217,54 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
     text
 }
 
+pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> Vec<String> {
+    let mut issues = Vec::new();
+    if trajectory.unit_ranges.is_empty() || trajectory.moves.is_empty() {
+        issues.push("没有可导出的加工单元或运动段".to_string());
+        return issues;
+    }
+    if profile.use_initial_position
+        && (!profile.initial_x.is_finite()
+            || !profile.initial_y.is_finite()
+            || !profile.initial_z.is_finite()
+            || !profile.initial_a.is_finite())
+    {
+        issues.push("初始机床位置包含非法数值".to_string());
+    }
+
+    for range in &trajectory.unit_ranges {
+        let start = range.start.min(trajectory.moves.len());
+        let end = range.end.min(trajectory.moves.len());
+        if start >= end {
+            issues.push(format!("加工单元 {} 的运动范围为空", range.order));
+            continue;
+        }
+        let moves = &trajectory.moves[start..end];
+        if !moves.iter().any(|movement| movement.kind.is_cutting()) {
+            issues.push(format!("加工单元 {} 没有切削移动", range.order));
+        }
+        if moves.iter().any(|movement| {
+            !movement.pose.x.is_finite()
+                || !movement.pose.y.is_finite()
+                || !movement.pose.z.is_finite()
+                || !movement.pose.a.is_finite()
+        }) {
+            issues.push(format!("加工单元 {} 包含非法坐标", range.order));
+        }
+        for pair in moves.windows(2) {
+            if pair[0].kind == MachineMoveKind::Rapid
+                && pair[1].kind == MachineMoveKind::Rapid
+                && (pair[0].pose.a - pair[1].pose.a).abs() > 1.0e-6
+                && (pair[0].pose.z < trajectory.safe_z - 1.0e-6
+                    || pair[1].pose.z < trajectory.safe_z - 1.0e-6)
+            {
+                issues.push(format!("加工单元 {} 在非安全高度改变 A 轴", range.order));
+            }
+        }
+    }
+    issues
+}
+
 fn push_block(lines: &mut Vec<String>, block: &str) {
     for line in block.lines() {
         let line = line.trim();

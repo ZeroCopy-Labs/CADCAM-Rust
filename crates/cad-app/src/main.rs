@@ -1037,6 +1037,8 @@ struct CamAnalysisUiAction {
     manual_machining: Option<cam::UnitId>,
     remove_machining: Option<cam::UnitId>,
     move_unit: Option<(u32, usize, isize)>,
+    set_lazy_rotation: Option<bool>,
+    set_rotation_direction: Option<cam_analysis::RotationDirection>,
 }
 
 fn cam_analysis_ui(
@@ -1236,6 +1238,38 @@ fn cam_analysis_ui(
                 }
 
                 if !analysis.plan.groups.is_empty() {
+                    ui.separator();
+                    ui.label("排序策略");
+                    let mut lazy = analysis.lazy_rotation;
+                    if ui.checkbox(&mut lazy, "懒旋转").changed() {
+                        action.set_lazy_rotation = Some(lazy);
+                    }
+                    let mut direction = analysis.rotation_direction;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .radio_value(
+                                &mut direction,
+                                cam_analysis::RotationDirection::CounterClockwise,
+                                "逆时针",
+                            )
+                            .changed()
+                        {
+                            action.set_rotation_direction = Some(direction);
+                        }
+                        if ui
+                            .radio_value(
+                                &mut direction,
+                                cam_analysis::RotationDirection::Clockwise,
+                                "顺时针",
+                            )
+                            .changed()
+                        {
+                            action.set_rotation_direction = Some(direction);
+                        }
+                    });
+                    ui.label(
+                        "懒旋转：完成一个区位后再转下一个区位；关闭后按 YZ 平面沿 +X 扫描顺序。",
+                    );
                     ui.separator();
                     ui.label("加工顺序（预览）");
                     ui.label(
@@ -1978,6 +2012,16 @@ fn drawing_ui(
                 cam_input_changed = true;
             }
         }
+        if let Some(lazy) = cam_action.set_lazy_rotation {
+            if analysis.set_plan_options(lazy, analysis.rotation_direction, display, cam) {
+                cam_input_changed = true;
+            }
+        }
+        if let Some(direction) = cam_action.set_rotation_direction {
+            if analysis.set_plan_options(analysis.lazy_rotation, direction, display, cam) {
+                cam_input_changed = true;
+            }
+        }
     }
     if cam_input_changed {
         let ViewerState {
@@ -2069,7 +2113,7 @@ fn drawing_ui(
         state.fit_dirty = true;
     }
 
-    if space.mode == SpaceMode::Cam {
+    if space.mode == SpaceMode::Cam && !state.gcode_settings_open {
         let (view_camera, view_transform) = view_camera.into_inner();
         draw_machining_order_labels(
             context,
@@ -2096,10 +2140,15 @@ fn drawing_ui(
         let mut window_open = true;
         let mut save_profile = false;
         let mut reload_profile = false;
+        let mut validate_gcode = false;
         let config_path = gcode_config_path();
+        let window_size = egui::vec2(960.0, 540.0);
+        let default_pos = context.content_rect().center() - window_size * 0.5;
         egui::Window::new("G代码配置")
-            .fixed_size(egui::vec2(960.0, 540.0))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(window_size)
+            .default_pos(default_pos)
+            .movable(true)
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut window_open)
             .show(context, |ui| {
                 ui.label(format!("配置文件：{}", config_path.display()));
@@ -2375,6 +2424,9 @@ fn drawing_ui(
                     if ui.button("刷新预览").clicked() {
                         refresh_gcode_preview(&mut state);
                     }
+                    if ui.button("校验 G 代码").clicked() {
+                        validate_gcode = true;
+                    }
                 });
                 ui.separator();
                 let preview: String = state
@@ -2411,6 +2463,20 @@ fn drawing_ui(
                     push_message(&mut state, "G 代码配置已保存，轨迹已重新计算");
                 }
                 Err(error) => push_message(&mut state, format!("保存配置失败：{error}")),
+            }
+        }
+        if validate_gcode {
+            if let Some(trajectory) = state.trajectory.as_ref() {
+                let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
+                if issues.is_empty() {
+                    push_message(&mut state, "G 代码校验通过");
+                } else {
+                    for issue in issues.into_iter().take(5) {
+                        push_message(&mut state, format!("G 代码校验：{issue}"));
+                    }
+                }
+            } else {
+                push_message(&mut state, "没有可校验的四轴轨迹");
             }
         }
     }
@@ -2801,6 +2867,13 @@ fn export_gcode_file(state: &mut ViewerState) {
         push_message(state, "没有可导出的加工单元");
         return;
     }
+    let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
+    if !issues.is_empty() {
+        for issue in issues.into_iter().take(5) {
+            push_message(state, format!("导出前校验：{issue}"));
+        }
+        return;
+    }
 
     let stem = Path::new(&state.file_name)
         .file_stem()
@@ -2831,6 +2904,13 @@ fn quick_export_gcode_file(state: &mut ViewerState) {
     };
     if trajectory.unit_ranges.is_empty() {
         push_message(state, "没有可导出的加工单元");
+        return;
+    }
+    let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
+    if !issues.is_empty() {
+        for issue in issues.into_iter().take(5) {
+            push_message(state, format!("导出前校验：{issue}"));
+        }
         return;
     }
     let stem = Path::new(&state.file_name)

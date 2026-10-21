@@ -432,7 +432,14 @@ pub struct UnitZoneProfile {
     pub owner_zone: Option<TubeZone>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RotationDirection {
+    #[default]
+    CounterClockwise,
+    Clockwise,
+}
+
+#[derive(Clone, Debug)]
 pub struct CamAnalysis {
     pub tube_candidates: Vec<TubeCandidate>,
     pub tube_section: Option<TubeSection>,
@@ -442,6 +449,25 @@ pub struct CamAnalysis {
     pub groups: Vec<MachiningGroup>,
     pub plan: CamPlan,
     pub zone_profiles: BTreeMap<UnitId, UnitZoneProfile>,
+    pub lazy_rotation: bool,
+    pub rotation_direction: RotationDirection,
+}
+
+impl Default for CamAnalysis {
+    fn default() -> Self {
+        Self {
+            tube_candidates: Vec::new(),
+            tube_section: None,
+            machining_candidates: Vec::new(),
+            machining_sections: Vec::new(),
+            intervals: Vec::new(),
+            groups: Vec::new(),
+            plan: CamPlan::default(),
+            zone_profiles: BTreeMap::new(),
+            lazy_rotation: true,
+            rotation_direction: RotationDirection::CounterClockwise,
+        }
+    }
 }
 
 impl CamAnalysis {
@@ -776,23 +802,63 @@ impl CamAnalysis {
 
         for group in &self.groups {
             let mut planned = Vec::new();
-            for zone_group in &group.zone_groups {
-                let mut units = zone_group.units.clone();
-                units.sort_by(|left, right| {
-                    let left_x = unit_x_center(display, cam, *left).unwrap_or(f64::INFINITY);
-                    let right_x = unit_x_center(display, cam, *right).unwrap_or(f64::INFINITY);
+            if self.lazy_rotation {
+                for zone in ordered_zones(self.rotation_direction) {
+                    let zone_group = &group.zone_groups[zone.index()];
+                    let mut units = zone_group.units.clone();
+                    units.sort_by(|left, right| {
+                        let left_x = unit_x_center(display, cam, *left).unwrap_or(f64::INFINITY);
+                        let right_x = unit_x_center(display, cam, *right).unwrap_or(f64::INFINITY);
+                        left_x
+                            .partial_cmp(&right_x)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| left.cmp(right))
+                    });
+                    for unit_id in units {
+                        if group.section_unit == Some(unit_id) {
+                            continue;
+                        }
+                        planned.push(PlanUnit {
+                            unit_id,
+                            zone: zone_group.zone,
+                            order: next_order,
+                            machining_cut: false,
+                            direction: UnitDirection::Forward,
+                            start_point: [0.0; 3],
+                            end_point: [0.0; 3],
+                        });
+                        next_order += 1;
+                    }
+                }
+            } else {
+                let mut units: Vec<(UnitId, TubeZone)> = Vec::new();
+                for zone_group in &group.zone_groups {
+                    for unit_id in &zone_group.units {
+                        if group.section_unit != Some(*unit_id) {
+                            units.push((*unit_id, zone_group.zone));
+                        }
+                    }
+                }
+                units.sort_by(|(left_id, left_zone), (right_id, right_zone)| {
+                    let left_x = unit_x_bounds(display, cam, *left_id)
+                        .map(|(minimum, _)| minimum)
+                        .unwrap_or(f64::INFINITY);
+                    let right_x = unit_x_bounds(display, cam, *right_id)
+                        .map(|(minimum, _)| minimum)
+                        .unwrap_or(f64::INFINITY);
                     left_x
                         .partial_cmp(&right_x)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| left.cmp(right))
+                        .then_with(|| {
+                            zone_rank(*left_zone, self.rotation_direction)
+                                .cmp(&zone_rank(*right_zone, self.rotation_direction))
+                        })
+                        .then_with(|| left_id.cmp(right_id))
                 });
-                for unit_id in units {
-                    if group.section_unit == Some(unit_id) {
-                        continue;
-                    }
+                for (unit_id, zone) in units {
                     planned.push(PlanUnit {
                         unit_id,
-                        zone: zone_group.zone,
+                        zone,
                         order: next_order,
                         machining_cut: false,
                         direction: UnitDirection::Forward,
@@ -842,6 +908,23 @@ impl CamAnalysis {
                 });
             }
         }
+    }
+
+    /// Change lazy-rotation / rotation-direction planning policy.
+    pub fn set_plan_options(
+        &mut self,
+        lazy_rotation: bool,
+        rotation_direction: RotationDirection,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) -> bool {
+        if self.lazy_rotation == lazy_rotation && self.rotation_direction == rotation_direction {
+            return false;
+        }
+        self.lazy_rotation = lazy_rotation;
+        self.rotation_direction = rotation_direction;
+        self.rebuild_plan(display, cam);
+        true
     }
 
     /// Move one non-section plan unit inside its group and refresh direction/start.
@@ -1259,6 +1342,28 @@ pub fn oriented_unit_path(
         path.reverse();
     }
     Some(path)
+}
+
+fn ordered_zones(direction: RotationDirection) -> Vec<TubeZone> {
+    match direction {
+        RotationDirection::CounterClockwise => TubeZone::ALL.to_vec(),
+        RotationDirection::Clockwise => std::iter::once(TubeZone::ALL[0])
+            .chain(TubeZone::ALL[1..].iter().rev().copied())
+            .collect(),
+    }
+}
+
+fn zone_rank(zone: TubeZone, direction: RotationDirection) -> usize {
+    match direction {
+        RotationDirection::CounterClockwise => zone.index(),
+        RotationDirection::Clockwise => {
+            if zone.index() == 0 {
+                0
+            } else {
+                TubeZone::ALL.len() - zone.index()
+            }
+        }
+    }
 }
 
 fn unit_x_bounds(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Option<(f64, f64)> {
