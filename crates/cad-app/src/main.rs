@@ -2145,8 +2145,8 @@ fn drawing_ui(
                                         "输出圆弧 G02/G03",
                                     );
                                     ui.checkbox(
-                                        &mut state.gcode_profile.normalize_a,
-                                        "A 轴规范化到 ±180°",
+                                        &mut state.gcode_profile.keep_continuous_angle,
+                                        "A 轴保持连续角度",
                                     );
                                 });
                                 let available = ui.available_height();

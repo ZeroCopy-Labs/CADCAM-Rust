@@ -40,7 +40,7 @@ pub struct GCodeProfile {
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub arc_output: bool,
-    pub normalize_a: bool,
+    pub keep_continuous_angle: bool,
     pub use_initial_position: bool,
     pub initial_x: f64,
     pub initial_y: f64,
@@ -84,7 +84,7 @@ impl Default for GCodeProfile {
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             arc_output: true,
-            normalize_a: true,
+            keep_continuous_angle: true,
             use_initial_position: false,
             initial_x: 0.0,
             initial_y: 0.0,
@@ -106,7 +106,7 @@ impl GCodeProfile {
             rotation_safety_clearance: self.rotation_safety_clearance,
             same_zone_clearance: self.same_zone_clearance,
             overcut_distance: self.overcut,
-            normalize_a: self.normalize_a,
+            keep_continuous_angle: self.keep_continuous_angle,
         }
     }
 
