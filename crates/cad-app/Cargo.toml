@@ -6,6 +6,6 @@ description = "Bevy + wgpu viewer for the CAD core"
 
 [dependencies]
 cad-core = { path = "../cad-core" }
-bevy = { version = "0.20.0", default-features = false, features = ["2d"] }
+bevy = { version = "0.20.0", default-features = false, features = ["2d", "3d", "tonemapping_luts"] }
 bevy_egui = "0.43.1"
 rfd = "0.17.2"

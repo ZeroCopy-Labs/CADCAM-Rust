@@ -4,11 +4,14 @@
 //! paths, Bevy renders them with gizmos, and egui provides the desktop UI.
 
 use std::env;
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bevy::{
+    gizmos::config::{GizmoConfigStore, GizmoLineStyle},
+    input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     prelude::*,
     window::{PrimaryWindow, WindowPlugin, WindowTheme},
 };
@@ -24,8 +27,6 @@ const MESSAGE_LIMIT: usize = 200;
 const COMMAND_MAX_HISTORY_LINES: usize = 4;
 const COMMAND_ROW_HEIGHT: f32 = 21.0;
 const COMMAND_VERTICAL_PADDING: f32 = 12.0;
-const TOP_BAR_HEIGHT: f32 = 36.0;
-const BOTTOM_BAR_HEIGHT: f32 = 30.0;
 const MENU_SIDE_WIDTH: f32 = 140.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
@@ -40,7 +41,6 @@ struct ViewerState {
     warning_count: usize,
     display: display::DisplayData,
     fit_dirty: bool,
-    rotation_deg: f32,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
     command_open: bool,
@@ -48,9 +48,47 @@ struct ViewerState {
     command_input: String,
 }
 
-/// Marker for the single 2D camera.
+/// Orbit camera state, independent from the loaded drawing.
+#[derive(Resource)]
+struct CameraRig {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    ortho_scale: f32,
+}
+
+impl Default for CameraRig {
+    fn default() -> Self {
+        Self {
+            target: Vec3::ZERO,
+            yaw: -FRAC_PI_4,
+            pitch: 0.55,
+            distance: 100.0,
+            ortho_scale: 1.0,
+        }
+    }
+}
+
+impl CameraRig {
+    /// Unit direction from the orbit target toward the camera.
+    fn direction(&self) -> Vec3 {
+        let cos_pitch = self.pitch.cos();
+        Vec3::new(
+            cos_pitch * self.yaw.sin(),
+            self.pitch.sin(),
+            cos_pitch * self.yaw.cos(),
+        )
+    }
+}
+
+/// Marker for the single 3D camera.
 #[derive(Component)]
 struct MainCamera;
+
+/// Dashed negative half-axes.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct DashedAxisGizmos;
 
 fn main() {
     let initial_path = env::args().nth(1).unwrap_or_default();
@@ -59,6 +97,10 @@ fn main() {
         ..Default::default()
     };
     push_message(&mut state, "使用“文件 → 打开文件”选择 DXF/DWG 图纸");
+    push_message(
+        &mut state,
+        "视角：Shift+中键旋转 | 中键拖动平移 | 滚轮缩放 | 右上角魔方切换",
+    );
     if !initial_path.trim().is_empty() {
         open_drawing(&mut state, &initial_path);
     }
@@ -76,14 +118,37 @@ fn main() {
         }))
         .add_plugins(EguiPlugin::default())
         .insert_resource(state)
-        .add_systems(Startup, setup_camera)
-        .add_systems(Update, (fit_camera, draw_display))
+        .insert_resource(CameraRig::default())
+        .init_gizmo_group::<DashedAxisGizmos>()
+        .add_systems(Startup, (setup_camera, configure_gizmos))
+        .add_systems(
+            Update,
+            (orbit_camera, fit_camera, update_camera, draw_scene).chain(),
+        )
         .add_systems(EguiPrimaryContextPass, drawing_ui)
         .run();
 }
 
 fn setup_camera(mut commands: Commands) {
-    commands.spawn((Camera2d, MainCamera));
+    commands.spawn((
+        Camera3d::default(),
+        Projection::Orthographic(OrthographicProjection {
+            scale: 1.0,
+            near: 0.01,
+            far: 1.0e7,
+            ..OrthographicProjection::default_3d()
+        }),
+        MainCamera,
+    ));
+}
+
+fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    let (negative_axes, _) = store.config_mut::<DashedAxisGizmos>();
+    negative_axes.line.width = 1.5;
+    negative_axes.line.style = GizmoLineStyle::Dashed {
+        gap_scale: 3.0,
+        line_scale: 3.0,
+    };
 }
 
 fn open_drawing(state: &mut ViewerState, raw_path: &str) {
@@ -108,7 +173,6 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.layer_count = document.layers.len();
             state.warning_count = document.import_report.warnings.len();
             state.display = display;
-            state.rotation_deg = 0.0;
             state.fit_dirty = true;
 
             push_message(state, format!("已加载 {} 个实体", state.entity_count));
@@ -153,10 +217,44 @@ fn submit_command(state: &mut ViewerState, raw: &str) {
     push_message(state, command.to_string());
 }
 
-/// Fit the 2D camera to the current display bounds.
+/// Orbit/pan/zoom controls for the 3D view.
+fn orbit_camera(
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    mut rig: ResMut<CameraRig>,
+) {
+    if mouse.pressed(MouseButton::Middle) {
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        if shift {
+            // Shift + middle drag: orbit the 3D view.
+            rig.yaw -= motion.delta.x * 0.008;
+            rig.pitch = (rig.pitch + motion.delta.y * 0.008).clamp(-1.55, 1.55);
+        } else {
+            // Plain middle drag: pan the orbit target.
+            let forward = -rig.direction();
+            let right = forward.cross(Vec3::Y).normalize_or_zero();
+            if right.length_squared() > 0.0 {
+                let up = right.cross(forward).normalize();
+                let speed = rig.ortho_scale;
+                rig.target -= right * motion.delta.x * speed;
+                rig.target += up * motion.delta.y * speed;
+            }
+        }
+    }
+
+    // Middle mouse wheel: zoom the orthographic projection.
+    let wheel = scroll.delta.y;
+    if wheel != 0.0 {
+        rig.ortho_scale = (rig.ortho_scale * (-wheel * 0.12).exp()).clamp(1.0e-5, 1.0e7);
+    }
+}
+
+/// Fit the orbit target and distance to the drawing bounds.
 fn fit_camera(
     mut state: ResMut<ViewerState>,
-    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
+    mut rig: ResMut<CameraRig>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
     if !state.fit_dirty {
@@ -168,44 +266,110 @@ fn fit_camera(
     };
 
     let width = (bounds.max_x - bounds.min_x).abs().max(1.0e-6);
-    let height = (bounds.max_y - bounds.min_y).abs().max(1.0e-6);
-    // Keep the drawing inside the menu/status bars instead of hiding it
-    // underneath the external UI panes.
-    let viewport_width = window.width().max(1.0) as f64;
-    let viewport_height = (window.height() - TOP_BAR_HEIGHT - BOTTOM_BAR_HEIGHT).max(1.0) as f64;
-    let scale = ((width / viewport_width).max(height / viewport_height) * 1.12) as f32;
+    let depth = (bounds.max_y - bounds.min_y).abs().max(1.0e-6);
+    let height = (bounds.max_z - bounds.min_z).abs().max(1.0e-6);
+    let center = Vec3::new(
+        ((bounds.min_x + bounds.max_x) * 0.5) as f32,
+        ((bounds.min_z + bounds.max_z) * 0.5) as f32,
+        -((bounds.min_y + bounds.max_y) * 0.5) as f32,
+    );
+    rig.target = center;
 
-    let (mut transform, mut projection) = camera.into_inner();
-    transform.translation.x = ((bounds.min_x + bounds.max_x) * 0.5) as f32;
-    transform.translation.y = ((bounds.min_y + bounds.max_y) * 0.5) as f32
-        + (TOP_BAR_HEIGHT - BOTTOM_BAR_HEIGHT) * 0.5 * scale;
-    transform.translation.z = 1000.0;
-    transform.rotation = Quat::from_rotation_z(state.rotation_deg.to_radians());
-    if let Projection::Orthographic(orthographic) = &mut *projection {
-        orthographic.scale = scale.max(1.0e-6);
+    // Fit the camera-aligned bounding box, so Z heights are included.
+    let direction = rig.direction();
+    let forward = -direction;
+    let mut right = forward.cross(Vec3::Y);
+    if right.length_squared() < 1.0e-6 {
+        right = Vec3::X;
+    } else {
+        right = right.normalize();
     }
+    let up = right.cross(forward).normalize_or_zero();
+    let mut max_right = 0.0f32;
+    let mut max_up = 0.0f32;
+    for x in [bounds.min_x, bounds.max_x] {
+        for y in [bounds.min_y, bounds.max_y] {
+            for z in [bounds.min_z, bounds.max_z] {
+                let corner = Vec3::new(x as f32, z as f32, -(y as f32)) - center;
+                max_right = max_right.max(corner.dot(right).abs());
+                max_up = max_up.max(corner.dot(up).abs());
+            }
+        }
+    }
+    let viewport_width = window.width().max(1.0);
+    let viewport_height = window.height().max(1.0);
+    let scale = (2.0 * max_right / viewport_width)
+        .max(2.0 * max_up / viewport_height)
+        .max(1.0e-6)
+        * 1.15;
+    rig.ortho_scale = scale;
+    rig.distance = ((width.max(depth).max(height) * 2.0).max(10.0)) as f32;
     state.fit_dirty = false;
 }
 
-/// Draw all display paths as 2D line segments.
-fn draw_display(state: Res<ViewerState>, mut gizmos: Gizmos) {
+fn update_camera(
+    rig: Res<CameraRig>,
+    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
+) {
+    let eye = rig.target + rig.direction() * rig.distance;
+    let (mut transform, mut projection) = camera.into_inner();
+    *transform = Transform::from_translation(eye).looking_at(rig.target, Vec3::Y);
+    if let Projection::Orthographic(orthographic) = &mut *projection {
+        orthographic.scale = rig.ortho_scale;
+    }
+}
+
+/// Draw the drawing paths and solid/dashed coordinate axes.
+fn draw_scene(
+    state: Res<ViewerState>,
+    mut gizmos: Gizmos,
+    mut negative_axes: Gizmos<DashedAxisGizmos>,
+) {
     for path in &state.display.paths {
         let color = Color::srgb(path.color[0], path.color[1], path.color[2]);
         for pair in path.points.windows(2) {
-            let [x0, y0] = pair[0];
-            let [x1, y1] = pair[1];
-            gizmos.line_2d(
-                Vec2::new(x0 as f32, y0 as f32),
-                Vec2::new(x1 as f32, y1 as f32),
+            let [x0, y0, z0] = pair[0];
+            let [x1, y1, z1] = pair[1];
+            gizmos.line(
+                Vec3::new(x0 as f32, z0 as f32, -(y0 as f32)),
+                Vec3::new(x1 as f32, z1 as f32, -(y1 as f32)),
                 color,
             );
         }
     }
+
+    let Some(bounds) = state.display.bounds else {
+        return;
+    };
+
+    // Keep the axes at the CAD world origin, never at the drawing center.
+    let extent = ((bounds.max_x - bounds.min_x)
+        .max(bounds.max_y - bounds.min_y)
+        .max(bounds.max_z - bounds.min_z)
+        .max(1.0)) as f32;
+    let axis = extent * 0.6;
+    let z_axis = axis * 0.5;
+    let red = Color::srgb(0.85, 0.25, 0.25);
+    let green = Color::srgb(0.30, 0.85, 0.35);
+    let blue = Color::srgb(0.25, 0.45, 0.95);
+    let origin = Vec3::ZERO;
+
+    // CAD +X, +Y and +Z in Bevy coordinates: CAD Y maps to -Bevy Z.
+    let positive_x = Vec3::X * axis;
+    let positive_y = -Vec3::Z * axis;
+    let positive_z = Vec3::Y * z_axis;
+    gizmos.line(origin, positive_x, red);
+    gizmos.line(origin, positive_y, blue);
+    gizmos.line(origin, positive_z, green);
+    negative_axes.line(origin, -positive_x, red);
+    negative_axes.line(origin, -positive_y, blue);
+    negative_axes.line(origin, -positive_z, green);
 }
 
 fn drawing_ui(
     mut contexts: EguiContexts,
     mut state: ResMut<ViewerState>,
+    mut camera: ResMut<CameraRig>,
     mut fonts_loaded: Local<bool>,
 ) -> Result {
     let context = contexts.ctx_mut()?;
@@ -266,14 +430,20 @@ fn drawing_ui(
                             fit_clicked = true;
                             ui.close();
                         }
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut state.rotation_deg, 0.0..=360.0)
-                                    .text("旋转"),
-                            )
-                            .changed()
-                        {
-                            fit_clicked = true;
+                        if ui.button("等轴测").clicked() {
+                            camera.yaw = -FRAC_PI_4;
+                            camera.pitch = 0.55;
+                            ui.close();
+                        }
+                        if ui.button("俯视图").clicked() {
+                            camera.yaw = 0.0;
+                            camera.pitch = 1.55;
+                            ui.close();
+                        }
+                        if ui.button("前视图").clicked() {
+                            camera.yaw = 0.0;
+                            camera.pitch = 0.0;
+                            ui.close();
                         }
                     });
                 },
@@ -392,7 +562,183 @@ fn drawing_ui(
     if fit_clicked {
         state.fit_dirty = true;
     }
+    view_cube_ui(context, &mut camera);
     Ok(())
+}
+
+/// Small clickable orientation cube in the top-right corner.
+fn view_cube_ui(context: &egui::Context, rig: &mut CameraRig) {
+    egui::Area::new(egui::Id::new("view_cube"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 48.0))
+        .show(context, |ui| {
+            let size = 108.0;
+            let (rect, response) =
+                ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(12, 17, 24, 235),
+            );
+
+            let dir = rig.direction();
+            let forward = -dir;
+            let mut right = forward.cross(Vec3::Y);
+            if right.length_squared() < 1.0e-6 {
+                right = Vec3::X;
+            } else {
+                right = right.normalize();
+            }
+            let up = right.cross(forward).normalize_or_zero();
+            let center = rect.center();
+            let scale = size * 0.28;
+            let project =
+                |point: Vec3| center + egui::vec2(point.dot(right), -point.dot(up)) * scale;
+
+            let pointer = ui.input(|input| input.pointer.hover_pos());
+            let visible: Vec<_> = cube_faces()
+                .into_iter()
+                .filter(|(_, normal, _, _)| normal.dot(dir) > 0.02)
+                .map(|(vertices, normal, label, view)| {
+                    let projected: Vec<egui::Pos2> =
+                        vertices.iter().map(|point| project(*point)).collect();
+                    (projected, normal, label, view)
+                })
+                .collect();
+            let hovered = pointer.and_then(|position| {
+                visible
+                    .iter()
+                    .position(|(polygon, _, _, _)| point_in_polygon(position, polygon))
+            });
+
+            for (index, (polygon, normal, label, _)) in visible.iter().enumerate() {
+                let base = if normal.x.abs() > 0.5 {
+                    egui::Color32::from_rgb(52, 62, 78)
+                } else if normal.y.abs() > 0.5 {
+                    egui::Color32::from_rgb(58, 70, 76)
+                } else {
+                    egui::Color32::from_rgb(48, 58, 74)
+                };
+                let fill = if Some(index) == hovered {
+                    egui::Color32::from_rgb(76, 105, 140)
+                } else {
+                    base
+                };
+                painter.add(egui::Shape::convex_polygon(
+                    polygon.clone(),
+                    fill,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 120, 145)),
+                ));
+                let center = polygon
+                    .iter()
+                    .fold(egui::Pos2::ZERO, |acc, point| acc + point.to_vec2())
+                    / polygon.len() as f32;
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(225, 232, 240),
+                );
+            }
+
+            if response.clicked() {
+                if let Some(index) = hovered {
+                    let (yaw, pitch) = visible[index].3;
+                    rig.yaw = yaw;
+                    rig.pitch = pitch;
+                }
+            }
+        });
+}
+
+/// Six cube faces: corners, outward normal, label, and (yaw, pitch) preset.
+fn cube_faces() -> [([Vec3; 4], Vec3, &'static str, (f32, f32)); 6] {
+    let v = Vec3::new;
+    [
+        (
+            [
+                v(1.0, -1.0, -1.0),
+                v(1.0, 1.0, -1.0),
+                v(1.0, 1.0, 1.0),
+                v(1.0, -1.0, 1.0),
+            ],
+            Vec3::X,
+            "右",
+            (FRAC_PI_2, 0.0),
+        ),
+        (
+            [
+                v(-1.0, -1.0, 1.0),
+                v(-1.0, 1.0, 1.0),
+                v(-1.0, 1.0, -1.0),
+                v(-1.0, -1.0, -1.0),
+            ],
+            Vec3::NEG_X,
+            "左",
+            (-FRAC_PI_2, 0.0),
+        ),
+        (
+            [
+                v(-1.0, 1.0, -1.0),
+                v(1.0, 1.0, -1.0),
+                v(1.0, 1.0, 1.0),
+                v(-1.0, 1.0, 1.0),
+            ],
+            Vec3::Y,
+            "上",
+            (0.0, 1.55),
+        ),
+        (
+            [
+                v(-1.0, -1.0, 1.0),
+                v(1.0, -1.0, 1.0),
+                v(1.0, -1.0, -1.0),
+                v(-1.0, -1.0, -1.0),
+            ],
+            Vec3::NEG_Y,
+            "下",
+            (0.0, -1.55),
+        ),
+        (
+            [
+                v(-1.0, -1.0, 1.0),
+                v(-1.0, 1.0, 1.0),
+                v(1.0, 1.0, 1.0),
+                v(1.0, -1.0, 1.0),
+            ],
+            Vec3::Z,
+            "前",
+            (0.0, 0.0),
+        ),
+        (
+            [
+                v(1.0, -1.0, -1.0),
+                v(1.0, 1.0, -1.0),
+                v(-1.0, 1.0, -1.0),
+                v(-1.0, -1.0, -1.0),
+            ],
+            Vec3::NEG_Z,
+            "后",
+            (PI, 0.0),
+        ),
+    ]
+}
+
+fn point_in_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
+    let mut inside = false;
+    let mut previous = polygon.len().saturating_sub(1);
+    for current in 0..polygon.len() {
+        let a = polygon[current];
+        let b = polygon[previous];
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
 }
 
 /// Install a Windows CJK font so the Chinese menu text is not rendered as boxes.

@@ -1,7 +1,7 @@
 //! Display tessellation for the Bevy viewport.
 //!
 //! This is a viewer adapter: it converts the internal CAD document into simple
-//! 2D line paths. It is not a geometry kernel and does not persist or modify
+//! 3D line paths. It is not a geometry kernel and does not persist or modify
 //! the CAD model.
 
 use std::f64::consts::TAU;
@@ -10,20 +10,22 @@ use cad_core::model::{
     Color, DrawingDocument, Entity, Geometry, Plane, Point3, Polyline, PolylineSegment, Spline,
 };
 
-/// World XY bounds of all display paths.
+/// World bounds of all display paths, in CAD coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct Bounds {
     pub min_x: f64,
     pub min_y: f64,
+    pub min_z: f64,
     pub max_x: f64,
     pub max_y: f64,
+    pub max_z: f64,
 }
 
 /// One drawable polyline with its display color.
 #[derive(Clone, Debug)]
 pub struct DisplayPath {
     pub color: [f32; 3],
-    pub points: Vec<[f64; 2]>,
+    pub points: Vec<[f64; 3]>,
 }
 
 /// All data the viewport needs after a drawing has been loaded.
@@ -33,24 +35,27 @@ pub struct DisplayData {
     pub bounds: Option<Bounds>,
 }
 
-/// Convert a drawing into flat 2D line paths for the Bevy gizmo renderer.
+/// Convert a drawing into 3D line paths for the Bevy scene.
 ///
-/// Z is preserved in the model but this first 2D view intentionally projects it.
+/// Arc/circle/ellipse points use their stored plane basis; splines are evaluated
+/// in 3D. The viewer only does the final CAD-to-render axis conversion.
 pub fn build_display(document: &DrawingDocument) -> DisplayData {
     let mut paths = Vec::new();
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
+    let mut min_z = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
     let mut has_points = false;
 
     for entity in &document.entities {
         let color = resolve_color(entity, document);
 
         for path in tessellate_geometry(&entity.geometry) {
-            let points: Vec<[f64; 2]> = path
+            let points: Vec<[f64; 3]> = path
                 .into_iter()
-                .filter(|point| point[0].is_finite() && point[1].is_finite())
+                .filter(|point| point.iter().all(|value| value.is_finite()))
                 .collect();
             if points.len() < 2 {
                 continue;
@@ -59,8 +64,10 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
             for point in &points {
                 min_x = min_x.min(point[0]);
                 min_y = min_y.min(point[1]);
+                min_z = min_z.min(point[2]);
                 max_x = max_x.max(point[0]);
                 max_y = max_y.max(point[1]);
+                max_z = max_z.max(point[2]);
             }
             has_points = true;
 
@@ -71,8 +78,10 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
     let bounds = has_points.then_some(Bounds {
         min_x,
         min_y,
+        min_z,
         max_x,
         max_y,
+        max_z,
     });
 
     DisplayData { paths, bounds }
@@ -123,9 +132,9 @@ fn aci_color(index: u8) -> [f32; 3] {
 }
 
 /// Dispatch one internal geometry value to its display tessellator.
-fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 2]>> {
+fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 3]>> {
     match geometry {
-        Geometry::Line(line) => vec![vec![project(line.start), project(line.end)]],
+        Geometry::Line(line) => vec![vec![to_array(line.start), to_array(line.end)]],
         Geometry::Polyline(polyline) => polyline_paths(polyline),
         Geometry::Circle(circle) => vec![sample_arc(
             circle.center,
@@ -155,10 +164,10 @@ fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 2]>> {
     }
 }
 
-/// Walk a polyline and merge its line/arc segments into one display path.
+/// Walk a polyline and merge its line/arc segments into one 3D display path.
 /// Arc segments use the polyline's shared plane; 3D polylines have line segments
 /// only by construction.
-fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 2]>> {
+fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 3]>> {
     let mut points = Vec::new();
     let plane = polyline.plane;
 
@@ -166,9 +175,9 @@ fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 2]>> {
         match segment {
             PolylineSegment::Line { start, end } => {
                 if points.is_empty() {
-                    points.push(project(*start));
+                    points.push(to_array(*start));
                 }
-                points.push(project(*end));
+                points.push(to_array(*end));
             }
             PolylineSegment::Arc {
                 start,
@@ -179,7 +188,7 @@ fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 2]>> {
                 sweep_angle,
             } => {
                 if points.is_empty() {
-                    points.push(project(*start));
+                    points.push(to_array(*start));
                 }
 
                 if let Some(plane) = plane {
@@ -197,7 +206,7 @@ fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 2]>> {
                 } else {
                     // A 3D-source polyline has line segments only; this is a
                     // defensive fallback for malformed input.
-                    points.push(project(*end));
+                    points.push(to_array(*end));
                 }
             }
         }
@@ -210,7 +219,7 @@ fn polyline_paths(polyline: &Polyline) -> Vec<Vec<[f64; 2]>> {
     }
 }
 
-/// Sample a 3D circular arc into 2D XY points using the plane basis.
+/// Sample a 3D circular arc using the plane basis.
 fn sample_arc(
     center: Point3,
     radius: f64,
@@ -218,7 +227,7 @@ fn sample_arc(
     sweep_angle: f64,
     plane: Plane,
     segments: usize,
-) -> Vec<[f64; 2]> {
+) -> Vec<[f64; 3]> {
     if !radius.is_finite() || radius.abs() <= 1.0e-12 || !sweep_angle.is_finite() {
         return Vec::new();
     }
@@ -240,13 +249,13 @@ fn sample_arc(
             center.y + radius * (cos * plane.x_axis.y + sin * y_axis.y),
             center.z + radius * (cos * plane.x_axis.z + sin * y_axis.z),
         );
-        points.push(project(point));
+        points.push(to_array(point));
     }
 
     points
 }
 
-/// Sample an ellipse parameter range into 2D XY points.
+/// Sample an ellipse parameter range in 3D.
 fn sample_ellipse(
     center: Point3,
     major_axis: cad_core::model::Vector3,
@@ -254,7 +263,7 @@ fn sample_ellipse(
     start_parameter: f64,
     sweep_parameter: f64,
     segments: usize,
-) -> Vec<[f64; 2]> {
+) -> Vec<[f64; 3]> {
     if !sweep_parameter.is_finite() || sweep_parameter.abs() <= 1.0e-12 {
         return Vec::new();
     }
@@ -270,31 +279,31 @@ fn sample_ellipse(
             center.y + major_axis.y * cos + minor_axis.y * sin,
             center.z + major_axis.z * cos + minor_axis.z * sin,
         );
-        points.push(project(point));
+        points.push(to_array(point));
     }
 
     points
 }
 
-/// Sample a NURBS spline. Falls back to the control polygon when the knot or
-/// degree data is incomplete; this keeps malformed drawings visible.
-fn sample_spline(spline: &Spline) -> Vec<[f64; 2]> {
+/// Sample a NURBS spline in 3D. Falls back to the control polygon when the knot
+/// or degree data is incomplete; this keeps malformed drawings visible.
+fn sample_spline(spline: &Spline) -> Vec<[f64; 3]> {
     let control = &spline.control_points;
     let control_count = control.len();
     let degree = spline.degree as usize;
 
     if control_count < degree + 1 || control_count < 2 {
-        return control.iter().map(|point| project(*point)).collect();
+        return control.iter().map(|point| to_array(*point)).collect();
     }
 
     if spline.knots.len() < control_count + degree + 1 {
-        return control.iter().map(|point| project(*point)).collect();
+        return control.iter().map(|point| to_array(*point)).collect();
     }
 
     let start = spline.knots[degree];
     let end = spline.knots[control_count];
     if !start.is_finite() || !end.is_finite() || end <= start {
-        return control.iter().map(|point| project(*point)).collect();
+        return control.iter().map(|point| to_array(*point)).collect();
     }
 
     let segments = 64usize;
@@ -310,14 +319,14 @@ fn sample_spline(spline: &Spline) -> Vec<[f64; 2]> {
         if let Some(point) =
             evaluate_spline(control, &spline.weights, &spline.knots, degree, parameter)
         {
-            points.push(project(point));
+            points.push(to_array(point));
         }
     }
 
     if points.len() >= 2 {
         points
     } else {
-        control.iter().map(|point| project(*point)).collect()
+        control.iter().map(|point| to_array(*point)).collect()
     }
 }
 
@@ -396,7 +405,6 @@ fn segments_for_sweep(sweep_angle: f64) -> usize {
     ((fraction * 96.0).ceil() as usize).clamp(8, 256)
 }
 
-/// The current viewport is a top view, so display points drop Z.
-fn project(point: Point3) -> [f64; 2] {
-    [point.x, point.y]
+fn to_array(point: Point3) -> [f64; 3] {
+    [point.x, point.y, point.z]
 }
