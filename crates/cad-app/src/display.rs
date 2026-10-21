@@ -4,6 +4,7 @@
 //! 3D line paths. It is not a geometry kernel and does not persist or modify
 //! the CAD model.
 
+use std::collections::BTreeMap;
 use std::f64::consts::TAU;
 
 use cad_core::model::{
@@ -41,11 +42,22 @@ pub struct DisplayEntity {
     pub properties: Vec<(&'static str, String)>,
 }
 
+/// Source arc/circle metadata retained for G02/G03 output of planar units.
+#[derive(Clone, Debug)]
+pub struct DisplayArc {
+    pub center: [f64; 3],
+    pub normal: [f64; 3],
+    pub start_angle: f64,
+    pub sweep_angle: f64,
+    pub full_circle: bool,
+}
+
 /// All data the viewport needs after a drawing has been loaded.
 #[derive(Clone, Debug, Default)]
 pub struct DisplayData {
     pub paths: Vec<DisplayPath>,
     pub entities: Vec<DisplayEntity>,
+    pub arcs: BTreeMap<u32, DisplayArc>,
     pub bounds: Option<Bounds>,
 }
 
@@ -56,6 +68,7 @@ pub struct DisplayData {
 pub fn build_display(document: &DrawingDocument) -> DisplayData {
     let mut paths = Vec::new();
     let mut entities = Vec::new();
+    let mut arcs = BTreeMap::new();
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut min_z = f64::INFINITY;
@@ -97,6 +110,37 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
             continue;
         }
         paths.extend(entity_paths);
+        match &entity.geometry {
+            Geometry::Circle(circle) => {
+                arcs.insert(
+                    entity.id.0,
+                    DisplayArc {
+                        center: [circle.center.x, circle.center.y, circle.center.z],
+                        normal: [
+                            circle.plane.normal.x,
+                            circle.plane.normal.y,
+                            circle.plane.normal.z,
+                        ],
+                        start_angle: 0.0,
+                        sweep_angle: TAU,
+                        full_circle: true,
+                    },
+                );
+            }
+            Geometry::Arc(arc) => {
+                arcs.insert(
+                    entity.id.0,
+                    DisplayArc {
+                        center: [arc.center.x, arc.center.y, arc.center.z],
+                        normal: [arc.plane.normal.x, arc.plane.normal.y, arc.plane.normal.z],
+                        start_angle: arc.start_angle,
+                        sweep_angle: arc.sweep_angle,
+                        full_circle: false,
+                    },
+                );
+            }
+            _ => {}
+        }
         let layer = document
             .layers
             .iter()
@@ -129,6 +173,7 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
     DisplayData {
         paths,
         entities,
+        arcs,
         bounds,
     }
 }

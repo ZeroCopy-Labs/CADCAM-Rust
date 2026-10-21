@@ -38,9 +38,27 @@ pub struct MachinePose {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArcPlane {
+    XY,
+    XZ,
+    YZ,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MachineMoveKind {
     Rapid,
     Cutting,
+    Arc {
+        clockwise: bool,
+        plane: ArcPlane,
+        center: [f64; 3],
+    },
+}
+
+impl MachineMoveKind {
+    pub fn is_cutting(self) -> bool {
+        matches!(self, Self::Cutting | Self::Arc { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,12 +224,61 @@ pub fn build_trajectory(
                 kind: MachineMoveKind::Rapid,
                 pose: first,
             });
-            for pose in poses.iter().skip(1) {
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Cutting,
-                    pose: *pose,
-                });
-                cutting_move_count += 1;
+            if let Some(arc) = arc_cut_info(
+                display,
+                cam,
+                unit,
+                &poses,
+                center_y,
+                center_z,
+                config.machining_z_offset,
+            ) {
+                if arc.full_circle && poses.len() >= 4 {
+                    let mid = poses[arc.mid_index];
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Arc {
+                            clockwise: arc.clockwise,
+                            plane: arc.plane,
+                            center: arc.center,
+                        },
+                        pose: mid,
+                    });
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Arc {
+                            clockwise: arc.clockwise,
+                            plane: arc.plane,
+                            center: arc.center,
+                        },
+                        pose: first,
+                    });
+                    cutting_move_count += 2;
+                } else if !arc.full_circle {
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Arc {
+                            clockwise: arc.clockwise,
+                            plane: arc.plane,
+                            center: arc.center,
+                        },
+                        pose: last,
+                    });
+                    cutting_move_count += 1;
+                } else {
+                    for pose in poses.iter().skip(1) {
+                        moves.push(MachineMove {
+                            kind: MachineMoveKind::Cutting,
+                            pose: *pose,
+                        });
+                        cutting_move_count += 1;
+                    }
+                }
+            } else {
+                for pose in poses.iter().skip(1) {
+                    moves.push(MachineMove {
+                        kind: MachineMoveKind::Cutting,
+                        pose: *pose,
+                    });
+                    cutting_move_count += 1;
+                }
             }
             moves.push(MachineMove {
                 kind: MachineMoveKind::Rapid,
@@ -249,6 +316,92 @@ pub fn build_trajectory(
         a_min: if a_min.is_finite() { a_min } else { 0.0 },
         a_max: if a_max.is_finite() { a_max } else { 0.0 },
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArcCutInfo {
+    center: [f64; 3],
+    plane: ArcPlane,
+    clockwise: bool,
+    full_circle: bool,
+    mid_index: usize,
+}
+
+fn arc_cut_info(
+    display: &DisplayData,
+    cam: &CamModel,
+    unit: &crate::cam_analysis::PlanUnit,
+    poses: &[MachinePose],
+    center_y: f64,
+    center_z: f64,
+    machining_z_offset: f64,
+) -> Option<ArcCutInfo> {
+    if unit.machining_cut || poses.len() < 3 {
+        return None;
+    }
+    let members = &cam.unit(unit.unit_id)?.members;
+    if members.len() != 1 {
+        return None;
+    }
+    let arc = display.arcs.get(&members[0])?;
+    let first_a = poses.first()?.a;
+    if poses.iter().any(|pose| (pose.a - first_a).abs() > 1.0e-6) {
+        return None;
+    }
+
+    let angle = first_a.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let center = [
+        arc.center[0],
+        center_y + (arc.center[1] - center_y) * cos - (arc.center[2] - center_z) * sin,
+        center_z
+            + (arc.center[1] - center_y) * sin
+            + (arc.center[2] - center_z) * cos
+            + machining_z_offset,
+    ];
+    let normal = [
+        arc.normal[0],
+        arc.normal[1] * cos - arc.normal[2] * sin,
+        arc.normal[1] * sin + arc.normal[2] * cos,
+    ];
+    let absolute = [normal[0].abs(), normal[1].abs(), normal[2].abs()];
+    let (plane, canonical) = if absolute[2] >= absolute[0] && absolute[2] >= absolute[1] {
+        (ArcPlane::XY, [0.0, 0.0, 1.0])
+    } else if absolute[1] >= absolute[0] {
+        (ArcPlane::XZ, [0.0, 1.0, 0.0])
+    } else {
+        (ArcPlane::YZ, [1.0, 0.0, 0.0])
+    };
+
+    let mid_index = poses.len() / 2;
+    if mid_index == 0 || mid_index >= poses.len() - 1 {
+        return None;
+    }
+    let start = poses[0];
+    let mid = poses[mid_index];
+    let start_vector = [
+        start.x - center[0],
+        start.y - center[1],
+        start.z - center[2],
+    ];
+    let mid_vector = [mid.x - center[0], mid.y - center[1], mid.z - center[2]];
+    let cross = [
+        start_vector[1] * mid_vector[2] - start_vector[2] * mid_vector[1],
+        start_vector[2] * mid_vector[0] - start_vector[0] * mid_vector[2],
+        start_vector[0] * mid_vector[1] - start_vector[1] * mid_vector[0],
+    ];
+    let sense = cross[0] * canonical[0] + cross[1] * canonical[1] + cross[2] * canonical[2];
+    if sense.abs() <= 1.0e-12 {
+        return None;
+    }
+
+    Some(ArcCutInfo {
+        center,
+        plane,
+        clockwise: sense < 0.0,
+        full_circle: arc.full_circle,
+        mid_index,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

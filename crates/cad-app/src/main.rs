@@ -49,6 +49,8 @@ struct ViewerState {
     analysis: cam_analysis::CamAnalysis,
     trajectory: Option<cam_trajectory::MachineTrajectory>,
     gcode_profile: gcode::GCodeProfile,
+    gcode_preview: String,
+    gcode_settings_open: bool,
     fit_dirty: bool,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
@@ -1441,6 +1443,7 @@ fn drawing_ui(
 
     let mut open_dialog = false;
     let mut export_gcode = false;
+    let mut quick_export_gcode = false;
     let mut pending_path: Option<PathBuf> = None;
     let mut fit_clicked = false;
     let current_name = if state.file_name.is_empty() {
@@ -1471,6 +1474,14 @@ fn drawing_ui(
                         ui.separator();
                         if ui.button("导出 G 代码").clicked() {
                             export_gcode = true;
+                            ui.close();
+                        }
+                        if ui.button("G代码配置与预览").clicked() {
+                            state.gcode_settings_open = true;
+                            ui.close();
+                        }
+                        if ui.button("快速导出到 build").clicked() {
+                            quick_export_gcode = true;
                             ui.close();
                         }
                         ui.separator();
@@ -1822,6 +1833,9 @@ fn drawing_ui(
     if export_gcode {
         export_gcode_file(&mut state);
     }
+    if quick_export_gcode {
+        quick_export_gcode_file(&mut state);
+    }
     if fit_clicked {
         state.fit_dirty = true;
     }
@@ -1845,6 +1859,139 @@ fn drawing_ui(
     }
 
     view_cube_ui(context, &mut camera);
+
+    if state.gcode_settings_open {
+        if state.gcode_preview.is_empty() {
+            refresh_gcode_preview(&mut state);
+        }
+        let mut window_open = true;
+        let mut save_profile = false;
+        let mut reload_profile = false;
+        let config_path = gcode_config_path();
+        egui::Window::new("G代码配置")
+            .default_width(560.0)
+            .open(&mut window_open)
+            .show(context, |ui| {
+                ui.label(format!("配置文件：{}", config_path.display()));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(520.0)
+                    .show(ui, |ui| {
+                        ui.label("文件头");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut state.gcode_profile.header)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label("文件尾");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut state.gcode_profile.footer)
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY),
+                        );
+                        egui::Grid::new("gcode_profile_fields")
+                            .num_columns(4)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("单元开始");
+                                ui.text_edit_singleline(&mut state.gcode_profile.unit_start);
+                                ui.label("单元结束");
+                                ui.text_edit_singleline(&mut state.gcode_profile.unit_end);
+                                ui.end_row();
+                                ui.label("快速代码");
+                                ui.text_edit_singleline(&mut state.gcode_profile.rapid);
+                                ui.label("切削代码");
+                                ui.text_edit_singleline(&mut state.gcode_profile.cutting);
+                                ui.end_row();
+                                ui.label("进给");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.gcode_profile.feed).speed(1.0),
+                                );
+                                ui.label("小数位");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.gcode_profile.decimals)
+                                        .range(0..=6),
+                                );
+                                ui.end_row();
+                                ui.label("换行");
+                                ui.text_edit_singleline(&mut state.gcode_profile.line_ending);
+                                ui.label("过切");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.gcode_profile.overcut)
+                                        .speed(0.1),
+                                );
+                                ui.end_row();
+                                ui.label("A 偏移");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.gcode_profile.a_offset_degrees)
+                                        .speed(0.1),
+                                );
+                                ui.label("Z 修正");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut state.gcode_profile.machining_z_offset,
+                                    )
+                                    .speed(0.1),
+                                );
+                                ui.end_row();
+                                ui.label("安全抬刀");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut state.gcode_profile.rotation_safety_clearance,
+                                    )
+                                    .speed(0.1),
+                                );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("保存配置并重算").clicked() {
+                                save_profile = true;
+                            }
+                            if ui.button("重新加载").clicked() {
+                                reload_profile = true;
+                            }
+                            if ui.button("刷新预览").clicked() {
+                                refresh_gcode_preview(&mut state);
+                            }
+                        });
+                        ui.separator();
+                        let preview: String = state
+                            .gcode_preview
+                            .lines()
+                            .take(300)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.collapsing("G代码预览（前 300 行）", |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.monospace(preview);
+                                });
+                        });
+                    });
+            });
+        state.gcode_settings_open = window_open;
+
+        if reload_profile {
+            state.gcode_profile = gcode::GCodeProfile::load(&config_path).unwrap_or_default();
+            rebuild_state_trajectory(&mut state);
+            refresh_gcode_preview(&mut state);
+            push_message(&mut state, "已重新加载 G 代码配置");
+        }
+        if save_profile {
+            match state.gcode_profile.save(&config_path) {
+                Ok(()) => {
+                    rebuild_state_trajectory(&mut state);
+                    refresh_gcode_preview(&mut state);
+                    push_message(&mut state, "G 代码配置已保存，轨迹已重新计算");
+                }
+                Err(error) => push_message(&mut state, format!("保存配置失败：{error}")),
+            }
+        }
+    }
 
     let pointer = context.input(|input| input.pointer.hover_pos());
     let over_panels = pointer
@@ -2071,6 +2218,31 @@ fn gcode_config_path() -> PathBuf {
     base.join("CADCAM-Rust").join("gcode.toml")
 }
 
+fn refresh_gcode_preview(state: &mut ViewerState) {
+    state.gcode_preview = state
+        .trajectory
+        .as_ref()
+        .map(|trajectory| gcode::render_gcode(trajectory, &state.gcode_profile))
+        .unwrap_or_default();
+}
+
+fn rebuild_state_trajectory(state: &mut ViewerState) {
+    let ViewerState {
+        display,
+        cam,
+        analysis,
+        trajectory,
+        gcode_profile,
+        ..
+    } = &mut *state;
+    *trajectory = Some(cam_trajectory::build_trajectory(
+        display,
+        cam,
+        analysis,
+        gcode_profile.rotary_config(),
+    ));
+}
+
 fn export_gcode_file(state: &mut ViewerState) {
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
@@ -2100,6 +2272,33 @@ fn export_gcode_file(state: &mut ViewerState) {
     match fs::write(&path, text) {
         Ok(()) => push_message(state, format!("已导出 G 代码：{}", path.display())),
         Err(error) => push_message(state, format!("导出 G 代码失败：{error}")),
+    }
+}
+
+fn quick_export_gcode_file(state: &mut ViewerState) {
+    let Some(trajectory) = state.trajectory.as_ref() else {
+        push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
+        return;
+    };
+    if trajectory.unit_ranges.is_empty() {
+        push_message(state, "没有可导出的加工单元");
+        return;
+    }
+    let stem = Path::new(&state.file_name)
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let path = env::current_dir()
+        .unwrap_or_default()
+        .join("build")
+        .join(format!("{stem}-quick.nc"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let text = gcode::render_gcode(trajectory, &state.gcode_profile);
+    match fs::write(&path, text) {
+        Ok(()) => push_message(state, format!("快速导出 G 代码：{}", path.display())),
+        Err(error) => push_message(state, format!("快速导出 G 代码失败：{error}")),
     }
 }
 

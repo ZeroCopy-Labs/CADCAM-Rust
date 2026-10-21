@@ -8,7 +8,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cam_trajectory::{MachineMoveKind, MachineTrajectory};
+use crate::cam_trajectory::{
+    ArcPlane, MachineMove, MachineMoveKind, MachinePose, MachineTrajectory,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -91,6 +93,7 @@ impl GCodeProfile {
 pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> String {
     let mut lines: Vec<String> = Vec::new();
     push_block(&mut lines, &profile.header);
+    let mut previous_pose: Option<MachinePose> = None;
 
     for range in &trajectory.unit_ranges {
         let start = range.start.min(trajectory.moves.len());
@@ -99,25 +102,23 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
             continue;
         }
         let moves = &trajectory.moves[start..end];
-        let first_cut = moves
-            .iter()
-            .position(|movement| movement.kind == MachineMoveKind::Cutting);
+        let first_cut = moves.iter().position(|movement| movement.kind.is_cutting());
         let last_cut = moves
             .iter()
-            .rposition(|movement| movement.kind == MachineMoveKind::Cutting);
+            .rposition(|movement| movement.kind.is_cutting());
 
         for movement in moves.iter().take(first_cut.unwrap_or(moves.len())) {
-            lines.push(rapid_line(movement, profile));
+            push_movement(&mut lines, movement, profile, &mut previous_pose);
         }
 
         if let (Some(first_cut), Some(last_cut)) = (first_cut, last_cut) {
             push_block(&mut lines, &profile.unit_start);
             for movement in &moves[first_cut..=last_cut] {
-                lines.push(cutting_line(movement, profile));
+                push_movement(&mut lines, movement, profile, &mut previous_pose);
             }
             push_block(&mut lines, &profile.unit_end);
             for movement in moves.iter().skip(last_cut + 1) {
-                lines.push(rapid_line(movement, profile));
+                push_movement(&mut lines, movement, profile, &mut previous_pose);
             }
         }
     }
@@ -143,12 +144,45 @@ fn push_block(lines: &mut Vec<String>, block: &str) {
     }
 }
 
-fn rapid_line(movement: &crate::cam_trajectory::MachineMove, profile: &GCodeProfile) -> String {
+fn push_movement(
+    lines: &mut Vec<String>,
+    movement: &MachineMove,
+    profile: &GCodeProfile,
+    previous_pose: &mut Option<MachinePose>,
+) {
+    match movement.kind {
+        MachineMoveKind::Rapid => lines.push(rapid_line(movement, profile)),
+        MachineMoveKind::Cutting => lines.push(cutting_line(movement, profile)),
+        MachineMoveKind::Arc {
+            clockwise,
+            plane,
+            center,
+        } => {
+            let Some(start) = *previous_pose else {
+                lines.push(cutting_line(movement, profile));
+                *previous_pose = Some(movement.pose);
+                return;
+            };
+            lines.push(
+                match plane {
+                    ArcPlane::XY => "G17",
+                    ArcPlane::XZ => "G18",
+                    ArcPlane::YZ => "G19",
+                }
+                .to_string(),
+            );
+            lines.push(arc_line(movement, start, center, clockwise, plane, profile));
+        }
+    }
+    *previous_pose = Some(movement.pose);
+}
+
+fn rapid_line(movement: &MachineMove, profile: &GCodeProfile) -> String {
     let axis = format_axis(movement.pose, profile.decimals);
     format!("{} {}", profile.rapid, axis)
 }
 
-fn cutting_line(movement: &crate::cam_trajectory::MachineMove, profile: &GCodeProfile) -> String {
+fn cutting_line(movement: &MachineMove, profile: &GCodeProfile) -> String {
     let axis = format_axis(movement.pose, profile.decimals);
     format!(
         "{} {} F{}",
@@ -158,7 +192,42 @@ fn cutting_line(movement: &crate::cam_trajectory::MachineMove, profile: &GCodePr
     )
 }
 
-fn format_axis(pose: crate::cam_trajectory::MachinePose, decimals: usize) -> String {
+fn arc_line(
+    movement: &MachineMove,
+    start: MachinePose,
+    center: [f64; 3],
+    clockwise: bool,
+    plane: ArcPlane,
+    profile: &GCodeProfile,
+) -> String {
+    let code = if clockwise { "G02" } else { "G03" };
+    let i = format_number(center[0] - start.x, profile.decimals);
+    let j = format_number(center[1] - start.y, profile.decimals);
+    let k = format_number(center[2] - start.z, profile.decimals);
+    let offsets = match plane {
+        ArcPlane::XY => format!("I{i} J{j}"),
+        ArcPlane::XZ => format!("I{i} K{k}"),
+        ArcPlane::YZ => format!("J{j} K{k}"),
+    };
+    format!(
+        "{} {} {} F{}",
+        code,
+        format_axis_xyz(movement.pose, profile.decimals),
+        offsets,
+        format_number(profile.feed, profile.decimals)
+    )
+}
+
+fn format_axis_xyz(pose: MachinePose, decimals: usize) -> String {
+    format!(
+        "X{} Y{} Z{}",
+        format_number(pose.x, decimals),
+        format_number(pose.y, decimals),
+        format_number(pose.z, decimals)
+    )
+}
+
+fn format_axis(pose: MachinePose, decimals: usize) -> String {
     format!(
         "X{} Y{} Z{} A{}",
         format_number(pose.x, decimals),
