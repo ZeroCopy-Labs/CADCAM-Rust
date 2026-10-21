@@ -121,6 +121,19 @@ pub struct TubeSection {
     pub source: SectionSource,
 }
 
+impl Default for TubeSection {
+    fn default() -> Self {
+        Self {
+            center_y: 0.0,
+            center_z: 0.0,
+            size_y: 38.0,
+            size_z: 25.0,
+            radius: 2.0,
+            source: SectionSource::Manual,
+        }
+    }
+}
+
 impl TubeSection {
     pub fn half_y(&self) -> f64 {
         self.size_y.max(1.0e-9) * 0.5
@@ -475,6 +488,9 @@ impl CamAnalysis {
         let mut analysis = Self::default();
         analysis.tube_candidates = detect_tube_candidates(display, cam);
         analysis.try_auto_tube_section(display, cam);
+        if analysis.tube_section.is_none() {
+            analysis.rebuild_without_tube_section(display, cam);
+        }
         analysis
     }
 
@@ -598,14 +614,95 @@ impl CamAnalysis {
         true
     }
 
-    pub fn clear_tube_section(&mut self) {
+    pub fn clear_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
         self.tube_section = None;
+        self.rebuild_without_tube_section(display, cam);
+    }
+
+    /// Fallback planning when no tube section can be determined: process the
+    /// machining units directly in X order without section/zone analysis.
+    fn rebuild_without_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
         self.machining_candidates.clear();
         self.machining_sections.clear();
+        self.zone_profiles.clear();
         self.intervals.clear();
         self.groups.clear();
         self.plan.groups.clear();
-        self.zone_profiles.clear();
+
+        let mut unit_ids: Vec<UnitId> = cam.units.iter().map(|unit| unit.id).collect();
+        if unit_ids.is_empty() {
+            return;
+        }
+        unit_ids.sort_by(|left, right| {
+            let left_x = unit_x_bounds(display, cam, *left)
+                .map(|(minimum, _)| minimum)
+                .unwrap_or(f64::INFINITY);
+            let right_x = unit_x_bounds(display, cam, *right)
+                .map(|(minimum, _)| minimum)
+                .unwrap_or(f64::INFINITY);
+            left_x
+                .partial_cmp(&right_x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut planned = Vec::new();
+        for (index, unit_id) in unit_ids.iter().enumerate() {
+            planned.push(PlanUnit {
+                unit_id: *unit_id,
+                zone: TubeZone::TopFace,
+                order: index as u32 + 1,
+                machining_cut: false,
+                direction: UnitDirection::Forward,
+                start_point: [0.0; 3],
+                end_point: [0.0; 3],
+            });
+        }
+        let mut previous_end: Option<[f64; 3]> = None;
+        for unit in &mut planned {
+            if let Some((direction, start, end)) =
+                choose_unit_direction(display, cam, unit.unit_id, previous_end)
+            {
+                unit.direction = direction;
+                unit.start_point = start;
+                unit.end_point = end;
+                previous_end = Some(end);
+            }
+        }
+
+        let x_start = unit_ids
+            .iter()
+            .filter_map(|unit_id| unit_x_bounds(display, cam, *unit_id))
+            .map(|(minimum, _)| minimum)
+            .fold(f64::INFINITY, f64::min);
+        let x_end = unit_ids
+            .iter()
+            .filter_map(|unit_id| unit_x_bounds(display, cam, *unit_id))
+            .map(|(_, maximum)| maximum)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let x_start = if x_start.is_finite() { x_start } else { 0.0 };
+        let x_end = if x_end.is_finite() { x_end } else { 0.0 };
+
+        self.groups.push(MachiningGroup {
+            id: 0,
+            x_start,
+            x_end,
+            section_unit: None,
+            units: unit_ids.clone(),
+            zone_groups: Vec::new(),
+        });
+        self.intervals.push(MachiningInterval {
+            id: 0,
+            x_start,
+            x_end,
+            units: unit_ids,
+        });
+        self.plan.groups.push(PlanGroup {
+            group_id: 0,
+            x_start,
+            x_end,
+            units: planned,
+        });
     }
 
     fn try_auto_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
@@ -633,6 +730,7 @@ impl CamAnalysis {
         self.plan.groups.clear();
         self.zone_profiles.clear();
         let Some(section) = self.tube_section.clone() else {
+            self.rebuild_without_tube_section(display, cam);
             return;
         };
         self.machining_candidates = detect_machining_candidates(display, cam, &section);
@@ -797,6 +895,10 @@ impl CamAnalysis {
     }
 
     fn rebuild_plan(&mut self, display: &DisplayData, cam: &CamModel) {
+        if self.tube_section.is_none() {
+            self.rebuild_without_tube_section(display, cam);
+            return;
+        }
         self.plan.groups.clear();
         let mut next_order = 1u32;
 

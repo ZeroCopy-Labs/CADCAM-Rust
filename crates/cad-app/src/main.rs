@@ -49,6 +49,7 @@ struct ViewerState {
     display: display::DisplayData,
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
+    manual_tube: cam_analysis::TubeSection,
     trajectory: Option<cam_trajectory::MachineTrajectory>,
     gcode_profile: gcode::GCodeProfile,
     gcode_preview: String,
@@ -1045,6 +1046,7 @@ fn cam_analysis_ui(
     ui: &mut egui::Ui,
     analysis: &cam_analysis::CamAnalysis,
     trajectory: Option<&cam_trajectory::MachineTrajectory>,
+    manual_tube: &mut cam_analysis::TubeSection,
 ) -> CamAnalysisUiAction {
     let mut action = CamAnalysisUiAction::default();
 
@@ -1104,35 +1106,63 @@ fn cam_analysis_ui(
                         action.manual_tube = Some(edited);
                     }
                 });
-            } else if analysis.tube_candidates.is_empty() {
-                ui.label("未识别到方管截面候选");
             } else {
-                ui.label(format!(
-                    "候选 {} 个，请选择",
-                    analysis.tube_candidates.len()
-                ));
-                for (index, candidate) in analysis.tube_candidates.iter().take(8).enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "Y{:.2} Z{:.2} {:.2}×{:.2} R{:.2}",
-                            candidate.center_y,
-                            candidate.center_z,
-                            candidate.size_y,
-                            candidate.size_z,
-                            candidate.radius
-                        ));
-                        if ui.small_button("应用").clicked() {
-                            action.apply_tube = Some(index);
-                        }
-                    });
+                if analysis.tube_candidates.is_empty() {
+                    ui.label("未识别到方管截面候选");
+                } else {
+                    ui.label(format!(
+                        "候选 {} 个，请选择",
+                        analysis.tube_candidates.len()
+                    ));
+                    for (index, candidate) in analysis.tube_candidates.iter().take(8).enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Y{:.2} Z{:.2} {:.2}×{:.2} R{:.2}",
+                                candidate.center_y,
+                                candidate.center_z,
+                                candidate.size_y,
+                                candidate.size_z,
+                                candidate.radius
+                            ));
+                            if ui.small_button("应用").clicked() {
+                                action.apply_tube = Some(index);
+                            }
+                        });
+                    }
                 }
+                ui.separator();
+                ui.label("无截面时可直接按加工单元导出；也可手动指定方管截面。");
+                ui.label("手动截面参数");
+                ui.horizontal(|ui| {
+                    ui.label("中心 Y");
+                    ui.add(egui::DragValue::new(&mut manual_tube.center_y).speed(0.1));
+                    ui.label("中心 Z");
+                    ui.add(egui::DragValue::new(&mut manual_tube.center_z).speed(0.1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("方管宽 Y");
+                    ui.add(egui::DragValue::new(&mut manual_tube.size_y).speed(0.1));
+                    ui.label("方管高 Z");
+                    ui.add(egui::DragValue::new(&mut manual_tube.size_z).speed(0.1));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("圆角");
+                    ui.add(egui::DragValue::new(&mut manual_tube.radius).speed(0.1));
+                    if ui.small_button("应用手动截面").clicked() {
+                        action.manual_tube = Some(manual_tube.clone());
+                    }
+                });
             }
         });
 
-    if analysis.tube_section.is_some() {
+    if analysis.tube_section.is_some() || !analysis.plan.groups.is_empty() {
         egui::CollapsingHeader::new("加工断面与区间")
             .default_open(true)
             .show(ui, |ui| {
+                if analysis.tube_section.is_none() {
+                    ui.label("未识别方管截面：当前按加工单元直接排序和导出。");
+                    ui.separator();
+                }
                 if analysis.machining_candidates.is_empty() {
                     ui.label("未识别到加工断面候选");
                 } else {
@@ -1881,8 +1911,14 @@ fn drawing_ui(
                 }
                 SpaceMode::Cam => {
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        let ViewerState {
+                            analysis,
+                            trajectory,
+                            manual_tube,
+                            ..
+                        } = &mut *state;
                         cam_action =
-                            cam_analysis_ui(ui, &state.analysis, state.trajectory.as_ref());
+                            cam_analysis_ui(ui, analysis, trajectory.as_ref(), manual_tube);
                         ui.separator();
 
                         let selected_units: Vec<&cam::MachiningUnit> = state
@@ -1974,10 +2010,7 @@ fn drawing_ui(
 
     let feature_rect = feature_panel.response.rect;
 
-    if cam_action.clear_tube {
-        state.analysis.clear_tube_section();
-    }
-    let mut cam_input_changed = cam_action.clear_tube;
+    let mut cam_input_changed = false;
     {
         let ViewerState {
             display,
@@ -1985,6 +2018,10 @@ fn drawing_ui(
             analysis,
             ..
         } = &mut *state;
+        if cam_action.clear_tube {
+            analysis.clear_tube_section(display, cam);
+            cam_input_changed = true;
+        }
         if let Some(index) = cam_action.apply_tube {
             analysis.apply_tube_candidate(index, display, cam);
             cam_input_changed = true;

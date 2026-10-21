@@ -103,7 +103,7 @@ pub fn build_trajectory(
     config: RotaryConfig,
 ) -> MachineTrajectory {
     let Some(section) = &analysis.tube_section else {
-        return MachineTrajectory::default();
+        return build_without_tube_section(display, cam, analysis, config);
     };
     let Some(bounds) = display.bounds else {
         return MachineTrajectory::default();
@@ -179,7 +179,7 @@ pub fn build_trajectory(
                     .map(|point| section_point_pose(*point, section))
                     .collect()
             } else {
-                let mode = pose_mode(unit, analysis, section);
+                let mode = pose_mode(unit, analysis, section, cam);
                 path.iter()
                     .map(|point| {
                         let angle = if mode == PoseMode::Radial {
@@ -432,6 +432,140 @@ fn unit_rule_keys(
     keys
 }
 
+fn build_without_tube_section(
+    display: &DisplayData,
+    cam: &CamModel,
+    analysis: &CamAnalysis,
+    config: RotaryConfig,
+) -> MachineTrajectory {
+    let Some(bounds) = display.bounds else {
+        return MachineTrajectory::default();
+    };
+    let safe_z = bounds.max_z + config.rotation_safety_clearance.max(1.0);
+    let mut moves = Vec::new();
+    let mut unit_ranges = Vec::new();
+    let mut unit_rules = Vec::new();
+    let mut cutting_move_count = 0usize;
+    let mut unit_count = 0usize;
+    let mut previous_end: Option<MachinePose> = None;
+
+    for group in &analysis.plan.groups {
+        for unit in &group.units {
+            let Some(mut path) = oriented_unit_path(display, cam, unit.unit_id, unit.direction)
+            else {
+                continue;
+            };
+            if path.len() < 2 {
+                continue;
+            }
+            let closed = cam
+                .unit(unit.unit_id)
+                .map(|machining_unit| machining_unit.closed)
+                .unwrap_or(false);
+            if closed && distance3(path[0], *path.last().unwrap()) > 1.0e-6 {
+                path.push(path[0]);
+            }
+
+            let to_pose = |point: [f64; 3]| MachinePose {
+                x: point[0],
+                y: point[1],
+                z: point[2],
+                a: config.a_offset_degrees,
+            };
+            let first = to_pose(path[0]);
+            let last = to_pose(*path.last().unwrap());
+            let start_index = moves.len();
+            if let Some(previous) = previous_end {
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: MachinePose {
+                        x: previous.x,
+                        y: previous.y,
+                        z: safe_z,
+                        a: previous.a,
+                    },
+                });
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: MachinePose {
+                        x: first.x,
+                        y: first.y,
+                        z: safe_z,
+                        a: first.a,
+                    },
+                });
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: first,
+                });
+            } else {
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: MachinePose {
+                        x: first.x,
+                        y: first.y,
+                        z: safe_z,
+                        a: first.a,
+                    },
+                });
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Rapid,
+                    pose: first,
+                });
+            }
+            for point in path.iter().skip(1) {
+                moves.push(MachineMove {
+                    kind: MachineMoveKind::Cutting,
+                    pose: to_pose(*point),
+                });
+                cutting_move_count += 1;
+            }
+            unit_ranges.push(TrajectoryUnitRange {
+                order: unit.order,
+                start: start_index,
+                end: moves.len(),
+            });
+            unit_rules.push(unit_rule_keys(display, cam, unit));
+            previous_end = Some(last);
+            unit_count += 1;
+        }
+    }
+
+    if let Some(previous) = previous_end {
+        moves.push(MachineMove {
+            kind: MachineMoveKind::Rapid,
+            pose: MachinePose {
+                x: previous.x,
+                y: previous.y,
+                z: safe_z,
+                a: previous.a,
+            },
+        });
+        if let Some(last_range) = unit_ranges.last_mut() {
+            last_range.end = moves.len();
+        }
+    }
+
+    let a_min = moves
+        .iter()
+        .map(|movement| movement.pose.a)
+        .fold(f64::INFINITY, f64::min);
+    let a_max = moves
+        .iter()
+        .map(|movement| movement.pose.a)
+        .fold(f64::NEG_INFINITY, f64::max);
+    MachineTrajectory {
+        moves,
+        unit_ranges,
+        unit_rules,
+        cutting_move_count,
+        safe_z,
+        unit_count,
+        a_min: if a_min.is_finite() { a_min } else { 0.0 },
+        a_max: if a_max.is_finite() { a_max } else { 0.0 },
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ArcCutInfo {
     center: [f64; 3],
@@ -528,11 +662,21 @@ fn pose_mode(
     unit: &crate::cam_analysis::PlanUnit,
     analysis: &CamAnalysis,
     _section: &TubeSection,
+    cam: &CamModel,
 ) -> PoseMode {
     // A machining cut is a profile going around the tube. Its tool axis must
     // follow the local radial normal, not a fixed owner-face angle.
     if unit.machining_cut {
         return PoseMode::Radial;
+    }
+    // Open paths are single straight/curved strokes. Keep one tool orientation
+    // for the whole stroke so the machine does not interpolate A while cutting.
+    if cam
+        .unit(unit.unit_id)
+        .map(|machining_unit| !machining_unit.closed)
+        .unwrap_or(false)
+    {
+        return PoseMode::Rotating;
     }
     let touched = analysis
         .zone_profiles
