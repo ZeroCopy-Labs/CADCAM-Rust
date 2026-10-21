@@ -956,11 +956,11 @@ fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> C
         });
 
     if analysis.tube_section.is_some() {
-        egui::CollapsingHeader::new("加工截面与区间")
+        egui::CollapsingHeader::new("加工断面与区间")
             .default_open(true)
             .show(ui, |ui| {
                 if analysis.machining_candidates.is_empty() {
-                    ui.label("未识别到加工截面候选");
+                    ui.label("未识别到加工断面候选");
                 } else {
                     let existing: BTreeSet<cam::UnitId> = analysis
                         .machining_sections
@@ -992,7 +992,7 @@ fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> C
                 if !analysis.machining_sections.is_empty() {
                     ui.separator();
                     ui.label(format!(
-                        "已应用加工截面 {} 个",
+                        "已应用加工断面 {} 个",
                         analysis.machining_sections.len()
                     ));
                     for section in &analysis.machining_sections {
@@ -1033,6 +1033,7 @@ fn cam_unit_info_ui(
     display: &display::DisplayData,
     zone_profile: Option<&cam_analysis::UnitZoneProfile>,
     machining_section_index: Option<usize>,
+    machining_candidate: bool,
     scope: &str,
 ) {
     ui.horizontal(|ui| {
@@ -1054,9 +1055,10 @@ fn cam_unit_info_ui(
             ui.label("成员数");
             ui.label(unit.members.len().to_string());
             ui.end_row();
-            ui.label("加工截面");
+            ui.label("加工断面");
             ui.label(match machining_section_index {
                 Some(index) => format!("是（#{}）", index),
+                None if machining_candidate => "候选（未应用）".to_string(),
                 None => "否".to_string(),
             });
             ui.end_row();
@@ -1182,11 +1184,20 @@ fn draw_machining_section_labels(
         let text = format!("#{index}");
         let galley =
             painter.layout_no_wrap(text, egui::FontId::monospace(14.0), egui::Color32::WHITE);
-        let anchor = position + egui::vec2(7.0, -9.0);
+        let anchor = egui::pos2(
+            position.x - 7.0 - galley.size().x,
+            position.y - galley.size().y * 0.5,
+        );
         let background = egui::Rect::from_min_size(
             anchor - egui::vec2(3.0, 2.0),
             galley.size() + egui::vec2(6.0, 4.0),
         );
+        if blocked
+            .iter()
+            .any(|rect| rect.expand(4.0).contains(background.center()))
+        {
+            continue;
+        }
         painter.rect_filled(
             background,
             3.0,
@@ -1405,114 +1416,125 @@ fn drawing_ui(
     let command_rect = command_panel.response.rect;
 
     let mut cam_action = CamAnalysisUiAction::default();
-    let feature_panel = egui::Panel::left("feature_info")
-        .default_size(300.0)
-        .resizable(true)
-        .show(&mut root, |ui| {
-            ui.add_space(6.0);
-            ui.heading("特征");
-            ui.separator();
+    let feature_panel =
+        egui::Panel::left("feature_info")
+            .default_size(300.0)
+            .resizable(true)
+            .show(&mut root, |ui| {
+                ui.add_space(6.0);
+                ui.heading("特征");
+                ui.separator();
 
-            match space.mode {
-                SpaceMode::Cad => {
-                    let selected_entities: Vec<&display::DisplayEntity> = state
-                        .display
-                        .entities
-                        .iter()
-                        .filter(|entity| selection.selected.contains(&entity.id))
-                        .collect();
+                match space.mode {
+                    SpaceMode::Cad => {
+                        let selected_entities: Vec<&display::DisplayEntity> = state
+                            .display
+                            .entities
+                            .iter()
+                            .filter(|entity| selection.selected.contains(&entity.id))
+                            .collect();
 
-                    if selected_entities.is_empty() {
-                        ui.label("未选择图元");
-                        ui.label("左键点选 / 拖拽框选");
-                        ui.label("Shift + 左键追加选择");
-                    } else {
-                        ui.label(format!("已选择 {} 个图元", selected_entities.len()));
-                        ui.separator();
+                        if selected_entities.is_empty() {
+                            ui.label("未选择图元");
+                            ui.label("左键点选 / 拖拽框选");
+                            ui.label("Shift + 左键追加选择");
+                        } else {
+                            ui.label(format!("已选择 {} 个图元", selected_entities.len()));
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                if selected_entities.len() == 1 {
+                                    entity_info_ui(ui, selected_entities[0], "single");
+                                } else {
+                                    for entity in selected_entities {
+                                        egui::CollapsingHeader::new(format!(
+                                            "{}  #{}",
+                                            entity.kind, entity.id
+                                        ))
+                                        .id_salt(entity.id)
+                                        .default_open(false)
+                                        .show(ui, |ui| entity_info_ui(ui, entity, "multi"));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    SpaceMode::Cam => {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            if selected_entities.len() == 1 {
-                                entity_info_ui(ui, selected_entities[0], "single");
+                            cam_action = cam_analysis_ui(ui, &state.analysis);
+                            ui.separator();
+
+                            let selected_units: Vec<&cam::MachiningUnit> = state
+                                .cam
+                                .units
+                                .iter()
+                                .filter(|unit| selection.cam_selected.contains(&unit.id))
+                                .collect();
+
+                            if selected_units.is_empty() {
+                                ui.label("未选择加工单元");
+                                ui.label("左键点选 / 拖拽框选");
+                                ui.label("Shift + 左键追加选择");
                             } else {
-                                for entity in selected_entities {
-                                    egui::CollapsingHeader::new(format!(
-                                        "{}  #{}",
-                                        entity.kind, entity.id
-                                    ))
-                                    .id_salt(entity.id)
-                                    .default_open(false)
-                                    .show(ui, |ui| entity_info_ui(ui, entity, "multi"));
+                                ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
+                                ui.separator();
+                                if selected_units.len() == 1 {
+                                    let zone_profile =
+                                        state.analysis.zone_profiles.get(&selected_units[0].id);
+                                    let section_index =
+                                        state.analysis.machining_sections.iter().position(
+                                            |section| section.unit_id == selected_units[0].id,
+                                        );
+                                    let machining_candidate =
+                                        state.analysis.machining_candidates.iter().any(
+                                            |candidate| candidate.unit_id == selected_units[0].id,
+                                        );
+                                    cam_unit_info_ui(
+                                        ui,
+                                        selected_units[0],
+                                        &state.display,
+                                        zone_profile,
+                                        section_index,
+                                        machining_candidate,
+                                        "single",
+                                    );
+                                } else {
+                                    for unit in selected_units {
+                                        egui::CollapsingHeader::new(format!(
+                                            "加工单元  #{:016X}",
+                                            unit.id.0
+                                        ))
+                                        .id_salt(unit.id)
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            let zone_profile =
+                                                state.analysis.zone_profiles.get(&unit.id);
+                                            let section_index = state
+                                                .analysis
+                                                .machining_sections
+                                                .iter()
+                                                .position(|section| section.unit_id == unit.id);
+                                            let machining_candidate = state
+                                                .analysis
+                                                .machining_candidates
+                                                .iter()
+                                                .any(|candidate| candidate.unit_id == unit.id);
+                                            cam_unit_info_ui(
+                                                ui,
+                                                unit,
+                                                &state.display,
+                                                zone_profile,
+                                                section_index,
+                                                machining_candidate,
+                                                "multi",
+                                            )
+                                        });
+                                    }
                                 }
                             }
                         });
                     }
                 }
-                SpaceMode::Cam => {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        cam_action = cam_analysis_ui(ui, &state.analysis);
-                        ui.separator();
-
-                        let selected_units: Vec<&cam::MachiningUnit> = state
-                            .cam
-                            .units
-                            .iter()
-                            .filter(|unit| selection.cam_selected.contains(&unit.id))
-                            .collect();
-
-                        if selected_units.is_empty() {
-                            ui.label("未选择加工单元");
-                            ui.label("左键点选 / 拖拽框选");
-                            ui.label("Shift + 左键追加选择");
-                        } else {
-                            ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
-                            ui.separator();
-                            if selected_units.len() == 1 {
-                                let zone_profile =
-                                    state.analysis.zone_profiles.get(&selected_units[0].id);
-                                let section_index = state
-                                    .analysis
-                                    .machining_sections
-                                    .iter()
-                                    .position(|section| section.unit_id == selected_units[0].id);
-                                cam_unit_info_ui(
-                                    ui,
-                                    selected_units[0],
-                                    &state.display,
-                                    zone_profile,
-                                    section_index,
-                                    "single",
-                                );
-                            } else {
-                                for unit in selected_units {
-                                    egui::CollapsingHeader::new(format!(
-                                        "加工单元  #{:016X}",
-                                        unit.id.0
-                                    ))
-                                    .id_salt(unit.id)
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        let zone_profile =
-                                            state.analysis.zone_profiles.get(&unit.id);
-                                        let section_index = state
-                                            .analysis
-                                            .machining_sections
-                                            .iter()
-                                            .position(|section| section.unit_id == unit.id);
-                                        cam_unit_info_ui(
-                                            ui,
-                                            unit,
-                                            &state.display,
-                                            zone_profile,
-                                            section_index,
-                                            "multi",
-                                        )
-                                    });
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        });
+            });
 
     let feature_rect = feature_panel.response.rect;
 

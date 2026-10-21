@@ -86,10 +86,10 @@ pub enum SectionSource {
     Manual,
 }
 
-/// A candidate automatically fitted from one closed machining unit.
+/// A candidate automatically fitted from the drawing's machining units.
 #[derive(Clone, Debug)]
 pub struct TubeCandidate {
-    pub unit_id: UnitId,
+    pub unit_id: Option<UnitId>,
     pub center_y: f64,
     pub center_z: f64,
     pub size_y: f64,
@@ -106,8 +106,8 @@ impl TubeCandidate {
             size_y: self.size_y,
             size_z: self.size_z,
             radius: self.radius,
-            source,
-            source_unit: Some(self.unit_id),
+            source: source,
+            source_unit: self.unit_id,
         }
     }
 }
@@ -489,23 +489,27 @@ impl CamAnalysis {
             return;
         };
         self.machining_candidates = detect_machining_candidates(display, cam, &section);
-        if let Some(best) = self.machining_candidates.first().cloned() {
-            let equivalent = self.machining_candidates.iter().all(|candidate| {
-                (candidate.x_min - best.x_min).abs() <= 0.1
-                    && (candidate.x_max - best.x_max).abs() <= 0.1
-            });
-            if self.machining_candidates.len() == 1 || equivalent {
+        // High-confidence section candidates are applied automatically. The
+        // candidate already passed winding/coverage checks; here we only require
+        // a tight surface deviation and no meaningful uncovered gap.
+        for candidate in &self.machining_candidates {
+            if candidate.maximum_deviation <= 0.05 && candidate.coverage_gap_bins <= 1 {
                 self.machining_sections.push(MachiningSection {
-                    unit_id: best.unit_id,
-                    boundary_units: vec![best.unit_id],
-                    x_min: best.x_min,
-                    x_max: best.x_max,
-                    winding: best.winding,
-                    zone_mask: best.zone_mask,
+                    unit_id: candidate.unit_id,
+                    boundary_units: vec![candidate.unit_id],
+                    x_min: candidate.x_min,
+                    x_max: candidate.x_max,
+                    winding: candidate.winding,
+                    zone_mask: candidate.zone_mask,
                     source: SectionSource::Auto,
                 });
             }
         }
+        self.machining_sections.sort_by(|left, right| {
+            left.x_min
+                .partial_cmp(&right.x_min)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         self.zone_profiles = classify_units(display, cam, &section);
         self.rebuild_intervals(display, cam);
     }
@@ -565,44 +569,59 @@ impl CamAnalysis {
 }
 
 pub fn detect_tube_candidates(display: &DisplayData, cam: &CamModel) -> Vec<TubeCandidate> {
-    let mut candidates = Vec::new();
-    for unit in &cam.units {
-        if !unit.closed {
+    // The tube section is inferred from the YZ envelope of all closed
+    // machining units. Open helpers do not define the tube section.
+    let closed_units: std::collections::BTreeSet<UnitId> = cam
+        .units
+        .iter()
+        .filter(|unit| unit.closed)
+        .map(|unit| unit.id)
+        .collect();
+    let mut points = Vec::new();
+    for path in &display.paths {
+        if !cam
+            .unit_for_entity(path.entity_id)
+            .map(|unit_id| closed_units.contains(&unit_id))
+            .unwrap_or(false)
+        {
             continue;
         }
-        let points = unit_yz_points(display, cam, unit.id);
-        if points.len() < 8 {
-            continue;
+        for point in &path.points {
+            points.push((point[1], point[2]));
         }
-        let mut min_y = f64::INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        let mut min_z = f64::INFINITY;
-        let mut max_z = f64::NEG_INFINITY;
-        for (y, z) in &points {
-            min_y = min_y.min(*y);
-            max_y = max_y.max(*y);
-            min_z = min_z.min(*z);
-            max_z = max_z.max(*z);
-        }
-        let size_y = max_y - min_y;
-        let size_z = max_z - min_z;
-        if size_y <= JOIN_TOLERANCE || size_z <= JOIN_TOLERANCE {
-            continue;
-        }
-        let center_y = (min_y + max_y) * 0.5;
-        let center_z = (min_z + max_z) * 0.5;
-        let radius = estimate_corner_radius(&points, center_y, center_z, size_y, size_z);
-        let score = (points.len() as f64).ln_1p() / (1.0 + radius.max(0.0));
-        candidates.push(TubeCandidate {
-            unit_id: unit.id,
-            center_y,
-            center_z,
-            size_y,
-            size_z,
-            radius,
-            score,
-        });
     }
+    if points.len() < 8 {
+        return Vec::new();
+    }
+
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    for (y, z) in &points {
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+        min_z = min_z.min(*z);
+        max_z = max_z.max(*z);
+    }
+    let size_y = max_y - min_y;
+    let size_z = max_z - min_z;
+    if size_y <= JOIN_TOLERANCE || size_z <= JOIN_TOLERANCE {
+        return Vec::new();
+    }
+    let center_y = (min_y + max_y) * 0.5;
+    let center_z = (min_z + max_z) * 0.5;
+    let radius = estimate_corner_radius(&points, center_y, center_z, size_y, size_z);
+
+    let mut candidates = vec![TubeCandidate {
+        unit_id: None,
+        center_y,
+        center_z,
+        size_y,
+        size_z,
+        radius,
+        score: 1.0,
+    }];
     candidates.sort_by(|left, right| {
         right
             .score
@@ -670,9 +689,6 @@ pub fn detect_machining_candidates(
     let mut candidates = Vec::new();
     for unit in &cam.units {
         if !unit.closed {
-            continue;
-        }
-        if section.source_unit == Some(unit.id) {
             continue;
         }
         let Some(points) = ordered_unit_points(display, cam, unit.id) else {
