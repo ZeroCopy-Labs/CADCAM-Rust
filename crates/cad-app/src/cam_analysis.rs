@@ -396,6 +396,40 @@ pub struct MachiningGroup {
     pub zone_groups: Vec<ZoneUnitGroup>,
 }
 
+/// One unit in the deterministic machining order preview.
+#[derive(Clone, Debug)]
+pub struct PlanUnit {
+    pub unit_id: UnitId,
+    pub zone: TubeZone,
+    pub order: u32,
+    pub machining_cut: bool,
+    pub direction: UnitDirection,
+    pub start_point: [f64; 3],
+    pub end_point: [f64; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnitDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+/// Ordered units for one cut-delimited machining group.
+#[derive(Clone, Debug)]
+pub struct PlanGroup {
+    pub group_id: u32,
+    pub x_start: f64,
+    pub x_end: f64,
+    pub units: Vec<PlanUnit>,
+}
+
+/// Deterministic order preview. Direction and start refinement come later.
+#[derive(Clone, Debug, Default)]
+pub struct CamPlan {
+    pub groups: Vec<PlanGroup>,
+}
+
 #[derive(Clone, Debug)]
 pub struct UnitZoneProfile {
     pub unit_id: UnitId,
@@ -412,6 +446,7 @@ pub struct CamAnalysis {
     pub machining_sections: Vec<MachiningSection>,
     pub intervals: Vec<MachiningInterval>,
     pub groups: Vec<MachiningGroup>,
+    pub plan: CamPlan,
     pub zone_profiles: BTreeMap<UnitId, UnitZoneProfile>,
 }
 
@@ -474,6 +509,7 @@ impl CamAnalysis {
         });
         self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_plan(display, cam);
     }
 
     pub fn clear_tube_section(&mut self) {
@@ -482,6 +518,7 @@ impl CamAnalysis {
         self.machining_sections.clear();
         self.intervals.clear();
         self.groups.clear();
+        self.plan.groups.clear();
         self.zone_profiles.clear();
     }
 
@@ -507,6 +544,7 @@ impl CamAnalysis {
         self.machining_sections.clear();
         self.intervals.clear();
         self.groups.clear();
+        self.plan.groups.clear();
         self.zone_profiles.clear();
         let Some(section) = self.tube_section.clone() else {
             return;
@@ -536,6 +574,7 @@ impl CamAnalysis {
         self.zone_profiles = classify_units(display, cam, &section);
         self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_plan(display, cam);
     }
 
     fn rebuild_intervals(&mut self, display: &DisplayData, cam: &CamModel) {
@@ -670,6 +709,80 @@ impl CamAnalysis {
             });
         }
         self.groups = groups;
+    }
+
+    fn rebuild_plan(&mut self, display: &DisplayData, cam: &CamModel) {
+        self.plan.groups.clear();
+        let mut next_order = 1u32;
+
+        for group in &self.groups {
+            let mut planned = Vec::new();
+            for zone_group in &group.zone_groups {
+                let mut units = zone_group.units.clone();
+                units.sort_by(|left, right| {
+                    let left_x = unit_x_center(display, cam, *left).unwrap_or(f64::INFINITY);
+                    let right_x = unit_x_center(display, cam, *right).unwrap_or(f64::INFINITY);
+                    left_x
+                        .partial_cmp(&right_x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.cmp(right))
+                });
+                for unit_id in units {
+                    if group.section_unit == Some(unit_id) {
+                        continue;
+                    }
+                    planned.push(PlanUnit {
+                        unit_id,
+                        zone: zone_group.zone,
+                        order: next_order,
+                        machining_cut: false,
+                        direction: UnitDirection::Forward,
+                        start_point: [0.0; 3],
+                        end_point: [0.0; 3],
+                    });
+                    next_order += 1;
+                }
+            }
+
+            if let Some(section_unit) = group.section_unit {
+                let zone = self
+                    .zone_profiles
+                    .get(&section_unit)
+                    .and_then(|profile| profile.owner_zone)
+                    .unwrap_or(TubeZone::TopFace);
+                planned.push(PlanUnit {
+                    unit_id: section_unit,
+                    zone,
+                    order: next_order,
+                    machining_cut: true,
+                    direction: UnitDirection::Forward,
+                    start_point: [0.0; 3],
+                    end_point: [0.0; 3],
+                });
+                next_order += 1;
+            }
+
+            let mut previous_end: Option<[f64; 3]> = None;
+            for planned_unit in &mut planned {
+                if let Some((direction, start, end)) =
+                    choose_unit_direction(display, cam, planned_unit.unit_id, previous_end)
+                {
+                    planned_unit.direction = direction;
+                    planned_unit.start_point = start;
+                    planned_unit.end_point = end;
+                    previous_end = Some(end);
+                }
+            }
+
+            if !planned.is_empty() {
+                self.plan.groups.push(PlanGroup {
+                    group_id: group.id,
+                    x_start: group.x_start,
+                    x_end: group.x_end,
+                    units: planned,
+                });
+            }
+        }
     }
 }
 
@@ -973,6 +1086,23 @@ fn ordered_unit_points(
         }
     }
     Some(ordered)
+}
+
+fn choose_unit_direction(
+    display: &DisplayData,
+    cam: &CamModel,
+    unit_id: UnitId,
+    previous_end: Option<[f64; 3]>,
+) -> Option<(UnitDirection, [f64; 3], [f64; 3])> {
+    let path = ordered_unit_points(display, cam, unit_id)?;
+    let start = *path.first()?;
+    let end = *path.last()?;
+    if let Some(previous_end) = previous_end {
+        if distance3(previous_end, end) < distance3(previous_end, start) {
+            return Some((UnitDirection::Reverse, end, start));
+        }
+    }
+    Some((UnitDirection::Forward, start, end))
 }
 
 fn unit_x_center(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Option<f64> {

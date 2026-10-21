@@ -1062,6 +1062,48 @@ fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> C
                             });
                     }
                 }
+
+                if !analysis.plan.groups.is_empty() {
+                    ui.separator();
+                    ui.label("加工顺序（预览）");
+                    for plan_group in &analysis.plan.groups {
+                        let title = format!(
+                            "组 {} · X {:.2}..{:.2}",
+                            plan_group.group_id + 1,
+                            plan_group.x_start,
+                            plan_group.x_end
+                        );
+                        egui::CollapsingHeader::new(title)
+                            .id_salt(("plan_group", plan_group.group_id))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for unit in &plan_group.units {
+                                    let kind = if unit.machining_cut {
+                                        "断面".to_string()
+                                    } else {
+                                        unit.zone.label().to_string()
+                                    };
+                                    let direction = match unit.direction {
+                                        cam_analysis::UnitDirection::Forward => "正向",
+                                        cam_analysis::UnitDirection::Reverse => "反向",
+                                    };
+                                    ui.add(
+                                        egui::Label::new(format!(
+                                            "{}. {}  #{:08X}  {}  起点 ({:.2}, {:.2}, {:.2})",
+                                            unit.order,
+                                            kind,
+                                            unit.unit_id.0 as u32,
+                                            direction,
+                                            unit.start_point[0],
+                                            unit.start_point[1],
+                                            unit.start_point[2]
+                                        ))
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    }
+                }
             });
     }
 
@@ -1186,6 +1228,70 @@ fn color32(rgb: [f32; 3]) -> egui::Color32 {
         (rgb[1] * 255.0).round() as u8,
         (rgb[2] * 255.0).round() as u8,
     )
+}
+
+fn draw_machining_order_labels(
+    context: &egui::Context,
+    state: &ViewerState,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    blocked: &[egui::Rect],
+) {
+    if state.analysis.plan.groups.is_empty() {
+        return;
+    }
+    let painter = context.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("machining_order_labels"),
+    ));
+    let viewport = context.viewport_rect();
+    let blue = egui::Color32::from_rgb(64, 146, 255);
+
+    for group in &state.analysis.plan.groups {
+        for unit in &group.units {
+            let Some(center) = unit_center(&state.display, &state.cam, unit.unit_id) else {
+                continue;
+            };
+            let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
+            let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
+                continue;
+            };
+            let position = egui::pos2(screen.x, screen.y);
+            if !viewport.contains(position)
+                || blocked
+                    .iter()
+                    .any(|rect| rect.expand(4.0).contains(position))
+            {
+                continue;
+            }
+
+            if !unit.machining_cut {
+                painter.circle_filled(position, 2.5, blue);
+            }
+            let galley = painter.layout_no_wrap(
+                unit.order.to_string(),
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+            );
+            let anchor = egui::pos2(position.x + 7.0, position.y - galley.size().y * 0.5);
+            let background = egui::Rect::from_min_size(
+                anchor - egui::vec2(3.0, 2.0),
+                galley.size() + egui::vec2(6.0, 4.0),
+            );
+            if blocked
+                .iter()
+                .any(|rect| rect.expand(4.0).contains(background.center()))
+            {
+                continue;
+            }
+            painter.rect_filled(
+                background,
+                3.0,
+                egui::Color32::from_rgba_unmultiplied(8, 12, 18, 210),
+            );
+            painter.galley(anchor, galley, egui::Color32::WHITE);
+        }
+    }
 }
 
 fn draw_machining_section_labels(
@@ -1649,6 +1755,13 @@ fn drawing_ui(
 
     if space.mode == SpaceMode::Cam {
         let (view_camera, view_transform) = view_camera.into_inner();
+        draw_machining_order_labels(
+            context,
+            &state,
+            view_camera,
+            view_transform,
+            &[menu_rect, feature_rect, command_rect],
+        );
         draw_machining_section_labels(
             context,
             &state,
