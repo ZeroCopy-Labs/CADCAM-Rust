@@ -226,25 +226,29 @@ fn push_block(lines: &mut Vec<String>, block: &str) {
     }
 }
 
-fn push_rule_headers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &UnitRuleKeys) {
-    let rules = [
-        profile.entity_type_rules.get(&keys.entity_type),
-        profile.layer_rules.get(&keys.layer),
-        profile.color_rules.get(&keys.color),
-    ];
-    for rule in rules.into_iter().flatten() {
-        push_block(lines, &rule.header);
+fn push_rule_headers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &[UnitRuleKeys]) {
+    for key in keys {
+        let rules = [
+            profile.entity_type_rules.get(&key.entity_type),
+            profile.layer_rules.get(&key.layer),
+            profile.color_rules.get(&key.color),
+        ];
+        for rule in rules.into_iter().flatten() {
+            push_block(lines, &rule.header);
+        }
     }
 }
 
-fn push_rule_footers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &UnitRuleKeys) {
-    let rules = [
-        profile.color_rules.get(&keys.color),
-        profile.layer_rules.get(&keys.layer),
-        profile.entity_type_rules.get(&keys.entity_type),
-    ];
-    for rule in rules.into_iter().flatten() {
-        push_block(lines, &rule.footer);
+fn push_rule_footers(lines: &mut Vec<String>, profile: &GCodeProfile, keys: &[UnitRuleKeys]) {
+    for key in keys.iter().rev() {
+        let rules = [
+            profile.color_rules.get(&key.color),
+            profile.layer_rules.get(&key.layer),
+            profile.entity_type_rules.get(&key.entity_type),
+        ];
+        for rule in rules.into_iter().flatten() {
+            push_block(lines, &rule.footer);
+        }
     }
 }
 

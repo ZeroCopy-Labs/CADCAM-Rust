@@ -505,6 +505,73 @@ impl CamAnalysis {
         self.rebuild_plan(display, cam);
     }
 
+    /// Mark a closed unit as a machining cut manually.
+    pub fn apply_manual_machining_section(
+        &mut self,
+        unit_id: UnitId,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) -> bool {
+        if self.tube_section.is_none()
+            || self
+                .machining_sections
+                .iter()
+                .any(|section| section.unit_id == unit_id)
+        {
+            return false;
+        }
+        let Some(unit) = cam.unit(unit_id) else {
+            return false;
+        };
+        if !unit.closed {
+            return false;
+        }
+        let Some((x_min, x_max)) = unit_x_bounds(display, cam, unit_id) else {
+            return false;
+        };
+        let zone_mask = self
+            .zone_profiles
+            .get(&unit_id)
+            .map(|profile| profile.touched_zones)
+            .unwrap_or([false; 16]);
+        self.machining_sections.push(MachiningSection {
+            unit_id,
+            boundary_units: vec![unit_id],
+            x_min,
+            x_max,
+            winding: 1,
+            zone_mask,
+        });
+        self.machining_sections.sort_by(|left, right| {
+            left.x_min
+                .partial_cmp(&right.x_min)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.rebuild_intervals(display, cam);
+        self.rebuild_groups(display, cam);
+        self.rebuild_plan(display, cam);
+        true
+    }
+
+    /// Remove a machining section assignment.
+    pub fn remove_machining_section(
+        &mut self,
+        unit_id: UnitId,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) -> bool {
+        let before = self.machining_sections.len();
+        self.machining_sections
+            .retain(|section| section.unit_id != unit_id);
+        if self.machining_sections.len() == before {
+            return false;
+        }
+        self.rebuild_intervals(display, cam);
+        self.rebuild_groups(display, cam);
+        self.rebuild_plan(display, cam);
+        true
+    }
+
     pub fn clear_tube_section(&mut self) {
         self.tube_section = None;
         self.machining_candidates.clear();
@@ -1192,6 +1259,21 @@ pub fn oriented_unit_path(
         path.reverse();
     }
     Some(path)
+}
+
+fn unit_x_bounds(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Option<(f64, f64)> {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    for path in &display.paths {
+        if cam.unit_for_entity(path.entity_id) != Some(unit_id) {
+            continue;
+        }
+        for point in &path.points {
+            min_x = min_x.min(point[0]);
+            max_x = max_x.max(point[0]);
+        }
+    }
+    (min_x.is_finite() && max_x.is_finite()).then_some((min_x, max_x))
 }
 
 fn unit_x_center(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Option<f64> {

@@ -1034,6 +1034,8 @@ struct CamAnalysisUiAction {
     manual_tube: Option<cam_analysis::TubeSection>,
     clear_tube: bool,
     apply_machining: Option<usize>,
+    manual_machining: Option<cam::UnitId>,
+    remove_machining: Option<cam::UnitId>,
     move_unit: Option<(u32, usize, isize)>,
 }
 
@@ -1802,126 +1804,139 @@ fn drawing_ui(
     let command_rect = command_panel.response.rect;
 
     let mut cam_action = CamAnalysisUiAction::default();
-    let feature_panel =
-        egui::Panel::left("feature_info")
-            .default_size(300.0)
-            .resizable(true)
-            .show(&mut root, |ui| {
-                ui.add_space(6.0);
-                ui.heading("特征");
-                ui.separator();
+    let feature_panel = egui::Panel::left("feature_info")
+        .default_size(300.0)
+        .resizable(true)
+        .show(&mut root, |ui| {
+            ui.add_space(6.0);
+            ui.heading("特征");
+            ui.separator();
 
-                match space.mode {
-                    SpaceMode::Cad => {
-                        let selected_entities: Vec<&display::DisplayEntity> = state
-                            .display
-                            .entities
-                            .iter()
-                            .filter(|entity| selection.selected.contains(&entity.id))
-                            .collect();
+            match space.mode {
+                SpaceMode::Cad => {
+                    let selected_entities: Vec<&display::DisplayEntity> = state
+                        .display
+                        .entities
+                        .iter()
+                        .filter(|entity| selection.selected.contains(&entity.id))
+                        .collect();
 
-                        if selected_entities.is_empty() {
-                            ui.label("未选择图元");
-                            ui.label("左键点选 / 拖拽框选");
-                            ui.label("Shift + 左键追加选择");
-                        } else {
-                            ui.label(format!("已选择 {} 个图元", selected_entities.len()));
-                            ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                if selected_entities.len() == 1 {
-                                    entity_info_ui(ui, selected_entities[0], "single");
-                                } else {
-                                    for entity in selected_entities {
-                                        egui::CollapsingHeader::new(format!(
-                                            "{}  #{}",
-                                            entity.kind, entity.id
-                                        ))
-                                        .id_salt(entity.id)
-                                        .default_open(false)
-                                        .show(ui, |ui| entity_info_ui(ui, entity, "multi"));
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    SpaceMode::Cam => {
+                    if selected_entities.is_empty() {
+                        ui.label("未选择图元");
+                        ui.label("左键点选 / 拖拽框选");
+                        ui.label("Shift + 左键追加选择");
+                    } else {
+                        ui.label(format!("已选择 {} 个图元", selected_entities.len()));
+                        ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            cam_action =
-                                cam_analysis_ui(ui, &state.analysis, state.trajectory.as_ref());
-                            ui.separator();
-
-                            let selected_units: Vec<&cam::MachiningUnit> = state
-                                .cam
-                                .units
-                                .iter()
-                                .filter(|unit| selection.cam_selected.contains(&unit.id))
-                                .collect();
-
-                            if selected_units.is_empty() {
-                                ui.label("未选择加工单元");
-                                ui.label("左键点选 / 拖拽框选");
-                                ui.label("Shift + 左键追加选择");
+                            if selected_entities.len() == 1 {
+                                entity_info_ui(ui, selected_entities[0], "single");
                             } else {
-                                ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
-                                ui.separator();
-                                if selected_units.len() == 1 {
-                                    let zone_profile =
-                                        state.analysis.zone_profiles.get(&selected_units[0].id);
-                                    let section_index =
-                                        state.analysis.machining_sections.iter().position(
-                                            |section| section.unit_id == selected_units[0].id,
-                                        );
-                                    let machining_candidate =
-                                        state.analysis.machining_candidates.iter().any(
-                                            |candidate| candidate.unit_id == selected_units[0].id,
-                                        );
-                                    cam_unit_info_ui(
-                                        ui,
-                                        selected_units[0],
-                                        &state.display,
-                                        zone_profile,
-                                        section_index,
-                                        machining_candidate,
-                                        "single",
-                                    );
-                                } else {
-                                    for unit in selected_units {
-                                        egui::CollapsingHeader::new(format!(
-                                            "加工单元  #{:016X}",
-                                            unit.id.0
-                                        ))
-                                        .id_salt(unit.id)
-                                        .default_open(false)
-                                        .show(ui, |ui| {
-                                            let zone_profile =
-                                                state.analysis.zone_profiles.get(&unit.id);
-                                            let section_index = state
-                                                .analysis
-                                                .machining_sections
-                                                .iter()
-                                                .position(|section| section.unit_id == unit.id);
-                                            let machining_candidate = state
-                                                .analysis
-                                                .machining_candidates
-                                                .iter()
-                                                .any(|candidate| candidate.unit_id == unit.id);
-                                            cam_unit_info_ui(
-                                                ui,
-                                                unit,
-                                                &state.display,
-                                                zone_profile,
-                                                section_index,
-                                                machining_candidate,
-                                                "multi",
-                                            )
-                                        });
-                                    }
+                                for entity in selected_entities {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{}  #{}",
+                                        entity.kind, entity.id
+                                    ))
+                                    .id_salt(entity.id)
+                                    .default_open(false)
+                                    .show(ui, |ui| entity_info_ui(ui, entity, "multi"));
                                 }
                             }
                         });
                     }
                 }
-            });
+                SpaceMode::Cam => {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        cam_action =
+                            cam_analysis_ui(ui, &state.analysis, state.trajectory.as_ref());
+                        ui.separator();
+
+                        let selected_units: Vec<&cam::MachiningUnit> = state
+                            .cam
+                            .units
+                            .iter()
+                            .filter(|unit| selection.cam_selected.contains(&unit.id))
+                            .collect();
+
+                        if selected_units.is_empty() {
+                            ui.label("未选择加工单元");
+                            ui.label("左键点选 / 拖拽框选");
+                            ui.label("Shift + 左键追加选择");
+                        } else {
+                            ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
+                            ui.separator();
+                            if selected_units.len() == 1 {
+                                let zone_profile =
+                                    state.analysis.zone_profiles.get(&selected_units[0].id);
+                                let section_index = state
+                                    .analysis
+                                    .machining_sections
+                                    .iter()
+                                    .position(|section| section.unit_id == selected_units[0].id);
+                                let machining_candidate = state
+                                    .analysis
+                                    .machining_candidates
+                                    .iter()
+                                    .any(|candidate| candidate.unit_id == selected_units[0].id);
+                                cam_unit_info_ui(
+                                    ui,
+                                    selected_units[0],
+                                    &state.display,
+                                    zone_profile,
+                                    section_index,
+                                    machining_candidate,
+                                    "single",
+                                );
+                                ui.separator();
+                                if section_index.is_some() {
+                                    if ui.button("取消加工断面").clicked() {
+                                        cam_action.remove_machining = Some(selected_units[0].id);
+                                    }
+                                } else if selected_units[0].closed
+                                    && state.analysis.tube_section.is_some()
+                                {
+                                    if ui.button("设为加工断面").clicked() {
+                                        cam_action.manual_machining = Some(selected_units[0].id);
+                                    }
+                                }
+                            } else {
+                                for unit in selected_units {
+                                    egui::CollapsingHeader::new(format!(
+                                        "加工单元  #{:016X}",
+                                        unit.id.0
+                                    ))
+                                    .id_salt(unit.id)
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        let zone_profile =
+                                            state.analysis.zone_profiles.get(&unit.id);
+                                        let section_index = state
+                                            .analysis
+                                            .machining_sections
+                                            .iter()
+                                            .position(|section| section.unit_id == unit.id);
+                                        let machining_candidate = state
+                                            .analysis
+                                            .machining_candidates
+                                            .iter()
+                                            .any(|candidate| candidate.unit_id == unit.id);
+                                        cam_unit_info_ui(
+                                            ui,
+                                            unit,
+                                            &state.display,
+                                            zone_profile,
+                                            section_index,
+                                            machining_candidate,
+                                            "multi",
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        });
 
     let feature_rect = feature_panel.response.rect;
 
@@ -1947,6 +1962,16 @@ fn drawing_ui(
         if let Some(index) = cam_action.apply_machining {
             analysis.apply_machining_candidate(index, display, cam);
             cam_input_changed = true;
+        }
+        if let Some(unit_id) = cam_action.manual_machining {
+            if analysis.apply_manual_machining_section(unit_id, display, cam) {
+                cam_input_changed = true;
+            }
+        }
+        if let Some(unit_id) = cam_action.remove_machining {
+            if analysis.remove_machining_section(unit_id, display, cam) {
+                cam_input_changed = true;
+            }
         }
         if let Some((group_id, index, delta)) = cam_action.move_unit {
             if analysis.move_plan_unit(display, cam, group_id, index, delta) {

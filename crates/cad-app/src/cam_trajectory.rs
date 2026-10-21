@@ -76,7 +76,7 @@ pub struct TrajectoryUnitRange {
     pub end: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitRuleKeys {
     pub entity_type: String,
     pub layer: String,
@@ -87,7 +87,7 @@ pub struct UnitRuleKeys {
 pub struct MachineTrajectory {
     pub moves: Vec<MachineMove>,
     pub unit_ranges: Vec<TrajectoryUnitRange>,
-    pub unit_rules: Vec<UnitRuleKeys>,
+    pub unit_rules: Vec<Vec<UnitRuleKeys>>,
     pub cutting_move_count: usize,
     pub safe_z: f64,
     pub unit_count: usize,
@@ -411,21 +411,25 @@ fn unit_rule_keys(
     display: &DisplayData,
     cam: &CamModel,
     unit: &crate::cam_analysis::PlanUnit,
-) -> UnitRuleKeys {
-    let Some(member) = cam
-        .unit(unit.unit_id)
-        .and_then(|machining_unit| machining_unit.members.first())
-    else {
-        return UnitRuleKeys::default();
+) -> Vec<UnitRuleKeys> {
+    let Some(machining_unit) = cam.unit(unit.unit_id) else {
+        return Vec::new();
     };
-    let Some(entity) = display.entities.iter().find(|entity| entity.id == *member) else {
-        return UnitRuleKeys::default();
-    };
-    UnitRuleKeys {
-        entity_type: entity.kind.to_string(),
-        layer: entity.layer.clone(),
-        color: entity.color_key.clone(),
+    let mut keys = Vec::new();
+    for member in &machining_unit.members {
+        let Some(entity) = display.entities.iter().find(|entity| entity.id == *member) else {
+            continue;
+        };
+        let key = UnitRuleKeys {
+            entity_type: entity.kind.to_string(),
+            layer: entity.layer.clone(),
+            color: entity.color_key.clone(),
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
     }
+    keys
 }
 
 #[derive(Clone, Copy, Debug)]
