@@ -1021,6 +1021,47 @@ fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> C
                         ));
                     }
                 }
+
+                if !analysis.groups.is_empty() {
+                    ui.separator();
+                    ui.label("断面加工组");
+                    for group in &analysis.groups {
+                        let title = format!(
+                            "组 {} · X {:.2}..{:.2} · {} 个单元",
+                            group.id + 1,
+                            group.x_start,
+                            group.x_end,
+                            group.units.len()
+                        );
+                        egui::CollapsingHeader::new(title)
+                            .id_salt(("machining_group", group.id))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if let Some(section_unit) = group.section_unit {
+                                    let section_index = analysis
+                                        .machining_sections
+                                        .iter()
+                                        .position(|section| section.unit_id == section_unit);
+                                    ui.label(format!(
+                                        "组末加工断面：{}",
+                                        section_index
+                                            .map(|index| format!("#{}", index))
+                                            .unwrap_or_else(|| "未编号".to_string())
+                                    ));
+                                }
+                                for zone_group in &group.zone_groups {
+                                    if zone_group.units.is_empty() {
+                                        continue;
+                                    }
+                                    ui.label(format!(
+                                        "{}：{} 个单元",
+                                        zone_group.zone.label(),
+                                        zone_group.units.len()
+                                    ));
+                                }
+                            });
+                    }
+                }
             });
     }
 

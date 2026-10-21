@@ -377,6 +377,25 @@ pub struct MachiningInterval {
     pub units: Vec<UnitId>,
 }
 
+/// One 16-zone bucket inside a section-delimited machining group.
+#[derive(Clone, Debug)]
+pub struct ZoneUnitGroup {
+    pub zone: TubeZone,
+    pub units: Vec<UnitId>,
+}
+
+/// A group delimited by machining cuts. Machining reaches `section_unit` at the
+/// end of the group; everything before it is then released.
+#[derive(Clone, Debug)]
+pub struct MachiningGroup {
+    pub id: u32,
+    pub x_start: f64,
+    pub x_end: f64,
+    pub section_unit: Option<UnitId>,
+    pub units: Vec<UnitId>,
+    pub zone_groups: Vec<ZoneUnitGroup>,
+}
+
 #[derive(Clone, Debug)]
 pub struct UnitZoneProfile {
     pub unit_id: UnitId,
@@ -392,6 +411,7 @@ pub struct CamAnalysis {
     pub machining_candidates: Vec<MachiningSectionCandidate>,
     pub machining_sections: Vec<MachiningSection>,
     pub intervals: Vec<MachiningInterval>,
+    pub groups: Vec<MachiningGroup>,
     pub zone_profiles: BTreeMap<UnitId, UnitZoneProfile>,
 }
 
@@ -453,6 +473,7 @@ impl CamAnalysis {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         self.rebuild_intervals(display, cam);
+        self.rebuild_groups(display, cam);
     }
 
     pub fn clear_tube_section(&mut self) {
@@ -460,6 +481,7 @@ impl CamAnalysis {
         self.machining_candidates.clear();
         self.machining_sections.clear();
         self.intervals.clear();
+        self.groups.clear();
         self.zone_profiles.clear();
     }
 
@@ -484,6 +506,7 @@ impl CamAnalysis {
         self.machining_candidates.clear();
         self.machining_sections.clear();
         self.intervals.clear();
+        self.groups.clear();
         self.zone_profiles.clear();
         let Some(section) = self.tube_section.clone() else {
             return;
@@ -512,6 +535,7 @@ impl CamAnalysis {
         });
         self.zone_profiles = classify_units(display, cam, &section);
         self.rebuild_intervals(display, cam);
+        self.rebuild_groups(display, cam);
     }
 
     fn rebuild_intervals(&mut self, display: &DisplayData, cam: &CamModel) {
@@ -565,6 +589,87 @@ impl CamAnalysis {
             });
         }
         self.intervals = intervals;
+    }
+
+    fn rebuild_groups(&mut self, display: &DisplayData, cam: &CamModel) {
+        self.groups.clear();
+        let Some(bounds) = display.bounds else {
+            return;
+        };
+
+        let mut sections: Vec<(f64, UnitId)> = self
+            .machining_sections
+            .iter()
+            .map(|section| (section.x_min, section.unit_id))
+            .collect();
+        sections.sort_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        sections.dedup_by(|left, right| (left.0 - right.0).abs() <= JOIN_TOLERANCE);
+
+        let section_units: std::collections::BTreeSet<UnitId> =
+            sections.iter().map(|(_, unit_id)| *unit_id).collect();
+
+        let mut edges = Vec::with_capacity(sections.len() + 2);
+        edges.push(bounds.min_x);
+        edges.extend(sections.iter().map(|(x, _)| *x));
+        edges.push(bounds.max_x);
+
+        let mut groups = Vec::new();
+        for index in 0..edges.len().saturating_sub(1) {
+            let x_start = edges[index];
+            let x_end = edges[index + 1];
+            let section_unit = sections.get(index).map(|(_, unit_id)| *unit_id);
+
+            let mut units: Vec<UnitId> = cam
+                .units
+                .iter()
+                .filter(|unit| !section_units.contains(&unit.id))
+                .filter(|unit| {
+                    unit_x_center(display, cam, unit.id)
+                        .map(|x| x > x_start - JOIN_TOLERANCE && x <= x_end + JOIN_TOLERANCE)
+                        .unwrap_or(false)
+                })
+                .map(|unit| unit.id)
+                .collect();
+            if let Some(section_unit) = section_unit {
+                units.push(section_unit);
+            }
+            if units.is_empty() && section_unit.is_none() {
+                continue;
+            }
+            units.sort_unstable();
+            units.dedup();
+
+            let mut zone_groups: Vec<ZoneUnitGroup> = TubeZone::ALL
+                .iter()
+                .copied()
+                .map(|zone| ZoneUnitGroup {
+                    zone,
+                    units: Vec::new(),
+                })
+                .collect();
+            for unit_id in &units {
+                let zone = self
+                    .zone_profiles
+                    .get(unit_id)
+                    .and_then(|profile| profile.owner_zone)
+                    .unwrap_or(TubeZone::TopFace);
+                zone_groups[zone.index()].units.push(*unit_id);
+            }
+
+            groups.push(MachiningGroup {
+                id: groups.len() as u32,
+                x_start,
+                x_end,
+                section_unit,
+                units,
+                zone_groups,
+            });
+        }
+        self.groups = groups;
     }
 }
 
