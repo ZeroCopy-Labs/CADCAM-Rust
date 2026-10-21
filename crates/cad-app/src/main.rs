@@ -20,9 +20,13 @@ mod display;
 
 const BACKGROUND: Color = Color::srgb(0.035, 0.045, 0.060);
 const RECENT_LIMIT: usize = 10;
+const MESSAGE_LIMIT: usize = 200;
+const COMMAND_MAX_HISTORY_LINES: usize = 4;
+const COMMAND_ROW_HEIGHT: f32 = 21.0;
+const COMMAND_VERTICAL_PADDING: f32 = 12.0;
 const TOP_BAR_HEIGHT: f32 = 36.0;
-const BOTTOM_BAR_HEIGHT: f32 = 54.0;
-const MENU_SIDE_WIDTH: f32 = 72.0;
+const BOTTOM_BAR_HEIGHT: f32 = 30.0;
+const MENU_SIDE_WIDTH: f32 = 140.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
@@ -34,11 +38,14 @@ struct ViewerState {
     entity_count: usize,
     layer_count: usize,
     warning_count: usize,
-    status: String,
     display: display::DisplayData,
     fit_dirty: bool,
     rotation_deg: f32,
     recent: Vec<PathBuf>,
+    messages: Vec<String>,
+    command_open: bool,
+    command_focus: bool,
+    command_input: String,
 }
 
 /// Marker for the single 2D camera.
@@ -48,10 +55,10 @@ struct MainCamera;
 fn main() {
     let initial_path = env::args().nth(1).unwrap_or_default();
     let mut state = ViewerState {
-        status: "使用“文件 → 打开文件”选择 DXF/DWG 图纸".to_string(),
         recent: load_recent(),
         ..Default::default()
     };
+    push_message(&mut state, "使用“文件 → 打开文件”选择 DXF/DWG 图纸");
     if !initial_path.trim().is_empty() {
         open_drawing(&mut state, &initial_path);
     }
@@ -82,11 +89,11 @@ fn setup_camera(mut commands: Commands) {
 fn open_drawing(state: &mut ViewerState, raw_path: &str) {
     let path = normalize_path(raw_path);
     if path.is_empty() {
-        state.status = "请输入 DXF/DWG 路径".to_string();
+        push_message(state, "请输入 DXF/DWG 路径");
         return;
     }
 
-    state.status = format!("正在读取 {path}");
+    push_message(state, format!("正在读取 {path}"));
     match read_document(&path) {
         Ok(document) => {
             let display = display::build_display(&document);
@@ -101,9 +108,22 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.layer_count = document.layers.len();
             state.warning_count = document.import_report.warnings.len();
             state.display = display;
-            state.status = format!("已加载 {} 个实体", state.entity_count);
             state.rotation_deg = 0.0;
             state.fit_dirty = true;
+
+            push_message(state, format!("已加载 {} 个实体", state.entity_count));
+            push_message(
+                state,
+                format!(
+                    "实体 {} | 图层 {} | {} | {} | {} | 警告 {}",
+                    state.entity_count,
+                    state.layer_count,
+                    state.format,
+                    state.version,
+                    state.unit,
+                    state.warning_count
+                ),
+            );
 
             let mut recent_path = PathBuf::from(&path);
             if !recent_path.is_absolute() {
@@ -112,9 +132,25 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             remember_recent(state, &recent_path);
         }
         Err(error) => {
-            state.status = format!("读取失败：{error}");
+            push_message(state, format!("读取失败：{error}"));
         }
     }
+}
+
+fn push_message(state: &mut ViewerState, message: impl Into<String>) {
+    state.messages.push(message.into());
+    if state.messages.len() > MESSAGE_LIMIT {
+        state.messages.remove(0);
+    }
+}
+
+/// Current command implementation: only echo the entered text.
+fn submit_command(state: &mut ViewerState, raw: &str) {
+    let command = raw.trim();
+    if command.is_empty() {
+        return;
+    }
+    push_message(state, command.to_string());
 }
 
 /// Fit the 2D camera to the current display bounds.
@@ -225,15 +261,29 @@ fn drawing_ui(
                             }
                         });
                     });
+                    ui.menu_button("视图", |ui| {
+                        if ui.button("适应视图").clicked() {
+                            fit_clicked = true;
+                            ui.close();
+                        }
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut state.rotation_deg, 0.0..=360.0)
+                                    .text("旋转"),
+                            )
+                            .changed()
+                        {
+                            fit_clicked = true;
+                        }
+                    });
                 },
             );
 
             let center_width = (ui.available_width() - MENU_SIDE_WIDTH).max(0.0);
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(center_width, 24.0),
-                egui::Layout::top_down(egui::Align::Center),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                 |ui| {
-                    ui.add_space(2.0);
                     ui.strong(&current_name);
                 },
             );
@@ -245,39 +295,91 @@ fn drawing_ui(
         });
     });
 
-    egui::Panel::bottom("status_bar").show(&mut root, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(format!(
-                "实体 {} | 图层 {} | {} | {} | {} | 警告 {}",
-                state.entity_count,
-                state.layer_count,
-                if state.format.is_empty() {
-                    "—"
-                } else {
-                    &state.format
-                },
-                if state.version.is_empty() {
-                    "—"
-                } else {
-                    &state.version
-                },
-                state.unit,
-                state.warning_count
-            ));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("适应视图").clicked() {
-                    fit_clicked = true;
+    let command_dimensions = state.command_open.then(|| {
+        let history_lines = state.messages.len().min(COMMAND_MAX_HISTORY_LINES);
+        let history_height = history_lines as f32 * COMMAND_ROW_HEIGHT;
+        let total_height =
+            (history_lines + 1) as f32 * COMMAND_ROW_HEIGHT + COMMAND_VERTICAL_PADDING;
+        (total_height, history_height)
+    });
+    let mut command_panel = egui::Panel::bottom("command_line").frame(
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(0, 6))
+            .fill(egui::Color32::from_rgb(12, 17, 24)),
+    );
+    if let Some((outer_height, _)) = command_dimensions {
+        command_panel = command_panel.min_size(outer_height).max_size(outer_height);
+    }
+    let command_panel = command_panel.show(&mut root, |ui| {
+        if state.command_open {
+            let (_, history_height) = command_dimensions.unwrap_or((0.0, 0.0));
+            if history_height > 0.0 {
+                egui::ScrollArea::vertical()
+                    .max_height(history_height)
+                    .auto_shrink([false, true])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for message in &state.messages {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(format!("> {message}"));
+                            });
+                        }
+                    });
+            }
+
+            let focus_input = std::mem::take(&mut state.command_focus);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let response = ui.add_sized(
+                    egui::Vec2::new(ui.available_width(), COMMAND_ROW_HEIGHT - 2.0),
+                    egui::TextEdit::singleline(&mut state.command_input).hint_text("输入命令"),
+                );
+                if focus_input {
+                    response.request_focus();
                 }
-                if ui
-                    .add(egui::Slider::new(&mut state.rotation_deg, 0.0..=360.0).text("旋转"))
-                    .changed()
-                {
-                    fit_clicked = true;
+                let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if enter && (response.has_focus() || response.lost_focus()) {
+                    let command = std::mem::take(&mut state.command_input);
+                    submit_command(&mut state, &command);
+                    response.request_focus();
                 }
             });
-        });
-        ui.label(&state.status);
+        } else {
+            let latest = state
+                .messages
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "就绪".to_string());
+            let (rect, response) = ui.allocate_exact_size(
+                egui::Vec2::new(ui.available_width(), COMMAND_ROW_HEIGHT),
+                egui::Sense::click(),
+            );
+            ui.painter().text(
+                rect.left_center() + egui::vec2(8.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("> {latest}"),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+            );
+            if response.clicked() {
+                state.command_open = true;
+                state.command_focus = true;
+            }
+        }
     });
+    let command_rect = command_panel.response.rect;
+    if state.command_open {
+        let clicked = context.input(|input| input.pointer.any_click());
+        let pointer = context.input(|input| input.pointer.interact_pos());
+        if clicked {
+            if let Some(position) = pointer {
+                if !command_rect.contains(position) {
+                    state.command_open = false;
+                }
+            }
+        }
+    }
 
     if open_dialog {
         if let Some(path) = choose_drawing_file(&state) {
