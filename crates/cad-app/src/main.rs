@@ -3,6 +3,7 @@
 //! cad-core owns parsing/model data, this crate tessellates it into 2D display
 //! paths, Bevy renders them with gizmos, and egui provides the desktop UI.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 use std::fs;
@@ -19,6 +20,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
 use cad_core::read_document;
 
+mod cam;
 mod display;
 
 const BACKGROUND: Color = Color::srgb(0.035, 0.045, 0.060);
@@ -27,7 +29,7 @@ const MESSAGE_LIMIT: usize = 200;
 const COMMAND_MAX_HISTORY_LINES: usize = 4;
 const COMMAND_ROW_HEIGHT: f32 = 21.0;
 const COMMAND_VERTICAL_PADDING: f32 = 12.0;
-const MENU_SIDE_WIDTH: f32 = 140.0;
+const MENU_SIDE_WIDTH: f32 = 300.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
@@ -40,12 +42,14 @@ struct ViewerState {
     layer_count: usize,
     warning_count: usize,
     display: display::DisplayData,
+    cam: cam::CamModel,
     fit_dirty: bool,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
     command_open: bool,
     command_focus: bool,
     command_input: String,
+    load_version: u64,
 }
 
 /// Orbit camera state, independent from the loaded drawing.
@@ -90,6 +94,40 @@ struct MainCamera;
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct DashedAxisGizmos;
 
+/// Thick yellow overlay for selected entities.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct SelectedGizmos;
+
+/// Current selection and in-progress rubber-band box.
+#[derive(Resource, Default)]
+struct SelectionState {
+    selected: BTreeSet<u32>,
+    cam_selected: BTreeSet<cam::UnitId>,
+    drag_start: Option<Vec2>,
+    drag_current: Option<Vec2>,
+    load_version: u64,
+}
+
+/// CAD space is the authoritative drawing; CAM space is the derived unit view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SpaceMode {
+    #[default]
+    Cad,
+    Cam,
+}
+
+#[derive(Resource, Default)]
+struct SpaceState {
+    mode: SpaceMode,
+}
+
+/// Last-frame UI occupancy, used to stop mouse/keyboard input leaking into the
+/// viewport while interacting with the feature panel or command bar.
+#[derive(Resource, Default)]
+struct UiState {
+    pointer_over_ui: bool,
+}
+
 fn main() {
     let initial_path = env::args().nth(1).unwrap_or_default();
     let mut state = ViewerState {
@@ -119,11 +157,22 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .insert_resource(state)
         .insert_resource(CameraRig::default())
+        .insert_resource(SelectionState::default())
+        .insert_resource(SpaceState::default())
+        .insert_resource(UiState::default())
         .init_gizmo_group::<DashedAxisGizmos>()
+        .init_gizmo_group::<SelectedGizmos>()
         .add_systems(Startup, (setup_camera, configure_gizmos))
         .add_systems(
             Update,
-            (orbit_camera, fit_camera, update_camera, draw_scene).chain(),
+            (
+                orbit_camera,
+                fit_camera,
+                update_camera,
+                selection_input,
+                draw_scene,
+            )
+                .chain(),
         )
         .add_systems(EguiPrimaryContextPass, drawing_ui)
         .run();
@@ -149,6 +198,9 @@ fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
         gap_scale: 3.0,
         line_scale: 3.0,
     };
+
+    let (selected, _) = store.config_mut::<SelectedGizmos>();
+    selected.line.width = 3.5;
 }
 
 fn open_drawing(state: &mut ViewerState, raw_path: &str) {
@@ -162,6 +214,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
     match read_document(&path) {
         Ok(document) => {
             let display = display::build_display(&document);
+            let cam_model = cam::build_cam_model(&document);
             state.file_name = document.source.file_name.clone();
             state.format = document.source.format.to_string();
             state.version = document.source.version.clone();
@@ -173,13 +226,16 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.layer_count = document.layers.len();
             state.warning_count = document.import_report.warnings.len();
             state.display = display;
+            state.cam = cam_model;
+            state.load_version += 1;
             state.fit_dirty = true;
 
             push_message(state, format!("已加载 {} 个实体", state.entity_count));
             push_message(
                 state,
                 format!(
-                    "实体 {} | 图层 {} | {} | {} | {} | 警告 {}",
+                    "生成 {} 个加工单元 | 实体 {} | 图层 {} | {} | {} | {} | 警告 {}",
+                    state.cam.units.len(),
                     state.entity_count,
                     state.layer_count,
                     state.format,
@@ -223,8 +279,12 @@ fn orbit_camera(
     keys: Res<ButtonInput<KeyCode>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    ui_state: Res<UiState>,
     mut rig: ResMut<CameraRig>,
 ) {
+    if ui_state.pointer_over_ui {
+        return;
+    }
     if mouse.pressed(MouseButton::Middle) {
         let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
         if shift {
@@ -319,22 +379,127 @@ fn update_camera(
     }
 }
 
+fn switch_space(
+    space: &mut SpaceState,
+    selection: &mut SelectionState,
+    cam: &cam::CamModel,
+    mode: SpaceMode,
+) {
+    if space.mode == mode {
+        return;
+    }
+
+    match mode {
+        SpaceMode::Cam => {
+            selection.cam_selected.clear();
+            for entity_id in &selection.selected {
+                if let Some(unit_id) = cam.unit_for_entity(*entity_id) {
+                    selection.cam_selected.insert(unit_id);
+                }
+            }
+        }
+        SpaceMode::Cad => {
+            selection.selected.clear();
+            for unit_id in &selection.cam_selected {
+                if let Some(unit) = cam.unit(*unit_id) {
+                    selection.selected.extend(unit.members.iter().copied());
+                }
+            }
+        }
+    }
+
+    space.mode = mode;
+    selection.drag_start = None;
+    selection.drag_current = None;
+}
+
+fn space_switch_ui(
+    ui: &mut egui::Ui,
+    space: &mut SpaceState,
+    selection: &mut SelectionState,
+    cam: &cam::CamModel,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(112.0, 24.0), egui::Sense::click());
+    let t = ui.ctx().animate_bool_with_time(
+        egui::Id::new("space_switch"),
+        space.mode == SpaceMode::Cam,
+        0.18,
+    );
+    let painter = ui.painter();
+
+    painter.rect_filled(rect, 12.0, egui::Color32::from_rgb(24, 31, 41));
+    let inner = rect.shrink(3.0);
+    let knob_width = (inner.width() - 4.0) * 0.5;
+    let left_x = inner.left() + 2.0;
+    let right_x = inner.right() - 2.0 - knob_width;
+    let knob_x = left_x + (right_x - left_x) * t;
+    let knob = egui::Rect::from_min_size(
+        egui::pos2(knob_x, inner.top()),
+        egui::vec2(knob_width, inner.height()),
+    );
+    painter.rect_filled(knob, 9.0, egui::Color32::from_rgb(44, 116, 196));
+
+    let active = egui::Color32::from_rgb(245, 248, 252);
+    let inactive = egui::Color32::from_rgb(135, 145, 160);
+    let font = egui::FontId::proportional(13.0);
+    painter.text(
+        egui::pos2(rect.left() + rect.width() * 0.25, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "CAD",
+        font.clone(),
+        if t < 0.5 { active } else { inactive },
+    );
+    painter.text(
+        egui::pos2(rect.left() + rect.width() * 0.75, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "CAM",
+        font,
+        if t >= 0.5 { active } else { inactive },
+    );
+
+    if response.clicked() {
+        let target = if space.mode == SpaceMode::Cad {
+            SpaceMode::Cam
+        } else {
+            SpaceMode::Cad
+        };
+        switch_space(space, selection, cam, target);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+}
+
 /// Draw the drawing paths and solid/dashed coordinate axes.
 fn draw_scene(
     state: Res<ViewerState>,
+    selection: Res<SelectionState>,
+    space: Res<SpaceState>,
     mut gizmos: Gizmos,
+    mut selected_gizmos: Gizmos<SelectedGizmos>,
     mut negative_axes: Gizmos<DashedAxisGizmos>,
 ) {
     for path in &state.display.paths {
-        let color = Color::srgb(path.color[0], path.color[1], path.color[2]);
+        let unit = state.cam.unit_for_entity(path.entity_id);
+        let is_selected = match space.mode {
+            SpaceMode::Cad => selection.selected.contains(&path.entity_id),
+            SpaceMode::Cam => unit
+                .map(|unit_id| selection.cam_selected.contains(&unit_id))
+                .unwrap_or(false),
+        };
+        let color = if is_selected {
+            Color::srgb(1.0, 0.82, 0.22)
+        } else {
+            Color::srgb(path.color[0], path.color[1], path.color[2])
+        };
         for pair in path.points.windows(2) {
             let [x0, y0, z0] = pair[0];
             let [x1, y1, z1] = pair[1];
-            gizmos.line(
-                Vec3::new(x0 as f32, z0 as f32, -(y0 as f32)),
-                Vec3::new(x1 as f32, z1 as f32, -(y1 as f32)),
-                color,
-            );
+            let start = Vec3::new(x0 as f32, z0 as f32, -(y0 as f32));
+            let end = Vec3::new(x1 as f32, z1 as f32, -(y1 as f32));
+            if is_selected {
+                selected_gizmos.line(start, end, color);
+            } else {
+                gizmos.line(start, end, color);
+            }
         }
     }
 
@@ -366,11 +531,401 @@ fn draw_scene(
     negative_axes.line(origin, -positive_z, green);
 }
 
+/// Mouse selection: click picking, Shift+click add, and AutoCAD-style
+/// left-to-right window / right-to-left crossing box selection.
+fn selection_input(
+    mut contexts: EguiContexts,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
+    state: Res<ViewerState>,
+    mut selection: ResMut<SelectionState>,
+    space: Res<SpaceState>,
+    ui_state: Res<UiState>,
+) -> Result {
+    let valid: BTreeSet<u32> = state
+        .display
+        .entities
+        .iter()
+        .map(|entity| entity.id)
+        .collect();
+    if selection.load_version != state.load_version {
+        selection.selected.clear();
+        selection.cam_selected.clear();
+        selection.drag_start = None;
+        selection.drag_current = None;
+        selection.load_version = state.load_version;
+    }
+    selection.selected.retain(|id| valid.contains(id));
+    let valid_units: BTreeSet<cam::UnitId> = state.cam.units.iter().map(|unit| unit.id).collect();
+    selection.cam_selected.retain(|id| valid_units.contains(id));
+
+    let Some(cursor) = window.cursor_position() else {
+        return Ok(());
+    };
+    let context = contexts.ctx_mut()?;
+    let over_ui = ui_state.pointer_over_ui || context.egui_wants_pointer_input();
+    let (camera, camera_transform) = camera.into_inner();
+
+    if mouse.just_pressed(MouseButton::Left) && !over_ui {
+        selection.drag_start = Some(cursor);
+        selection.drag_current = Some(cursor);
+    }
+    if mouse.pressed(MouseButton::Left) && selection.drag_start.is_some() {
+        selection.drag_current = Some(cursor);
+    }
+    if mouse.just_released(MouseButton::Left) {
+        let Some(start) = selection.drag_start.take() else {
+            return Ok(());
+        };
+        let end = selection.drag_current.take().unwrap_or(cursor);
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+        if (end - start).length() < 4.0 {
+            match space.mode {
+                SpaceMode::Cad => {
+                    let hit = pick_entity(&state.display, camera, camera_transform, cursor);
+                    if shift {
+                        if let Some(id) = hit {
+                            selection.selected.insert(id);
+                        }
+                    } else {
+                        selection.selected.clear();
+                        if let Some(id) = hit {
+                            selection.selected.insert(id);
+                        }
+                    }
+                }
+                SpaceMode::Cam => {
+                    let hit = pick_entity(&state.display, camera, camera_transform, cursor)
+                        .and_then(|entity_id| state.cam.unit_for_entity(entity_id));
+                    if shift {
+                        if let Some(id) = hit {
+                            selection.cam_selected.insert(id);
+                        }
+                    } else {
+                        selection.cam_selected.clear();
+                        if let Some(id) = hit {
+                            selection.cam_selected.insert(id);
+                        }
+                    }
+                }
+            }
+        } else {
+            match space.mode {
+                SpaceMode::Cad => {
+                    let chosen = box_select(&state.display, camera, camera_transform, start, end);
+                    if shift {
+                        selection.selected.extend(chosen);
+                    } else {
+                        selection.selected = chosen;
+                    }
+                }
+                SpaceMode::Cam => {
+                    let chosen = box_select_units(
+                        &state.display,
+                        &state.cam,
+                        camera,
+                        camera_transform,
+                        start,
+                        end,
+                    );
+                    if shift {
+                        selection.cam_selected.extend(chosen);
+                    } else {
+                        selection.cam_selected = chosen;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn to_render_point(point: [f64; 3]) -> Vec3 {
+    Vec3::new(point[0] as f32, point[2] as f32, -(point[1] as f32))
+}
+
+fn project_entity_point(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    point: [f64; 3],
+) -> Option<Vec2> {
+    camera
+        .world_to_viewport(camera_transform, to_render_point(point))
+        .ok()
+}
+
+fn pick_entity(
+    display: &display::DisplayData,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    cursor: Vec2,
+) -> Option<u32> {
+    let mut best: Option<(f32, u32)> = None;
+    for path in &display.paths {
+        let projected: Vec<Vec2> = path
+            .points
+            .iter()
+            .filter_map(|point| project_entity_point(camera, camera_transform, *point))
+            .collect();
+        for pair in projected.windows(2) {
+            let distance = distance_to_segment(cursor, pair[0], pair[1]);
+            if distance <= 6.0
+                && best
+                    .map(|(best_distance, _)| distance < best_distance)
+                    .unwrap_or(true)
+            {
+                best = Some((distance, path.entity_id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+fn box_select(
+    display: &display::DisplayData,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    start: Vec2,
+    end: Vec2,
+) -> BTreeSet<u32> {
+    let rect = egui::Rect::from_two_pos(egui::pos2(start.x, start.y), egui::pos2(end.x, end.y));
+    let window_mode = end.x >= start.x;
+    let mut selected = BTreeSet::new();
+
+    for path in &display.paths {
+        let projected: Vec<Vec2> = path
+            .points
+            .iter()
+            .filter_map(|point| project_entity_point(camera, camera_transform, *point))
+            .collect();
+        if projected.len() < 2 {
+            continue;
+        }
+
+        let hit = if window_mode {
+            projected
+                .iter()
+                .all(|point| rect.contains(egui::pos2(point.x, point.y)))
+        } else {
+            projected
+                .iter()
+                .any(|point| rect.contains(egui::pos2(point.x, point.y)))
+                || projected
+                    .windows(2)
+                    .any(|pair| segment_intersects_rect(pair[0], pair[1], rect))
+        };
+        if hit {
+            selected.insert(path.entity_id);
+        }
+    }
+    selected
+}
+
+fn box_select_units(
+    display: &display::DisplayData,
+    cam: &cam::CamModel,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    start: Vec2,
+    end: Vec2,
+) -> BTreeSet<cam::UnitId> {
+    let rect = egui::Rect::from_two_pos(egui::pos2(start.x, start.y), egui::pos2(end.x, end.y));
+    let window_mode = end.x >= start.x;
+    let mut selected = BTreeSet::new();
+
+    for unit in &cam.units {
+        let mut has_projection = false;
+        let mut all_inside = true;
+        let mut intersects = false;
+
+        for path in &display.paths {
+            if cam.entity_to_unit.get(&path.entity_id) != Some(&unit.id) {
+                continue;
+            }
+            let projected: Vec<Vec2> = path
+                .points
+                .iter()
+                .filter_map(|point| project_entity_point(camera, camera_transform, *point))
+                .collect();
+            if projected.len() < 2 {
+                continue;
+            }
+            has_projection = true;
+            all_inside &= projected
+                .iter()
+                .all(|point| rect.contains(egui::pos2(point.x, point.y)));
+            intersects |= projected
+                .iter()
+                .any(|point| rect.contains(egui::pos2(point.x, point.y)))
+                || projected
+                    .windows(2)
+                    .any(|pair| segment_intersects_rect(pair[0], pair[1], rect));
+        }
+
+        let hit = has_projection && if window_mode { all_inside } else { intersects };
+        if hit {
+            selected.insert(unit.id);
+        }
+    }
+
+    selected
+}
+
+fn distance_to_segment(point: Vec2, start: Vec2, end: Vec2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_squared();
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+    point.distance(start + segment * t)
+}
+
+fn segment_intersects_rect(start: Vec2, end: Vec2, rect: egui::Rect) -> bool {
+    let min = Vec2::new(rect.min.x, rect.min.y);
+    let max = Vec2::new(rect.max.x, rect.max.y);
+    if rect.contains(egui::pos2(start.x, start.y)) || rect.contains(egui::pos2(end.x, end.y)) {
+        return true;
+    }
+    let corners = [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)];
+    (0..4).any(|index| segments_intersect(start, end, corners[index], corners[(index + 1) % 4]))
+}
+
+fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+    fn cross(a: Vec2, b: Vec2, c: Vec2) -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+    let ab_c = cross(a, b, c);
+    let ab_d = cross(a, b, d);
+    let cd_a = cross(c, d, a);
+    let cd_b = cross(c, d, b);
+    ab_c * ab_d < 0.0 && cd_a * cd_b < 0.0
+}
+
+fn entity_info_ui(ui: &mut egui::Ui, entity: &display::DisplayEntity, scope: &str) {
+    ui.horizontal(|ui| {
+        ui.colored_label(color32(entity.color), "■");
+        ui.strong(format!("{}  #{}", entity.kind, entity.id));
+    });
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("基本信息").strong());
+
+    egui::Grid::new(format!("common_{scope}_{}", entity.id))
+        .num_columns(2)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("类型");
+            ui.label(entity.kind);
+            ui.end_row();
+            ui.label("实体 ID");
+            ui.label(entity.id.to_string());
+            ui.end_row();
+            ui.label("图层");
+            ui.label(&entity.layer);
+            ui.end_row();
+            ui.label("图层颜色");
+            color_label(ui, entity.layer_color);
+            ui.end_row();
+            ui.label("图元颜色");
+            color_label(ui, entity.color);
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("几何信息").strong());
+    egui::Grid::new(format!("geometry_{scope}_{}", entity.id))
+        .num_columns(2)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for (label, value) in &entity.properties {
+                ui.label(*label);
+                ui.label(value);
+                ui.end_row();
+            }
+        });
+}
+
+fn cam_unit_info_ui(
+    ui: &mut egui::Ui,
+    unit: &cam::MachiningUnit,
+    display: &display::DisplayData,
+    scope: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.strong("加工单元");
+    });
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("基本信息").strong());
+    egui::Grid::new(format!("unit_common_{scope}_{:016X}", unit.id.0))
+        .num_columns(2)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("单元 ID");
+            ui.label(format!("{:016X}", unit.id.0));
+            ui.end_row();
+            ui.label("类型");
+            ui.label(if unit.closed { "闭合" } else { "开放" });
+            ui.end_row();
+            ui.label("成员数");
+            ui.label(unit.members.len().to_string());
+            ui.end_row();
+            ui.label("显示颜色");
+            ui.label("跟随成员图元");
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("成员图元").strong());
+    egui::Grid::new(format!("unit_members_{scope}_{:016X}", unit.id.0))
+        .num_columns(3)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for member in &unit.members {
+                if let Some(entity) = display.entities.iter().find(|entity| entity.id == *member) {
+                    ui.label(entity.kind);
+                    ui.label(format!("#{}", entity.id));
+                    ui.label(&entity.layer);
+                    ui.end_row();
+                }
+            }
+        });
+}
+
+fn color_label(ui: &mut egui::Ui, rgb: [f32; 3]) {
+    ui.horizontal(|ui| {
+        ui.colored_label(color32(rgb), "■");
+        ui.label(format!(
+            "#{:02X}{:02X}{:02X}",
+            (rgb[0] * 255.0).round() as u8,
+            (rgb[1] * 255.0).round() as u8,
+            (rgb[2] * 255.0).round() as u8
+        ));
+    });
+}
+
+fn color32(rgb: [f32; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (rgb[0] * 255.0).round() as u8,
+        (rgb[1] * 255.0).round() as u8,
+        (rgb[2] * 255.0).round() as u8,
+    )
+}
+
 fn drawing_ui(
     mut contexts: EguiContexts,
     mut state: ResMut<ViewerState>,
     mut camera: ResMut<CameraRig>,
+    mut selection: ResMut<SelectionState>,
+    mut space: ResMut<SpaceState>,
     mut fonts_loaded: Local<bool>,
+    mut ui_state: ResMut<UiState>,
 ) -> Result {
     let context = contexts.ctx_mut()?;
     install_cjk_font(context, &mut fonts_loaded);
@@ -393,7 +948,7 @@ fn drawing_ui(
             .max_rect(context.viewport_rect()),
     );
 
-    egui::Panel::top("menu_bar").show(&mut root, |ui| {
+    let menu_panel = egui::Panel::top("menu_bar").show(&mut root, |ui| {
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(MENU_SIDE_WIDTH, 24.0),
@@ -446,6 +1001,8 @@ fn drawing_ui(
                             ui.close();
                         }
                     });
+                    ui.separator();
+                    space_switch_ui(ui, &mut space, &mut selection, &state.cam);
                 },
             );
 
@@ -464,7 +1021,7 @@ fn drawing_ui(
             );
         });
     });
-
+    let menu_rect = menu_panel.response.rect;
     let command_dimensions = state.command_open.then(|| {
         let history_lines = state.messages.len().min(COMMAND_MAX_HISTORY_LINES);
         let history_height = history_lines as f32 * COMMAND_ROW_HEIGHT;
@@ -539,6 +1096,110 @@ fn drawing_ui(
         }
     });
     let command_rect = command_panel.response.rect;
+
+    let feature_panel = egui::Panel::left("feature_info")
+        .default_size(300.0)
+        .resizable(true)
+        .show(&mut root, |ui| {
+            ui.add_space(6.0);
+            ui.heading("特征");
+            ui.separator();
+
+            match space.mode {
+                SpaceMode::Cad => {
+                    let selected_entities: Vec<&display::DisplayEntity> = state
+                        .display
+                        .entities
+                        .iter()
+                        .filter(|entity| selection.selected.contains(&entity.id))
+                        .collect();
+
+                    if selected_entities.is_empty() {
+                        ui.label("未选择图元");
+                        ui.label("左键点选 / 拖拽框选");
+                        ui.label("Shift + 左键追加选择");
+                    } else {
+                        ui.label(format!("已选择 {} 个图元", selected_entities.len()));
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if selected_entities.len() == 1 {
+                                entity_info_ui(ui, selected_entities[0], "single");
+                            } else {
+                                for entity in selected_entities {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{}  #{}",
+                                        entity.kind, entity.id
+                                    ))
+                                    .id_salt(entity.id)
+                                    .default_open(false)
+                                    .show(ui, |ui| entity_info_ui(ui, entity, "multi"));
+                                }
+                            }
+                        });
+                    }
+                }
+                SpaceMode::Cam => {
+                    let selected_units: Vec<&cam::MachiningUnit> = state
+                        .cam
+                        .units
+                        .iter()
+                        .filter(|unit| selection.cam_selected.contains(&unit.id))
+                        .collect();
+
+                    if selected_units.is_empty() {
+                        ui.label("未选择加工单元");
+                        ui.label("左键点选 / 拖拽框选");
+                        ui.label("Shift + 左键追加选择");
+                    } else {
+                        ui.label(format!("已选择 {} 个加工单元", selected_units.len()));
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if selected_units.len() == 1 {
+                                cam_unit_info_ui(ui, selected_units[0], &state.display, "single");
+                            } else {
+                                for unit in selected_units {
+                                    egui::CollapsingHeader::new(format!(
+                                        "加工单元  #{:016X}",
+                                        unit.id.0
+                                    ))
+                                    .id_salt(unit.id)
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        cam_unit_info_ui(ui, unit, &state.display, "multi")
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+    let feature_rect = feature_panel.response.rect;
+
+    if let (Some(start), Some(current)) = (selection.drag_start, selection.drag_current) {
+        if (current - start).length() > 2.0 {
+            let rect = egui::Rect::from_two_pos(
+                egui::pos2(start.x, start.y),
+                egui::pos2(current.x, current.y),
+            );
+            let painter = context.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("selection_rectangle"),
+            ));
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(80, 140, 255, 28),
+            );
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 180, 255));
+            painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+            painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+            painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
+            painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
+        }
+    }
+
     if state.command_open {
         let clicked = context.input(|input| input.pointer.any_click());
         let pointer = context.input(|input| input.pointer.interact_pos());
@@ -563,6 +1224,16 @@ fn drawing_ui(
         state.fit_dirty = true;
     }
     view_cube_ui(context, &mut camera);
+
+    let pointer = context.input(|input| input.pointer.hover_pos());
+    let over_panels = pointer
+        .map(|position| {
+            menu_rect.contains(position)
+                || feature_rect.contains(position)
+                || command_rect.contains(position)
+        })
+        .unwrap_or(false);
+    ui_state.pointer_over_ui = over_panels || context.egui_wants_pointer_input();
     Ok(())
 }
 

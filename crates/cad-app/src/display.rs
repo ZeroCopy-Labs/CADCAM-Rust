@@ -21,17 +21,31 @@ pub struct Bounds {
     pub max_z: f64,
 }
 
-/// One drawable polyline with its display color.
+/// One drawable polyline with its display color and owning entity.
 #[derive(Clone, Debug)]
 pub struct DisplayPath {
+    pub entity_id: u32,
     pub color: [f32; 3],
     pub points: Vec<[f64; 3]>,
+}
+
+/// Basic display metadata for one CAD entity.
+#[derive(Clone, Debug)]
+pub struct DisplayEntity {
+    pub id: u32,
+    pub kind: &'static str,
+    pub layer: String,
+    pub color: [f32; 3],
+    pub layer_color: [f32; 3],
+    /// Geometry-specific table rows, independent of the common entity fields.
+    pub properties: Vec<(&'static str, String)>,
 }
 
 /// All data the viewport needs after a drawing has been loaded.
 #[derive(Clone, Debug, Default)]
 pub struct DisplayData {
     pub paths: Vec<DisplayPath>,
+    pub entities: Vec<DisplayEntity>,
     pub bounds: Option<Bounds>,
 }
 
@@ -41,6 +55,7 @@ pub struct DisplayData {
 /// in 3D. The viewer only does the final CAD-to-render axis conversion.
 pub fn build_display(document: &DrawingDocument) -> DisplayData {
     let mut paths = Vec::new();
+    let mut entities = Vec::new();
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut min_z = f64::INFINITY;
@@ -51,6 +66,7 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
 
     for entity in &document.entities {
         let color = resolve_color(entity, document);
+        let mut entity_paths = Vec::new();
 
         for path in tessellate_geometry(&entity.geometry) {
             let points: Vec<[f64; 3]> = path
@@ -70,9 +86,35 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
                 max_z = max_z.max(point[2]);
             }
             has_points = true;
-
-            paths.push(DisplayPath { color, points });
+            entity_paths.push(DisplayPath {
+                entity_id: entity.id.0,
+                color,
+                points,
+            });
         }
+
+        if entity_paths.is_empty() {
+            continue;
+        }
+        paths.extend(entity_paths);
+        let layer = document
+            .layers
+            .iter()
+            .find(|layer| layer.id == entity.layer_id);
+        let layer_name = layer
+            .map(|layer| layer.name.clone())
+            .unwrap_or_else(|| "0".to_string());
+        let layer_color = layer
+            .map(|layer| color_to_rgb(layer.color))
+            .unwrap_or([0.86, 0.89, 0.94]);
+        entities.push(DisplayEntity {
+            id: entity.id.0,
+            kind: entity.geometry.kind(),
+            layer: layer_name,
+            color,
+            layer_color,
+            properties: entity_properties(&entity.geometry),
+        });
     }
 
     let bounds = has_points.then_some(Bounds {
@@ -84,7 +126,11 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
         max_z,
     });
 
-    DisplayData { paths, bounds }
+    DisplayData {
+        paths,
+        entities,
+        bounds,
+    }
 }
 
 /// Resolve the display color from the entity, falling back to its layer color.
@@ -129,6 +175,99 @@ fn aci_color(index: u8) -> [f32; 3] {
         9 => [0.72, 0.76, 0.82],
         _ => [0.82, 0.86, 0.92],
     }
+}
+
+/// Type-specific table rows for the selection panel.
+fn entity_properties(geometry: &Geometry) -> Vec<(&'static str, String)> {
+    match geometry {
+        Geometry::Line(line) => vec![
+            ("起点", format_point(line.start)),
+            ("终点", format_point(line.end)),
+            ("长度", format!("{:.3}", distance(line.start, line.end))),
+        ],
+        Geometry::Polyline(polyline) => {
+            let start = polyline.segments.first().map(|segment| match segment {
+                PolylineSegment::Line { start, .. } => *start,
+                PolylineSegment::Arc { start, .. } => *start,
+            });
+            let end = polyline.segments.last().map(|segment| match segment {
+                PolylineSegment::Line { end, .. } => *end,
+                PolylineSegment::Arc { end, .. } => *end,
+            });
+            vec![
+                ("段数", polyline.segments.len().to_string()),
+                ("闭合", yes_no(polyline.closed)),
+                (
+                    "起点",
+                    start.map(format_point).unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "终点",
+                    end.map(format_point).unwrap_or_else(|| "—".to_string()),
+                ),
+                (
+                    "平面法向",
+                    polyline
+                        .plane
+                        .map(|plane| format_vector(plane.normal))
+                        .unwrap_or_else(|| "3D（无线段平面）".to_string()),
+                ),
+            ]
+        }
+        Geometry::Circle(circle) => vec![
+            ("圆心", format_point(circle.center)),
+            ("半径", format!("{:.3}", circle.radius)),
+            ("平面法向", format_vector(circle.plane.normal)),
+        ],
+        Geometry::Arc(arc) => vec![
+            ("圆心", format_point(arc.center)),
+            ("半径", format!("{:.3}", arc.radius)),
+            ("起始角", format!("{:.3}°", arc.start_angle.to_degrees())),
+            ("扫掠角", format!("{:.3}°", arc.sweep_angle.to_degrees())),
+            ("平面法向", format_vector(arc.plane.normal)),
+        ],
+        Geometry::Ellipse(ellipse) => vec![
+            ("中心", format_point(ellipse.center)),
+            ("长半轴", format!("{:.3}", ellipse.major_axis.length())),
+            ("短半轴", format!("{:.3}", ellipse.minor_axis.length())),
+            (
+                "起始参数",
+                format!("{:.3}°", ellipse.start_parameter.to_degrees()),
+            ),
+            (
+                "扫掠参数",
+                format!("{:.3}°", ellipse.sweep_parameter.to_degrees()),
+            ),
+        ],
+        Geometry::Spline(spline) => vec![
+            ("阶数", spline.degree.to_string()),
+            ("控制点数", spline.control_points.len().to_string()),
+            ("节点数", spline.knots.len().to_string()),
+            ("闭合", yes_no(spline.closed)),
+            ("周期", yes_no(spline.periodic)),
+            ("有理", yes_no(spline.rational)),
+            ("平面", yes_no(spline.planar)),
+        ],
+    }
+}
+
+fn distance(start: Point3, end: Point3) -> f64 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let dz = end.z - start.z;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn yes_no(value: bool) -> String {
+    if value { "是" } else { "否" }.to_string()
+}
+
+fn format_point(point: Point3) -> String {
+    format!("({:.2}, {:.2}, {:.2})", point.x, point.y, point.z)
+}
+
+fn format_vector(vector: cad_core::model::Vector3) -> String {
+    format!("({:.3}, {:.3}, {:.3})", vector.x, vector.y, vector.z)
 }
 
 /// Dispatch one internal geometry value to its display tessellator.
