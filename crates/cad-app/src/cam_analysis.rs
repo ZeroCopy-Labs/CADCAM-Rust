@@ -1105,6 +1105,19 @@ fn choose_unit_direction(
     Some((UnitDirection::Forward, start, end))
 }
 
+pub fn oriented_unit_path(
+    display: &DisplayData,
+    cam: &CamModel,
+    unit_id: UnitId,
+    direction: UnitDirection,
+) -> Option<Vec<[f64; 3]>> {
+    let mut path = ordered_unit_points(display, cam, unit_id)?;
+    if direction == UnitDirection::Reverse {
+        path.reverse();
+    }
+    Some(path)
+}
+
 fn unit_x_center(display: &DisplayData, cam: &CamModel, unit_id: UnitId) -> Option<f64> {
     let mut min_x = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;

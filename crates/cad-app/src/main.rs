@@ -22,7 +22,9 @@ use cad_core::read_document;
 
 mod cam;
 mod cam_analysis;
+mod cam_trajectory;
 mod display;
+mod gcode;
 
 const BACKGROUND: Color = Color::srgb(0.035, 0.045, 0.060);
 const RECENT_LIMIT: usize = 10;
@@ -45,6 +47,8 @@ struct ViewerState {
     display: display::DisplayData,
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
+    trajectory: Option<cam_trajectory::MachineTrajectory>,
+    gcode_profile: gcode::GCodeProfile,
     fit_dirty: bool,
     recent: Vec<PathBuf>,
     messages: Vec<String>,
@@ -132,8 +136,10 @@ struct UiState {
 
 fn main() {
     let initial_path = env::args().nth(1).unwrap_or_default();
+    let gcode_path = gcode_config_path();
     let mut state = ViewerState {
         recent: load_recent(),
+        gcode_profile: gcode::GCodeProfile::load_or_create(&gcode_path),
         ..Default::default()
     };
     push_message(&mut state, "使用“文件 → 打开文件”选择 DXF/DWG 图纸");
@@ -141,6 +147,7 @@ fn main() {
         &mut state,
         "视角：Shift+中键旋转 | 中键拖动平移 | 滚轮缩放 | 右上角魔方切换",
     );
+    push_message(&mut state, format!("G代码配置：{}", gcode_path.display()));
     if !initial_path.trim().is_empty() {
         open_drawing(&mut state, &initial_path);
     }
@@ -218,6 +225,12 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             let display = display::build_display(&document);
             let cam_model = cam::build_cam_model(&document);
             let analysis = cam_analysis::CamAnalysis::build(&display, &cam_model);
+            let trajectory = Some(cam_trajectory::build_trajectory(
+                &display,
+                &cam_model,
+                &analysis,
+                state.gcode_profile.rotary_config(),
+            ));
             state.file_name = document.source.file_name.clone();
             state.format = document.source.format.to_string();
             state.version = document.source.version.clone();
@@ -231,6 +244,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.display = display;
             state.cam = cam_model;
             state.analysis = analysis;
+            state.trajectory = trajectory;
             state.load_version += 1;
             state.fit_dirty = true;
 
@@ -871,7 +885,11 @@ struct CamAnalysisUiAction {
     apply_machining: Option<usize>,
 }
 
-fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> CamAnalysisUiAction {
+fn cam_analysis_ui(
+    ui: &mut egui::Ui,
+    analysis: &cam_analysis::CamAnalysis,
+    trajectory: Option<&cam_trajectory::MachineTrajectory>,
+) -> CamAnalysisUiAction {
     let mut action = CamAnalysisUiAction::default();
 
     egui::CollapsingHeader::new("方管截面")
@@ -1105,6 +1123,31 @@ fn cam_analysis_ui(ui: &mut egui::Ui, analysis: &cam_analysis::CamAnalysis) -> C
                     }
                 }
             });
+
+        if let Some(trajectory) = trajectory {
+            if trajectory.moves.is_empty() {
+                ui.label("四轴轨迹：暂无");
+            } else {
+                egui::CollapsingHeader::new("四轴轨迹（预览）")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!("加工单元：{}", trajectory.unit_count));
+                        ui.label(format!("运动段：{}", trajectory.moves.len()));
+                        ui.label(format!("切削段：{}", trajectory.cutting_move_count));
+                        ui.label(format!("旋转安全 Z：{:.3}", trajectory.safe_z));
+                        ui.label(format!(
+                            "A 范围：{:.2}° .. {:.2}°",
+                            trajectory.a_min, trajectory.a_max
+                        ));
+                        if let Some(last) = trajectory.moves.last() {
+                            ui.label(format!(
+                                "末姿态 X{:.2} Y{:.2} Z{:.2} A{:.2}",
+                                last.pose.x, last.pose.y, last.pose.z, last.pose.a
+                            ));
+                        }
+                    });
+            }
+        }
     }
 
     action
@@ -1397,6 +1440,7 @@ fn drawing_ui(
     context.set_visuals(egui::Visuals::dark());
 
     let mut open_dialog = false;
+    let mut export_gcode = false;
     let mut pending_path: Option<PathBuf> = None;
     let mut fit_clicked = false;
     let current_name = if state.file_name.is_empty() {
@@ -1422,6 +1466,11 @@ fn drawing_ui(
                     ui.menu_button("文件", |ui| {
                         if ui.button("打开文件").clicked() {
                             open_dialog = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("导出 G 代码").clicked() {
+                            export_gcode = true;
                             ui.close();
                         }
                         ui.separator();
@@ -1607,7 +1656,8 @@ fn drawing_ui(
                     }
                     SpaceMode::Cam => {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            cam_action = cam_analysis_ui(ui, &state.analysis);
+                            cam_action =
+                                cam_analysis_ui(ui, &state.analysis, state.trajectory.as_ref());
                             ui.separator();
 
                             let selected_units: Vec<&cam::MachiningUnit> = state
@@ -1688,6 +1738,7 @@ fn drawing_ui(
     if cam_action.clear_tube {
         state.analysis.clear_tube_section();
     }
+    let mut cam_input_changed = cam_action.clear_tube;
     {
         let ViewerState {
             display,
@@ -1697,13 +1748,32 @@ fn drawing_ui(
         } = &mut *state;
         if let Some(index) = cam_action.apply_tube {
             analysis.apply_tube_candidate(index, display, cam);
+            cam_input_changed = true;
         }
         if let Some(section) = cam_action.manual_tube {
             analysis.apply_manual_tube(section, display, cam);
+            cam_input_changed = true;
         }
         if let Some(index) = cam_action.apply_machining {
             analysis.apply_machining_candidate(index, display, cam);
+            cam_input_changed = true;
         }
+    }
+    if cam_input_changed {
+        let ViewerState {
+            display,
+            cam,
+            analysis,
+            trajectory,
+            gcode_profile,
+            ..
+        } = &mut *state;
+        *trajectory = Some(cam_trajectory::build_trajectory(
+            display,
+            cam,
+            analysis,
+            gcode_profile.rotary_config(),
+        ));
     }
 
     if let (Some(start), Some(current)) = (selection.drag_start, selection.drag_current) {
@@ -1748,6 +1818,9 @@ fn drawing_ui(
     }
     if let Some(path) = pending_path {
         open_drawing(&mut state, &path.to_string_lossy());
+    }
+    if export_gcode {
+        export_gcode_file(&mut state);
     }
     if fit_clicked {
         state.fit_dirty = true;
@@ -1989,6 +2062,45 @@ fn install_cjk_font(context: &egui::Context, loaded: &mut bool) {
         .or_default()
         .push("cjk".to_string());
     context.set_fonts(fonts);
+}
+
+fn gcode_config_path() -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    base.join("CADCAM-Rust").join("gcode.toml")
+}
+
+fn export_gcode_file(state: &mut ViewerState) {
+    let Some(trajectory) = state.trajectory.as_ref() else {
+        push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
+        return;
+    };
+    if trajectory.unit_ranges.is_empty() {
+        push_message(state, "没有可导出的加工单元");
+        return;
+    }
+
+    let stem = Path::new(&state.file_name)
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let directory = dialog_directory(state);
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出 G 代码")
+        .add_filter("G 代码 (*.nc, *.gcode)", &["nc", "gcode", "txt"])
+        .set_directory(&directory)
+        .set_file_name(format!("{stem}.nc"))
+        .save_file()
+    else {
+        return;
+    };
+
+    let text = gcode::render_gcode(trajectory, &state.gcode_profile);
+    match fs::write(&path, text) {
+        Ok(()) => push_message(state, format!("已导出 G 代码：{}", path.display())),
+        Err(error) => push_message(state, format!("导出 G 代码失败：{error}")),
+    }
 }
 
 /// Native file picker, starting in the last used directory.

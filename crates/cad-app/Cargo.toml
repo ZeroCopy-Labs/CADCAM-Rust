@@ -9,3 +9,5 @@ cad-core = { path = "../cad-core" }
 bevy = { version = "0.20.0", default-features = false, features = ["2d", "3d", "tonemapping_luts"] }
 bevy_egui = "0.43.1"
 rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
