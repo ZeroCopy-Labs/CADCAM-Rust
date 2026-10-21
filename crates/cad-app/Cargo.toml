@@ -8,3 +8,4 @@ description = "Bevy + wgpu viewer for the CAD core"
 cad-core = { path = "../cad-core" }
 bevy = { version = "0.20.0", default-features = false, features = ["2d"] }
 bevy_egui = "0.43.1"
+rfd = "0.17.2"

@@ -5,17 +5,21 @@
 
 ## 当前功能
 
-- 通过命令行参数、界面路径输入打开 DXF / DWG；
+- 顶部 `文件` 菜单：打开文件、最近打开；
+- 打开文件使用原生文件对话框，默认桌面，并记住上次目录；
+- 最近打开列表启动时从 `%APPDATA%\CADCAM-Rust\recent.txt` 加载；
+- 窗口顶部居中显示当前文件名；
+- 支持命令行参数直接打开 DXF / DWG；
 - 解析后显示模型空间中的 LINE、POLYLINE、CIRCLE、ARC、ELLIPSE、SPLINE；
 - 按图层/ACI/RGB 颜色绘制二维线段；
-- 显示文件名、实体数、图层数、格式、版本、单位和导入警告数；
+- 底部状态栏显示文件统计、单位和导入警告，以及视图适应/旋转控制；
 - 视图自适应图纸范围，支持旋转角度；
 - 深色界面。
 
 ## 构建
 
 ```powershell
-cd D:\projects\CAD_CAM
+cd D:\projects\CADCAM-Rust
 .\build.ps1
 ```
 
