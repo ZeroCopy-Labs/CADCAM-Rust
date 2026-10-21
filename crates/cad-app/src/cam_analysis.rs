@@ -776,6 +776,106 @@ impl CamAnalysis {
             }
         }
     }
+
+    /// Move one non-section plan unit inside its group and refresh direction/start.
+    pub fn move_plan_unit(
+        &mut self,
+        display: &DisplayData,
+        cam: &CamModel,
+        group_id: u32,
+        index: usize,
+        delta: isize,
+    ) -> bool {
+        let Some(group) = self
+            .plan
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if index >= group.units.len() || target < 0 || target >= group.units.len() as isize {
+            return false;
+        }
+        let target = target as usize;
+        if group.units[index].machining_cut || group.units[target].machining_cut {
+            return false;
+        }
+        group.units.swap(index, target);
+
+        let mut previous_end: Option<[f64; 3]> = None;
+        for unit in &mut group.units {
+            if let Some((direction, start, end)) =
+                choose_unit_direction(display, cam, unit.unit_id, previous_end)
+            {
+                unit.direction = direction;
+                unit.start_point = start;
+                unit.end_point = end;
+                previous_end = Some(end);
+            }
+        }
+
+        let mut order = 1u32;
+        for group in &mut self.plan.groups {
+            for unit in &mut group.units {
+                unit.order = order;
+                order += 1;
+            }
+        }
+        true
+    }
+
+    /// Move one non-section plan unit to a new index inside its group.
+    pub fn move_plan_unit_to(
+        &mut self,
+        display: &DisplayData,
+        cam: &CamModel,
+        group_id: u32,
+        from: usize,
+        to: usize,
+    ) -> bool {
+        let Some(group) = self
+            .plan
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            return false;
+        };
+        if from >= group.units.len()
+            || to > group.units.len()
+            || from == to
+            || group.units[from].machining_cut
+        {
+            return false;
+        }
+        let unit = group.units.remove(from);
+        let section_count = group.units.iter().filter(|unit| unit.machining_cut).count();
+        let insert = to.min(group.units.len().saturating_sub(section_count));
+        group.units.insert(insert, unit);
+
+        let mut previous_end: Option<[f64; 3]> = None;
+        for unit in &mut group.units {
+            if let Some((direction, start, end)) =
+                choose_unit_direction(display, cam, unit.unit_id, previous_end)
+            {
+                unit.direction = direction;
+                unit.start_point = start;
+                unit.end_point = end;
+                previous_end = Some(end);
+            }
+        }
+
+        let mut order = 1u32;
+        for group in &mut self.plan.groups {
+            for unit in &mut group.units {
+                unit.order = order;
+                order += 1;
+            }
+        }
+        true
+    }
 }
 
 pub fn detect_tube_candidates(display: &DisplayData, cam: &CamModel) -> Vec<TubeCandidate> {

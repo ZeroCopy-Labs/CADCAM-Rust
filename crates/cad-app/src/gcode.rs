@@ -40,6 +40,13 @@ pub struct GCodeProfile {
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub arc_output: bool,
+    pub normalize_a: bool,
+    pub use_initial_position: bool,
+    pub initial_x: f64,
+    pub initial_y: f64,
+    pub initial_z: f64,
+    pub initial_a: f64,
+    pub return_to_initial: bool,
     pub entity_type_rules: BTreeMap<String, CodeRule>,
     pub color_rules: BTreeMap<String, CodeRule>,
     pub layer_rules: BTreeMap<String, CodeRule>,
@@ -77,6 +84,13 @@ impl Default for GCodeProfile {
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             arc_output: true,
+            normalize_a: true,
+            use_initial_position: false,
+            initial_x: 0.0,
+            initial_y: 0.0,
+            initial_z: 0.0,
+            initial_a: 0.0,
+            return_to_initial: false,
             entity_type_rules,
             color_rules,
             layer_rules,
@@ -92,6 +106,7 @@ impl GCodeProfile {
             rotation_safety_clearance: self.rotation_safety_clearance,
             same_zone_clearance: self.same_zone_clearance,
             overcut_distance: self.overcut,
+            normalize_a: self.normalize_a,
         }
     }
 
@@ -126,6 +141,20 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
     let mut lines: Vec<String> = Vec::new();
     push_block(&mut lines, &profile.header);
     let mut previous_pose: Option<MachinePose> = None;
+    if profile.use_initial_position {
+        let pose = MachinePose {
+            x: profile.initial_x,
+            y: profile.initial_y,
+            z: profile.initial_z,
+            a: profile.initial_a,
+        };
+        lines.push(format!(
+            "{} {}",
+            profile.rapid,
+            format_axis(pose, profile.decimals)
+        ));
+        previous_pose = Some(pose);
+    }
 
     for (index, range) in trajectory.unit_ranges.iter().enumerate() {
         let start = range.start.min(trajectory.moves.len());
@@ -160,6 +189,20 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
                 push_movement(&mut lines, movement, profile, &mut previous_pose);
             }
         }
+    }
+
+    if profile.return_to_initial {
+        let pose = MachinePose {
+            x: profile.initial_x,
+            y: profile.initial_y,
+            z: profile.initial_z,
+            a: profile.initial_a,
+        };
+        lines.push(format!(
+            "{} {}",
+            profile.rapid,
+            format_axis(pose, profile.decimals)
+        ));
     }
 
     push_block(&mut lines, &profile.footer);

@@ -15,6 +15,7 @@ pub struct RotaryConfig {
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub overcut_distance: f64,
+    pub normalize_a: bool,
 }
 
 impl Default for RotaryConfig {
@@ -25,6 +26,7 @@ impl Default for RotaryConfig {
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             overcut_distance: 0.0,
+            normalize_a: true,
         }
     }
 }
@@ -191,9 +193,14 @@ pub fn build_trajectory(
             };
 
             let mut poses = Vec::with_capacity(path.len());
+            let mut unit_angle_started = false;
             for (point, (raw_angle, mode)) in path.iter().zip(point_poses.iter()) {
                 let angle = *raw_angle + config.a_offset_degrees;
-                let aligned = unwrap_angle(previous_a, angle);
+                let mut aligned = unwrap_angle(previous_a, angle);
+                if config.normalize_a && !unit_angle_started {
+                    aligned = wrap_angle_180(aligned);
+                    unit_angle_started = true;
+                }
                 let pose = match mode {
                     PoseMode::Radial => radial_pose(
                         *point,
@@ -658,6 +665,10 @@ fn pose_from_point(
         z: center_z + machine_z + machining_z_offset,
         a: angle_degrees,
     }
+}
+
+fn wrap_angle_180(value: f64) -> f64 {
+    ((value + 180.0).rem_euclid(360.0)) - 180.0
 }
 
 fn unwrap_angle(previous: f64, target: f64) -> f64 {

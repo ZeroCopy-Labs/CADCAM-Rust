@@ -34,6 +34,7 @@ const COMMAND_MAX_HISTORY_LINES: usize = 4;
 const COMMAND_ROW_HEIGHT: f32 = 21.0;
 const COMMAND_VERTICAL_PADDING: f32 = 12.0;
 const MENU_SIDE_WIDTH: f32 = 300.0;
+const PICK_TOLERANCE: f32 = 12.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
@@ -118,7 +119,16 @@ struct SelectionState {
     cam_selected: BTreeSet<cam::UnitId>,
     drag_start: Option<Vec2>,
     drag_current: Option<Vec2>,
+    reorder_clicks: Option<ReorderClicks>,
     load_version: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ReorderClicks {
+    group_id: u32,
+    start: usize,
+    length: usize,
+    clicked: Vec<cam::UnitId>,
 }
 
 /// CAD space is the authoritative drawing; CAM space is the derived unit view.
@@ -571,7 +581,7 @@ fn selection_input(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
-    state: Res<ViewerState>,
+    mut state: ResMut<ViewerState>,
     mut selection: ResMut<SelectionState>,
     space: Res<SpaceState>,
     ui_state: Res<UiState>,
@@ -587,6 +597,7 @@ fn selection_input(
         selection.cam_selected.clear();
         selection.drag_start = None;
         selection.drag_current = None;
+        selection.reorder_clicks = None;
         selection.load_version = state.load_version;
     }
     selection.selected.retain(|id| valid.contains(id));
@@ -605,11 +616,43 @@ fn selection_input(
         // panel, even if the first press frame already reached this system.
         selection.drag_start = None;
         selection.drag_current = None;
+        selection.reorder_clicks = None;
         return Ok(());
     }
     let (camera, camera_transform) = camera.into_inner();
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if !ctrl {
+        selection.reorder_clicks = None;
+    }
 
     if mouse.just_pressed(MouseButton::Left) {
+        if space.mode == SpaceMode::Cam && ctrl {
+            if let Some(unit_id) = pick_entity(&state.display, camera, camera_transform, cursor)
+                .and_then(|entity_id| state.cam.unit_for_entity(entity_id))
+            {
+                let mut reorder = selection.reorder_clicks.take();
+                if reorder.is_none() && selection.cam_selected.contains(&unit_id) {
+                    if let Some((group_id, start, length)) =
+                        consecutive_plan_block(&state.analysis, &selection.cam_selected)
+                    {
+                        reorder = Some(ReorderClicks {
+                            group_id,
+                            start,
+                            length,
+                            clicked: Vec::new(),
+                        });
+                    }
+                }
+                if let Some(mut active) = reorder {
+                    if apply_reorder_click(&mut state, &mut active, unit_id) {
+                        selection.reorder_clicks = Some(active);
+                        selection.drag_start = None;
+                        selection.drag_current = None;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         selection.drag_start = Some(cursor);
         selection.drag_current = Some(cursor);
     }
@@ -713,7 +756,7 @@ fn pick_entity(
             .collect();
         for pair in projected.windows(2) {
             let distance = distance_to_segment(cursor, pair[0], pair[1]);
-            if distance <= 6.0
+            if distance <= PICK_TOLERANCE
                 && best
                     .map(|(best_distance, _)| distance < best_distance)
                     .unwrap_or(true)
@@ -815,6 +858,100 @@ fn box_select_units(
     selected
 }
 
+fn consecutive_plan_block(
+    analysis: &cam_analysis::CamAnalysis,
+    selected: &BTreeSet<cam::UnitId>,
+) -> Option<(u32, usize, usize)> {
+    if selected.is_empty() {
+        return None;
+    }
+    let mut group_id = None;
+    let mut entries = Vec::new();
+    for group in &analysis.plan.groups {
+        for (index, unit) in group.units.iter().enumerate() {
+            if !selected.contains(&unit.unit_id) {
+                continue;
+            }
+            if unit.machining_cut {
+                return None;
+            }
+            if let Some(existing) = group_id {
+                if existing != group.group_id {
+                    return None;
+                }
+            } else {
+                group_id = Some(group.group_id);
+            }
+            entries.push((index, unit.order));
+        }
+    }
+    if entries.len() != selected.len() {
+        return None;
+    }
+    entries.sort_by_key(|(_, order)| *order);
+    if entries.windows(2).any(|pair| pair[1].1 != pair[0].1 + 1) {
+        return None;
+    }
+    let start = entries.iter().map(|(index, _)| *index).min()?;
+    let end = entries.iter().map(|(index, _)| *index).max()?;
+    if end + 1 - start != entries.len() {
+        return None;
+    }
+    Some((group_id?, start, entries.len()))
+}
+
+fn plan_unit_location(
+    analysis: &cam_analysis::CamAnalysis,
+    unit_id: cam::UnitId,
+) -> Option<(u32, usize)> {
+    for group in &analysis.plan.groups {
+        for (index, unit) in group.units.iter().enumerate() {
+            if unit.unit_id == unit_id {
+                return Some((group.group_id, index));
+            }
+        }
+    }
+    None
+}
+
+fn apply_reorder_click(
+    state: &mut ViewerState,
+    reorder: &mut ReorderClicks,
+    unit_id: cam::UnitId,
+) -> bool {
+    if reorder.clicked.contains(&unit_id) {
+        return true;
+    }
+    let Some((group_id, current)) = plan_unit_location(&state.analysis, unit_id) else {
+        return false;
+    };
+    if group_id != reorder.group_id
+        || current < reorder.start
+        || current >= reorder.start + reorder.length
+    {
+        return false;
+    }
+    let target = reorder.start + reorder.clicked.len();
+    if target >= reorder.start + reorder.length {
+        return false;
+    }
+    if current != target {
+        let ViewerState {
+            display,
+            cam,
+            analysis,
+            ..
+        } = &mut *state;
+        if !analysis.move_plan_unit_to(display, cam, group_id, current, target) {
+            return false;
+        }
+    }
+    reorder.clicked.push(unit_id);
+    rebuild_state_trajectory(state);
+    refresh_gcode_preview(state);
+    true
+}
+
 fn distance_to_segment(point: Vec2, start: Vec2, end: Vec2) -> f32 {
     let segment = end - start;
     let length_squared = segment.length_squared();
@@ -897,6 +1034,7 @@ struct CamAnalysisUiAction {
     manual_tube: Option<cam_analysis::TubeSection>,
     clear_tube: bool,
     apply_machining: Option<usize>,
+    move_unit: Option<(u32, usize, isize)>,
 }
 
 fn cam_analysis_ui(
@@ -1098,6 +1236,10 @@ fn cam_analysis_ui(
                 if !analysis.plan.groups.is_empty() {
                     ui.separator();
                     ui.label("加工顺序（预览）");
+                    ui.label(
+                        "框选连续编号的加工单元后，按住 Ctrl 依次点击单元，点击顺序即最终顺序。",
+                    );
+                    ui.label("加工断面固定在组末，不参与排序。");
                     for plan_group in &analysis.plan.groups {
                         let title = format!(
                             "组 {} · X {:.2}..{:.2}",
@@ -1109,7 +1251,7 @@ fn cam_analysis_ui(
                             .id_salt(("plan_group", plan_group.group_id))
                             .default_open(false)
                             .show(ui, |ui| {
-                                for unit in &plan_group.units {
+                                for (unit_index, unit) in plan_group.units.iter().enumerate() {
                                     let kind = if unit.machining_cut {
                                         "断面".to_string()
                                     } else {
@@ -1119,19 +1261,44 @@ fn cam_analysis_ui(
                                         cam_analysis::UnitDirection::Forward => "正向",
                                         cam_analysis::UnitDirection::Reverse => "反向",
                                     };
-                                    ui.add(
-                                        egui::Label::new(format!(
-                                            "{}. {}  #{:08X}  {}  起点 ({:.2}, {:.2}, {:.2})",
-                                            unit.order,
-                                            kind,
-                                            unit.unit_id.0 as u32,
-                                            direction,
-                                            unit.start_point[0],
-                                            unit.start_point[1],
-                                            unit.start_point[2]
-                                        ))
-                                        .wrap(),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        if !unit.machining_cut {
+                                            let can_up = unit_index > 0
+                                                && !plan_group.units[unit_index - 1].machining_cut;
+                                            let can_down = unit_index + 1 < plan_group.units.len()
+                                                && !plan_group.units[unit_index + 1].machining_cut;
+                                            if ui
+                                                .add_enabled(can_up, egui::Button::new("↑").small())
+                                                .clicked()
+                                            {
+                                                action.move_unit =
+                                                    Some((plan_group.group_id, unit_index, -1));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    can_down,
+                                                    egui::Button::new("↓").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                action.move_unit =
+                                                    Some((plan_group.group_id, unit_index, 1));
+                                            }
+                                        }
+                                        ui.add(
+                                            egui::Label::new(format!(
+                                                "{}. {}  #{:08X}  {}  起点 ({:.2}, {:.2}, {:.2})",
+                                                unit.order,
+                                                kind,
+                                                unit.unit_id.0 as u32,
+                                                direction,
+                                                unit.start_point[0],
+                                                unit.start_point[1],
+                                                unit.start_point[2]
+                                            ))
+                                            .wrap(),
+                                        );
+                                    });
                                 }
                             });
                     }
@@ -1781,6 +1948,11 @@ fn drawing_ui(
             analysis.apply_machining_candidate(index, display, cam);
             cam_input_changed = true;
         }
+        if let Some((group_id, index, delta)) = cam_action.move_unit {
+            if analysis.move_plan_unit(display, cam, group_id, index, delta) {
+                cam_input_changed = true;
+            }
+        }
     }
     if cam_input_changed {
         let ViewerState {
@@ -1815,6 +1987,26 @@ fn drawing_ui(
                 egui::Color32::from_rgba_unmultiplied(80, 140, 255, 28),
             );
             let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 180, 255));
+            painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+            painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+            painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
+            painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
+        }
+    }
+
+    if let Some(position) = context.input(|input| input.pointer.hover_pos()) {
+        let over_ui = menu_rect.expand(6.0).contains(position)
+            || feature_rect.expand(8.0).contains(position)
+            || command_rect.expand(6.0).contains(position)
+            || context.egui_wants_pointer_input();
+        if !over_ui {
+            let size = PICK_TOLERANCE * 2.0;
+            let rect = egui::Rect::from_center_size(position, egui::vec2(size, size));
+            let painter = context.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("pick_box"),
+            ));
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 205, 90));
             painter.line_segment([rect.left_top(), rect.right_top()], stroke);
             painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
             painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
@@ -1947,10 +2139,16 @@ fn drawing_ui(
                                         ui.label("");
                                         ui.end_row();
                                     });
-                                ui.checkbox(
-                                    &mut state.gcode_profile.arc_output,
-                                    "输出圆弧 G02/G03",
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(
+                                        &mut state.gcode_profile.arc_output,
+                                        "输出圆弧 G02/G03",
+                                    );
+                                    ui.checkbox(
+                                        &mut state.gcode_profile.normalize_a,
+                                        "A 轴规范化到 ±180°",
+                                    );
+                                });
                                 let available = ui.available_height();
                                 let label_height = 18.0;
                                 let gap = 6.0;
@@ -2059,6 +2257,52 @@ fn drawing_ui(
                                 ui.label(
                                 "大于 0 时执行局部抬刀、平移、落刀；跨区始终先抬到旋转安全高度。",
                             );
+                                ui.separator();
+                                ui.checkbox(
+                                    &mut state.gcode_profile.use_initial_position,
+                                    "启用初始机床位置",
+                                );
+                                if state.gcode_profile.use_initial_position {
+                                    egui::Grid::new("gcode_initial_position")
+                                        .num_columns(4)
+                                        .spacing([8.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label("X");
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut state.gcode_profile.initial_x,
+                                                )
+                                                .speed(0.1),
+                                            );
+                                            ui.label("Y");
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut state.gcode_profile.initial_y,
+                                                )
+                                                .speed(0.1),
+                                            );
+                                            ui.end_row();
+                                            ui.label("Z");
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut state.gcode_profile.initial_z,
+                                                )
+                                                .speed(0.1),
+                                            );
+                                            ui.label("A");
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut state.gcode_profile.initial_a,
+                                                )
+                                                .speed(0.1),
+                                            );
+                                            ui.end_row();
+                                        });
+                                }
+                                ui.checkbox(
+                                    &mut state.gcode_profile.return_to_initial,
+                                    "程序结束返回初始位置",
+                                );
                             }
                             5 => {
                                 egui::Grid::new("gcode_planning_tab")
