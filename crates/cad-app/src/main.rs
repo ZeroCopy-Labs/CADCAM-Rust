@@ -249,7 +249,16 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
         Ok(document) => {
             let display = display::build_display(&document);
             let cam_model = cam::build_cam_model(&document);
-            let analysis = cam_analysis::CamAnalysis::build(&display, &cam_model);
+            let mut analysis = cam_analysis::CamAnalysis::build(&display, &cam_model);
+            analysis.set_machine_start(
+                &display,
+                &cam_model,
+                [
+                    state.gcode_profile.initial_x,
+                    state.gcode_profile.initial_y,
+                    state.gcode_profile.initial_z,
+                ],
+            );
             let trajectory = Some(cam_trajectory::build_trajectory(
                 &display,
                 &cam_model,
@@ -1249,7 +1258,7 @@ fn cam_analysis_ui(
                                     ui.label(format!(
                                         "组末加工断面：{}",
                                         section_index
-                                            .map(|index| format!("#{}", index))
+                                            .map(|index| format!("#{}", index + 1))
                                             .unwrap_or_else(|| "未编号".to_string())
                                     ));
                                 }
@@ -1430,7 +1439,7 @@ fn cam_unit_info_ui(
             ui.end_row();
             ui.label("加工断面");
             ui.label(match machining_section_index {
-                Some(index) => format!("是（#{}）", index),
+                Some(index) => format!("是（#{}）", index + 1),
                 None if machining_candidate => "候选（未应用）".to_string(),
                 None => "否".to_string(),
             });
@@ -1540,24 +1549,9 @@ fn draw_machining_order_labels(
 
     for group in &state.analysis.plan.groups {
         for unit in &group.units {
-            let Some(center) = unit_center(&state.display, &state.cam, unit.unit_id) else {
-                continue;
-            };
-            let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
-            let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
-                continue;
-            };
-            let position = egui::pos2(screen.x, screen.y);
-            if !viewport.contains(position)
-                || blocked
-                    .iter()
-                    .any(|rect| rect.expand(4.0).contains(position))
-            {
-                continue;
-            }
-
-            // Draw the actual entry point and the local cutting tangent. The
-            // tangent comes from the ordered path, not from center-to-center.
+            // Draw the entry arrow independently of the unit-center label, so
+            // a section whose center is off-screen or under a panel still gets
+            // its start marker when the start itself is visible.
             if let Some(path) = cam_analysis::oriented_unit_path_from(
                 &state.display,
                 &state.cam,
@@ -1576,7 +1570,7 @@ fn draw_machining_order_labels(
                     ) {
                         let start = egui::pos2(start_screen.x, start_screen.y);
                         let mut direction = None;
-                        for point in path.iter().skip(1).take(8) {
+                        for point in path.iter().skip(1) {
                             if let Ok(next_screen) = camera.world_to_viewport(
                                 camera_transform,
                                 Vec3::new(point[0] as f32, point[2] as f32, -(point[1] as f32)),
@@ -1613,6 +1607,22 @@ fn draw_machining_order_labels(
                         }
                     }
                 }
+            }
+
+            let Some(center) = unit_center(&state.display, &state.cam, unit.unit_id) else {
+                continue;
+            };
+            let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
+            let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
+                continue;
+            };
+            let position = egui::pos2(screen.x, screen.y);
+            if !viewport.contains(position)
+                || blocked
+                    .iter()
+                    .any(|rect| rect.expand(4.0).contains(position))
+            {
+                continue;
             }
 
             if !unit.machining_cut {
@@ -1678,7 +1688,7 @@ fn draw_machining_section_labels(
         }
 
         painter.circle_filled(position, 3.0, egui::Color32::from_rgb(255, 214, 80));
-        let text = format!("#{index}");
+        let text = format!("#{}", index + 1);
         let galley =
             painter.layout_no_wrap(text, egui::FontId::monospace(14.0), egui::Color32::WHITE);
         let anchor = egui::pos2(
@@ -2557,6 +2567,7 @@ fn drawing_ui(
 
         if reload_profile {
             state.gcode_profile = gcode::GCodeProfile::load(&config_path).unwrap_or_default();
+            sync_machine_start(&mut state);
             rebuild_state_trajectory(&mut state);
             refresh_gcode_preview(&mut state);
             push_message(&mut state, "已重新加载 G 代码配置");
@@ -2564,6 +2575,7 @@ fn drawing_ui(
         if save_profile {
             match state.gcode_profile.save(&config_path) {
                 Ok(()) => {
+                    sync_machine_start(&mut state);
                     rebuild_state_trajectory(&mut state);
                     refresh_gcode_preview(&mut state);
                     push_message(&mut state, "G 代码配置已保存，轨迹已重新计算");
@@ -2945,6 +2957,21 @@ fn gcode_rule_tab(
             }
         });
     });
+}
+
+fn sync_machine_start(state: &mut ViewerState) {
+    let start = [
+        state.gcode_profile.initial_x,
+        state.gcode_profile.initial_y,
+        state.gcode_profile.initial_z,
+    ];
+    let ViewerState {
+        display,
+        cam,
+        analysis,
+        ..
+    } = &mut *state;
+    analysis.set_machine_start(display, cam, start);
 }
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
