@@ -218,12 +218,13 @@ pub fn build_trajectory(
         + radius_y.hypot(radius_z)
         + config.machining_z_offset.max(0.0)
         + config.rotation_safety_clearance;
+    if !safe_z.is_finite() {
+        return MachineTrajectory::default();
+    }
     let mut moves = Vec::new();
     let mut unit_ranges = Vec::new();
     let mut unit_rules = Vec::new();
-    let mut cutting_move_count = 0usize;
     let mut unit_count = 0usize;
-    let mut previous_a = config.initial_position.map(|pose| pose.a).unwrap_or(0.0);
     let mut previous_end = config.initial_position;
     let mut previous_surface: Option<TubeZone> = None;
 
@@ -295,12 +296,13 @@ pub fn build_trajectory(
             };
 
             let mut poses = Vec::with_capacity(path.len());
+            let mut previous_a = previous_end.map(|pose| pose.a).unwrap_or(0.0);
             for (point, (raw_angle, mode)) in path.iter().zip(point_poses.iter()) {
-                let angle = *raw_angle + config.a_offset_degrees;
-                let aligned = if config.keep_continuous_angle {
-                    unwrap_angle(previous_a, angle)
+                let angle = wrap_angle_180(*raw_angle + wrap_angle_180(config.a_offset_degrees));
+                let aligned = if poses.is_empty() {
+                    align_entry_angle(previous_a, angle, config.keep_continuous_angle)
                 } else {
-                    wrap_angle_180(angle)
+                    unwrap_angle(previous_a, angle)
                 };
                 let pose = match mode {
                     PoseMode::Radial => radial_pose(
@@ -320,6 +322,9 @@ pub fn build_trajectory(
                 };
                 poses.push(pose);
                 previous_a = aligned;
+            }
+            if poses.iter().any(|pose| !finite_pose(*pose)) {
+                return MachineTrajectory::default();
             }
 
             let Some(first) = poses.first().copied() else {
@@ -376,7 +381,6 @@ pub fn build_trajectory(
                         },
                         pose: first,
                     });
-                    cutting_move_count += 2;
                     // A closed circle may have an overcut point appended after
                     // the geometric start. Emit it as a real move so the next
                     // transfer starts from the position actually reached.
@@ -389,7 +393,6 @@ pub fn build_trajectory(
                             kind: MachineMoveKind::Cutting,
                             pose: last,
                         });
-                        cutting_move_count += 1;
                     }
                 } else if !arc.full_circle {
                     moves.push(MachineMove {
@@ -400,14 +403,12 @@ pub fn build_trajectory(
                         },
                         pose: last,
                     });
-                    cutting_move_count += 1;
                 } else {
                     for pose in poses.iter().skip(1) {
                         moves.push(MachineMove {
                             kind: MachineMoveKind::Cutting,
                             pose: *pose,
                         });
-                        cutting_move_count += 1;
                     }
                 }
             } else {
@@ -416,7 +417,6 @@ pub fn build_trajectory(
                         kind: MachineMoveKind::Cutting,
                         pose: *pose,
                     });
-                    cutting_move_count += 1;
                 }
             }
             unit_ranges.push(TrajectoryUnitRange {
@@ -425,17 +425,18 @@ pub fn build_trajectory(
                 end: moves.len(),
             });
             unit_rules.push(unit_rule_keys(display, cam, unit));
-            previous_end = Some(last);
+            previous_end = moves.last().map(|movement| movement.pose);
             previous_surface = surface;
             unit_count += 1;
         }
     }
 
     if let Some(previous) = previous_end {
-        let target = config.return_position.unwrap_or(MachinePose {
+        let mut target = config.return_position.unwrap_or(MachinePose {
             z: previous.z.max(safe_z),
             ..previous
         });
+        target.a = unwrap_angle(previous.a, target.a);
         moves.extend(transfer_moves(
             Some(previous),
             target,
@@ -458,6 +459,10 @@ pub fn build_trajectory(
         .map(|movement| movement.pose.a)
         .fold(f64::NEG_INFINITY, f64::max);
 
+    let cutting_move_count = moves
+        .iter()
+        .filter(|movement| movement.kind.is_cutting())
+        .count();
     MachineTrajectory {
         moves,
         unit_ranges,
@@ -474,6 +479,15 @@ fn finite_pose(pose: MachinePose) -> bool {
     [pose.x, pose.y, pose.z, pose.a]
         .iter()
         .all(|v| v.is_finite())
+}
+
+fn align_entry_angle(previous: f64, target: f64, continuous: bool) -> f64 {
+    let aligned = unwrap_angle(previous, target);
+    if continuous || (aligned - previous).abs() <= 1.0e-9 {
+        aligned
+    } else {
+        target
+    }
 }
 
 fn push_rapid(moves: &mut Vec<MachineMove>, pose: MachinePose) {
@@ -526,6 +540,11 @@ pub fn transfer_moves(
         );
         push_rapid(&mut moves, end);
         return moves;
+    };
+    // Equivalent angles describe the same pose, even with continuity disabled.
+    let end = MachinePose {
+        a: align_entry_angle(start.a, end.a, false),
+        ..end
     };
     if local && (start.a - end.a).abs() <= 1.0e-6 {
         let distance = (end.x - start.x).hypot(end.y - start.y);
@@ -689,11 +708,16 @@ fn build_without_tube_section(
                 path.push(path[0]);
             }
 
+            let angle = align_entry_angle(
+                previous_end.map(|pose| pose.a).unwrap_or(0.0),
+                wrap_angle_180(config.a_offset_degrees),
+                config.keep_continuous_angle,
+            );
             let to_pose = |point: [f64; 3]| MachinePose {
                 x: point[0],
                 y: point[1],
                 z: point[2],
-                a: config.a_offset_degrees,
+                a: angle,
             };
             let first = to_pose(path[0]);
             let last = to_pose(*path.last().unwrap());
@@ -730,10 +754,11 @@ fn build_without_tube_section(
     }
 
     if let Some(previous) = previous_end {
-        let target = config.return_position.unwrap_or(MachinePose {
+        let mut target = config.return_position.unwrap_or(MachinePose {
             z: previous.z.max(safe_z),
             ..previous
         });
+        target.a = unwrap_angle(previous.a, target.a);
         moves.extend(transfer_moves(
             Some(previous),
             target,
@@ -1016,18 +1041,23 @@ fn pose_from_point(
 }
 
 fn wrap_angle_180(value: f64) -> f64 {
-    ((value + 180.0).rem_euclid(360.0)) - 180.0
+    let value = value.rem_euclid(360.0);
+    if value > 180.0 {
+        value - 360.0
+    } else {
+        value
+    }
 }
 
 fn unwrap_angle(previous: f64, target: f64) -> f64 {
-    let mut value = target;
-    while value - previous > 180.0 {
-        value -= 360.0;
+    let mut delta = (target - previous) % 360.0;
+    if delta > 180.0 {
+        delta -= 360.0;
     }
-    while value - previous < -180.0 {
-        value += 360.0;
+    if delta < -180.0 {
+        delta += 360.0;
     }
-    value
+    previous + delta
 }
 
 fn distance3(left: [f64; 3], right: [f64; 3]) -> f64 {

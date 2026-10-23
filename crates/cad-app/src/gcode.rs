@@ -103,6 +103,16 @@ impl Default for GCodeProfile {
 }
 
 impl GCodeProfile {
+    pub fn a_validation_error(&self) -> Option<&'static str> {
+        if !self.a_offset_degrees.is_finite() {
+            return Some("A 轴偏移必须是有限数值");
+        }
+        if (self.use_initial_position || self.return_to_initial) && !self.initial_a.is_finite() {
+            return Some("初始/返回 A 轴角度必须是有限数值");
+        }
+        None
+    }
+
     pub fn rotary_config(&self) -> crate::cam_trajectory::RotaryConfig {
         crate::cam_trajectory::RotaryConfig {
             a_offset_degrees: self.a_offset_degrees,
@@ -134,6 +144,9 @@ impl GCodeProfile {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(error) = self.a_validation_error() {
+            return Err(error.to_string());
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -177,26 +190,23 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
             .cloned()
             .unwrap_or_default();
         let moves = &trajectory.moves[start..end];
-        let first_cut = moves.iter().position(|movement| movement.kind.is_cutting());
-        let last_cut = moves
-            .iter()
-            .rposition(|movement| movement.kind.is_cutting());
-
-        for movement in moves.iter().take(first_cut.unwrap_or(moves.len())) {
+        let mut cutting = false;
+        for movement in moves {
+            if movement.kind.is_cutting() != cutting {
+                if movement.kind.is_cutting() {
+                    push_rule_headers(&mut lines, profile, &keys);
+                    push_block(&mut lines, &profile.unit_start);
+                } else {
+                    push_block(&mut lines, &profile.unit_end);
+                    push_rule_footers(&mut lines, profile, &keys);
+                }
+                cutting = movement.kind.is_cutting();
+            }
             push_movement(&mut lines, movement, profile, &mut previous_pose);
         }
-
-        if let (Some(first_cut), Some(last_cut)) = (first_cut, last_cut) {
-            push_rule_headers(&mut lines, profile, &keys);
-            push_block(&mut lines, &profile.unit_start);
-            for movement in &moves[first_cut..=last_cut] {
-                push_movement(&mut lines, movement, profile, &mut previous_pose);
-            }
+        if cutting {
             push_block(&mut lines, &profile.unit_end);
             push_rule_footers(&mut lines, profile, &keys);
-            for movement in moves.iter().skip(last_cut + 1) {
-                push_movement(&mut lines, movement, profile, &mut previous_pose);
-            }
         }
     }
 
@@ -214,6 +224,9 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
 
 pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> Vec<String> {
     let mut issues = Vec::new();
+    if let Some(error) = profile.a_validation_error() {
+        issues.push(error.to_string());
+    }
     if let Some(error) = profile.transfer.validation_error() {
         issues.push(error.to_string());
     }
@@ -270,6 +283,9 @@ pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfil
     }
     // Check across unit boundaries too; initial and return transfers are now semantic moves.
     for pair in trajectory.moves.windows(2) {
+        if pair[1].kind.is_cutting() && (pair[0].pose.a - pair[1].pose.a).abs() > 180.0 + 1.0e-6 {
+            issues.push("切削移动的 A 轴角度不连续（相邻差值超过 180°）".to_string());
+        }
         if pair[1].kind == MachineMoveKind::Rapid
             && (pair[0].pose.a - pair[1].pose.a).abs() > 1.0e-6
             && (pair[0].pose.z < trajectory.safe_z - 1.0e-6

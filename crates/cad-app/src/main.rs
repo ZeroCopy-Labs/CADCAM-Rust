@@ -2320,7 +2320,7 @@ fn drawing_ui(
                                     );
                                     ui.checkbox(
                                         &mut state.gcode_profile.keep_continuous_angle,
-                                        "A 轴保持连续角度",
+                                        "A 轴保持连续角度（跨单元最短转位）",
                                     );
                                 });
                                 let available = ui.available_height();
