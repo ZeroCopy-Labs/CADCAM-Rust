@@ -4,11 +4,77 @@
 //! to X/Y/Z/A using the unit's owner zone. It is a preview layer, not yet a
 //! validated machine post-processor.
 
+use serde::{Deserialize, Serialize};
+
 use crate::cam::CamModel;
 use crate::cam_analysis::{
     oriented_unit_path, oriented_unit_path_from, CamAnalysis, TubeSection, TubeZone,
 };
 use crate::display::DisplayData;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferConfig {
+    pub enabled: bool,
+    pub retract_height: f64,
+    pub approach_height: f64,
+    pub height: f64,
+    pub auto_height: bool,
+    pub rise_ratio: f64,
+    pub fall_ratio: f64,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retract_height: 2.0,
+            approach_height: 2.0,
+            height: 4.0,
+            auto_height: false,
+            rise_ratio: 0.5,
+            fall_ratio: 0.5,
+        }
+    }
+}
+
+impl TransferConfig {
+    pub fn total_height(self) -> f64 {
+        if self.auto_height {
+            self.retract_height.max(self.approach_height)
+        } else {
+            self.height
+        }
+    }
+
+    pub fn validation_error(self) -> Option<&'static str> {
+        if ![
+            self.retract_height,
+            self.approach_height,
+            self.height,
+            self.rise_ratio,
+            self.fall_ratio,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        {
+            return Some("联动转移参数必须为有限数值");
+        }
+        if self.retract_height < 0.0 || self.approach_height < 0.0 || self.height < 0.0 {
+            return Some("联动抬落刀高度不能为负数");
+        }
+        if self.total_height() < self.retract_height.max(self.approach_height) {
+            return Some("联动总高度不能小于最小抬刀/落刀高度");
+        }
+        if !(0.0..=1.0).contains(&self.rise_ratio)
+            || !(0.0..=1.0).contains(&self.fall_ratio)
+            || self.rise_ratio + self.fall_ratio > 1.0 + 1.0e-9
+        {
+            return Some("联动水平占比须在 0–100% 内且合计不超过 100%");
+        }
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RotaryConfig {
@@ -16,6 +82,9 @@ pub struct RotaryConfig {
     pub machining_z_offset: f64,
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
+    pub transfer: TransferConfig,
+    pub initial_position: Option<MachinePose>,
+    pub return_position: Option<MachinePose>,
     pub overcut_distance: f64,
     pub keep_continuous_angle: bool,
     pub feed: f64,
@@ -28,6 +97,9 @@ impl Default for RotaryConfig {
             machining_z_offset: 0.0,
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
+            transfer: TransferConfig::default(),
+            initial_position: None,
+            return_position: None,
             overcut_distance: 0.0,
             keep_continuous_angle: true,
             feed: 1000.0,
@@ -134,24 +206,26 @@ pub fn build_trajectory(
 
     let center_y = section.center_y;
     let center_z = section.center_z;
-    let max_radius = [
-        (bounds.min_y - center_y).abs(),
-        (bounds.max_y - center_y).abs(),
-        (bounds.min_z - center_z).abs(),
-        (bounds.max_z - center_z).abs(),
-    ]
-    .into_iter()
-    .fold(0.0f64, f64::max)
-    .max(1.0);
-    let safe_z = center_z + max_radius + config.rotation_safety_clearance;
+    let radius_y = (bounds.min_y - center_y)
+        .abs()
+        .max((bounds.max_y - center_y).abs())
+        .max(section.half_y());
+    let radius_z = (bounds.min_z - center_z)
+        .abs()
+        .max((bounds.max_z - center_z).abs())
+        .max(section.half_z());
+    let safe_z = center_z
+        + radius_y.hypot(radius_z)
+        + config.machining_z_offset.max(0.0)
+        + config.rotation_safety_clearance;
     let mut moves = Vec::new();
     let mut unit_ranges = Vec::new();
     let mut unit_rules = Vec::new();
     let mut cutting_move_count = 0usize;
     let mut unit_count = 0usize;
-    let mut previous_a = 0.0f64;
-    let mut previous_end: Option<MachinePose> = None;
-    let mut previous_zone: Option<TubeZone> = None;
+    let mut previous_a = config.initial_position.map(|pose| pose.a).unwrap_or(0.0);
+    let mut previous_end = config.initial_position;
+    let mut previous_surface: Option<TubeZone> = None;
 
     for group in &analysis.plan.groups {
         for unit in &group.units {
@@ -254,83 +328,27 @@ pub fn build_trajectory(
             let last = poses.last().copied().unwrap_or(first);
             let start_index = moves.len();
 
-            let same_zone = previous_end
-                .map(|previous| {
-                    previous_zone == Some(unit.zone) && (previous.a - first.a).abs() <= 1.0e-6
-                })
-                .unwrap_or(false);
-            if let Some(previous) = previous_end {
-                if same_zone && config.same_zone_clearance <= 1.0e-9 {
-                    // Same face, same A, zero clearance: rapid on the surface.
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: first,
-                    });
-                } else if same_zone {
-                    // Same face with a small clearance: local lift, lateral
-                    // move at the clearance height, then drop.
-                    let lift_z = (previous.z + config.same_zone_clearance).min(safe_z);
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: MachinePose {
-                            x: previous.x,
-                            y: previous.y,
-                            z: lift_z,
-                            a: previous.a,
-                        },
-                    });
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: MachinePose {
-                            x: first.x,
-                            y: first.y,
-                            z: lift_z,
-                            a: first.a,
-                        },
-                    });
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: first,
-                    });
-                } else {
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: MachinePose {
-                            x: previous.x,
-                            y: previous.y,
-                            z: safe_z,
-                            a: previous.a,
-                        },
-                    });
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: MachinePose {
-                            x: first.x,
-                            y: first.y,
-                            z: safe_z,
-                            a: first.a,
-                        },
-                    });
-                    moves.push(MachineMove {
-                        kind: MachineMoveKind::Rapid,
-                        pose: first,
-                    });
+            if unit_count == 0 {
+                if let Some(initial) = config.initial_position {
+                    push_rapid(&mut moves, initial);
                 }
-            } else {
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: MachinePose {
-                        x: first.x,
-                        y: first.y,
-                        z: safe_z,
-                        a: first.a,
-                    },
-                });
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: first,
-                });
             }
+            let surface = if !unit.machining_cut
+                && flat_surface(unit.zone, section, &poses, config.machining_z_offset)
+            {
+                Some(unit.zone)
+            } else {
+                None
+            };
+            let local = surface.is_some() && surface == previous_surface;
+            moves.extend(transfer_moves(
+                previous_end,
+                first,
+                safe_z,
+                local,
+                config.transfer,
+                config.same_zone_clearance,
+            ));
             if let Some(arc) = arc_cut_info(
                 display,
                 cam,
@@ -408,21 +426,24 @@ pub fn build_trajectory(
             });
             unit_rules.push(unit_rule_keys(display, cam, unit));
             previous_end = Some(last);
-            previous_zone = Some(unit.zone);
+            previous_surface = surface;
             unit_count += 1;
         }
     }
 
     if let Some(previous) = previous_end {
-        moves.push(MachineMove {
-            kind: MachineMoveKind::Rapid,
-            pose: MachinePose {
-                x: previous.x,
-                y: previous.y,
-                z: safe_z,
-                a: previous.a,
-            },
+        let target = config.return_position.unwrap_or(MachinePose {
+            z: previous.z.max(safe_z),
+            ..previous
         });
+        moves.extend(transfer_moves(
+            Some(previous),
+            target,
+            safe_z,
+            false,
+            config.transfer,
+            config.same_zone_clearance,
+        ));
         if let Some(last_range) = unit_ranges.last_mut() {
             last_range.end = moves.len();
         }
@@ -447,6 +468,132 @@ pub fn build_trajectory(
         a_min: if a_min.is_finite() { a_min } else { 0.0 },
         a_max: if a_max.is_finite() { a_max } else { 0.0 },
     }
+}
+
+fn finite_pose(pose: MachinePose) -> bool {
+    [pose.x, pose.y, pose.z, pose.a]
+        .iter()
+        .all(|v| v.is_finite())
+}
+
+fn push_rapid(moves: &mut Vec<MachineMove>, pose: MachinePose) {
+    if moves
+        .last()
+        .map(|last| {
+            distance3(
+                [last.pose.x, last.pose.y, last.pose.z],
+                [pose.x, pose.y, pose.z],
+            ) <= 1.0e-9
+                && (last.pose.a - pose.a).abs() <= 1.0e-9
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    moves.push(MachineMove {
+        kind: MachineMoveKind::Rapid,
+        pose,
+    });
+}
+
+/// Generate the same profile used by the settings diagram and real transfers.
+/// `local` requires a known common horizontal surface, with no release boundary.
+pub fn transfer_moves(
+    start: Option<MachinePose>,
+    end: MachinePose,
+    safe_z: f64,
+    local: bool,
+    config: TransferConfig,
+    legacy_clearance: f64,
+) -> Vec<MachineMove> {
+    let mut moves = Vec::new();
+    if config.validation_error().is_some()
+        || !safe_z.is_finite()
+        || !finite_pose(end)
+        || start.is_some_and(|p| !finite_pose(p))
+        || !legacy_clearance.is_finite()
+        || legacy_clearance < 0.0
+    {
+        return moves;
+    }
+    let Some(start) = start else {
+        push_rapid(
+            &mut moves,
+            MachinePose {
+                z: safe_z.max(end.z),
+                ..end
+            },
+        );
+        push_rapid(&mut moves, end);
+        return moves;
+    };
+    if local && (start.a - end.a).abs() <= 1.0e-6 {
+        let distance = (end.x - start.x).hypot(end.y - start.y);
+        if config.enabled && distance > 1.0e-9 {
+            let peak = start.z.max(end.z) + config.total_height();
+            let at = |t: f64, z: f64| MachinePose {
+                x: start.x + (end.x - start.x) * t,
+                y: start.y + (end.y - start.y) * t,
+                z,
+                a: start.a,
+            };
+            push_rapid(&mut moves, at(0.0, start.z + config.retract_height));
+            push_rapid(&mut moves, at(config.rise_ratio, peak));
+            push_rapid(&mut moves, at(1.0 - config.fall_ratio, peak));
+            push_rapid(&mut moves, at(1.0, end.z + config.approach_height));
+        } else {
+            let lift = if config.enabled {
+                (start.z + config.retract_height).max(end.z + config.approach_height)
+            } else {
+                start.z.max(end.z) + legacy_clearance
+            };
+            push_rapid(&mut moves, MachinePose { z: lift, ..start });
+            push_rapid(&mut moves, MachinePose { z: lift, ..end });
+        }
+    } else {
+        let clearance = safe_z.max(start.z).max(end.z);
+        push_rapid(
+            &mut moves,
+            MachinePose {
+                z: clearance,
+                ..start
+            },
+        );
+        push_rapid(
+            &mut moves,
+            MachinePose {
+                z: clearance,
+                ..end
+            },
+        );
+    }
+    push_rapid(&mut moves, end);
+    if moves.len() > 1 && moves[0].pose == start {
+        moves.remove(0);
+    }
+    moves
+}
+
+fn flat_surface(
+    zone: TubeZone,
+    section: &TubeSection,
+    poses: &[MachinePose],
+    z_offset: f64,
+) -> bool {
+    let (angle, height, width) = match zone {
+        TubeZone::TopFace => (0.0, section.half_z(), section.half_y()),
+        TubeZone::RightFace => (90.0, section.half_y(), section.half_z()),
+        TubeZone::BottomFace => (180.0, section.half_z(), section.half_y()),
+        TubeZone::LeftFace => (-90.0, section.half_y(), section.half_z()),
+        _ => return false,
+    };
+    poses.iter().all(|p| {
+        let delta = (p.a - angle).to_radians();
+        delta.sin().abs() <= 1.0e-9
+            && delta.cos() > 0.0
+            && (p.z - (section.center_z + height + z_offset)).abs() <= 1.0e-6
+            && (p.y - section.center_y).abs() <= width - section.corner_radius() + 1.0e-6
+    })
 }
 
 fn unit_rule_keys(
@@ -489,6 +636,12 @@ fn valid_config(config: RotaryConfig) -> bool {
         && config.same_zone_clearance >= 0.0
         && config.overcut_distance >= 0.0
         && config.feed > 0.0
+        && config.transfer.validation_error().is_none()
+        && config
+            .initial_position
+            .into_iter()
+            .chain(config.return_position)
+            .all(finite_pose)
 }
 
 fn valid_section(section: &TubeSection) -> bool {
@@ -517,7 +670,7 @@ fn build_without_tube_section(
     let mut unit_rules = Vec::new();
     let mut cutting_move_count = 0usize;
     let mut unit_count = 0usize;
-    let mut previous_end: Option<MachinePose> = None;
+    let mut previous_end = config.initial_position;
 
     for group in &analysis.plan.groups {
         for unit in &group.units {
@@ -545,44 +698,19 @@ fn build_without_tube_section(
             let first = to_pose(path[0]);
             let last = to_pose(*path.last().unwrap());
             let start_index = moves.len();
-            if let Some(previous) = previous_end {
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: MachinePose {
-                        x: previous.x,
-                        y: previous.y,
-                        z: safe_z,
-                        a: previous.a,
-                    },
-                });
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: MachinePose {
-                        x: first.x,
-                        y: first.y,
-                        z: safe_z,
-                        a: first.a,
-                    },
-                });
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: first,
-                });
-            } else {
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: MachinePose {
-                        x: first.x,
-                        y: first.y,
-                        z: safe_z,
-                        a: first.a,
-                    },
-                });
-                moves.push(MachineMove {
-                    kind: MachineMoveKind::Rapid,
-                    pose: first,
-                });
+            if unit_count == 0 {
+                if let Some(initial) = config.initial_position {
+                    push_rapid(&mut moves, initial);
+                }
             }
+            moves.extend(transfer_moves(
+                previous_end,
+                first,
+                safe_z,
+                false,
+                config.transfer,
+                config.same_zone_clearance,
+            ));
             for point in path.iter().skip(1) {
                 moves.push(MachineMove {
                     kind: MachineMoveKind::Cutting,
@@ -602,15 +730,18 @@ fn build_without_tube_section(
     }
 
     if let Some(previous) = previous_end {
-        moves.push(MachineMove {
-            kind: MachineMoveKind::Rapid,
-            pose: MachinePose {
-                x: previous.x,
-                y: previous.y,
-                z: safe_z,
-                a: previous.a,
-            },
+        let target = config.return_position.unwrap_or(MachinePose {
+            z: previous.z.max(safe_z),
+            ..previous
         });
+        moves.extend(transfer_moves(
+            Some(previous),
+            target,
+            safe_z,
+            false,
+            config.transfer,
+            config.same_zone_clearance,
+        ));
         if let Some(last_range) = unit_ranges.last_mut() {
             last_range.end = moves.len();
         }

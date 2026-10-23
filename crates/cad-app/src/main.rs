@@ -53,6 +53,8 @@ struct ViewerState {
     trajectory: Option<cam_trajectory::MachineTrajectory>,
     gcode_profile: gcode::GCodeProfile,
     gcode_preview: String,
+    transfer_example_distance: f64,
+    transfer_example_delta_z: f64,
     gcode_settings_open: bool,
     gcode_settings_tab: usize,
     gcode_selected_type: String,
@@ -157,6 +159,7 @@ fn main() {
     let gcode_path = gcode_config_path();
     let mut state = ViewerState {
         recent: load_recent(),
+        transfer_example_distance: 100.0,
         gcode_profile: gcode::GCodeProfile::load_or_create(&gcode_path),
         ..Default::default()
     };
@@ -279,6 +282,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.cam = cam_model;
             state.analysis = analysis;
             state.trajectory = trajectory;
+            state.gcode_preview.clear();
             state.load_version += 1;
             state.fit_dirty = true;
 
@@ -957,7 +961,6 @@ fn apply_reorder_click(
         }
     }
     reorder.clicked.push(unit_id);
-    rebuild_state_trajectory(state);
     refresh_gcode_preview(state);
     true
 }
@@ -2134,20 +2137,7 @@ fn drawing_ui(
         }
     }
     if cam_input_changed {
-        let ViewerState {
-            display,
-            cam,
-            analysis,
-            trajectory,
-            gcode_profile,
-            ..
-        } = &mut *state;
-        *trajectory = Some(cam_trajectory::build_trajectory(
-            display,
-            cam,
-            analysis,
-            gcode_profile.rotary_config(),
-        ));
+        rebuild_state_trajectory(&mut state);
     }
 
     if let (Some(start), Some(current)) = (selection.drag_start, selection.drag_current) {
@@ -2437,10 +2427,9 @@ fn drawing_ui(
                                         );
                                         ui.end_row();
                                     });
-                                ui.label("同区离面为 0 时，同区位、同 A 角直接在表面快速转移。");
-                                ui.label(
-                                "大于 0 时执行局部抬刀、平移、落刀；跨区始终先抬到旋转安全高度。",
-                            );
+                                ui.label("关闭联动时，同面且 A 不变使用同区离面参数；跨面或旋转先达到净空。");
+                                let ViewerState { gcode_profile, transfer_example_distance, transfer_example_delta_z, .. } = &mut *state;
+                                transfer_settings_ui(ui, &mut gcode_profile.transfer, transfer_example_distance, transfer_example_delta_z);
                                 ui.separator();
                                 ui.checkbox(
                                     &mut state.gcode_profile.use_initial_position,
@@ -2570,16 +2559,17 @@ fn drawing_ui(
 
         if reload_profile {
             state.gcode_profile = gcode::GCodeProfile::load(&config_path).unwrap_or_default();
-            sync_machine_start(&mut state);
-            rebuild_state_trajectory(&mut state);
             refresh_gcode_preview(&mut state);
             push_message(&mut state, "已重新加载 G 代码配置");
         }
         if save_profile {
-            match state.gcode_profile.save(&config_path) {
+            let saved = if let Some(error) = state.gcode_profile.transfer.validation_error() {
+                Err(error.to_string())
+            } else {
+                state.gcode_profile.save(&config_path)
+            };
+            match saved {
                 Ok(()) => {
-                    sync_machine_start(&mut state);
-                    rebuild_state_trajectory(&mut state);
                     refresh_gcode_preview(&mut state);
                     push_message(&mut state, "G 代码配置已保存，轨迹已重新计算");
                 }
@@ -2587,6 +2577,7 @@ fn drawing_ui(
             }
         }
         if validate_gcode {
+            refresh_gcode_preview(&mut state);
             if let Some(trajectory) = state.trajectory.as_ref() {
                 let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
                 if issues.is_empty() {
@@ -2828,6 +2819,7 @@ fn gcode_config_path() -> PathBuf {
 }
 
 fn refresh_gcode_preview(state: &mut ViewerState) {
+    rebuild_state_trajectory(state);
     state.gcode_preview = state
         .trajectory
         .as_ref()
@@ -2962,6 +2954,142 @@ fn gcode_rule_tab(
     });
 }
 
+fn transfer_settings_ui(
+    ui: &mut egui::Ui,
+    config: &mut cam_trajectory::TransferConfig,
+    distance: &mut f64,
+    delta_z: &mut f64,
+) {
+    ui.separator();
+    ui.checkbox(&mut config.enabled, "启用同面联动抬落刀");
+    egui::Grid::new("transfer_settings")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("最小安全抬刀高度");
+            ui.add(
+                egui::DragValue::new(&mut config.retract_height)
+                    .speed(0.1)
+                    .suffix(" mm"),
+            );
+            ui.end_row();
+            ui.label("最小安全落刀高度");
+            ui.add(
+                egui::DragValue::new(&mut config.approach_height)
+                    .speed(0.1)
+                    .suffix(" mm"),
+            );
+            ui.end_row();
+            ui.label("联动总高度");
+            ui.add_enabled(
+                !config.auto_height,
+                egui::DragValue::new(&mut config.height)
+                    .speed(0.1)
+                    .suffix(" mm"),
+            );
+            ui.end_row();
+            let mut rise = config.rise_ratio * 100.0;
+            ui.label("联动抬刀水平占比");
+            if ui
+                .add(egui::DragValue::new(&mut rise).speed(1.0).suffix(" %"))
+                .changed()
+            {
+                config.rise_ratio = rise / 100.0;
+            }
+            ui.end_row();
+            let mut fall = config.fall_ratio * 100.0;
+            ui.label("联动落刀水平占比");
+            if ui
+                .add(egui::DragValue::new(&mut fall).speed(1.0).suffix(" %"))
+                .changed()
+            {
+                config.fall_ratio = fall / 100.0;
+            }
+            ui.end_row();
+        });
+    ui.checkbox(&mut config.auto_height, "总高度取两个最小高度的较大值");
+    if let Some(error) = config.validation_error() {
+        ui.colored_label(egui::Color32::LIGHT_RED, error);
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label("示例 XY 距离");
+        ui.add(egui::DragValue::new(distance).range(0.0..=1.0e6).speed(1.0));
+        ui.label("终点 Z 差");
+        ui.add(egui::DragValue::new(delta_z).speed(0.1));
+    });
+    ui.label("示例参数不保存。横轴 XY 行程，纵轴 Z（非等比）；示意与实际转移共用计算。");
+    let start = cam_trajectory::MachinePose {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        a: 0.0,
+    };
+    let end = cam_trajectory::MachinePose {
+        x: *distance,
+        y: 0.0,
+        z: *delta_z,
+        a: 0.0,
+    };
+    let moves = cam_trajectory::transfer_moves(
+        Some(start),
+        end,
+        config.total_height().max(*delta_z) + 1.0,
+        true,
+        *config,
+        0.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 160.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(24, 30, 38));
+    let plot = rect.shrink(22.0);
+    let points: Vec<_> = std::iter::once(start)
+        .chain(moves.iter().map(|m| m.pose))
+        .collect();
+    let min_z = points.iter().map(|p| p.z).fold(0.0f64, f64::min);
+    let max_z = points.iter().map(|p| p.z).fold(1.0f64, f64::max);
+    let project = |p: cam_trajectory::MachinePose| {
+        egui::pos2(
+            plot.left() + (p.x / distance.max(1.0)) as f32 * plot.width(),
+            plot.bottom() - ((p.z - min_z) / (max_z - min_z).max(1.0)) as f32 * plot.height(),
+        )
+    };
+    for (i, pair) in points.windows(2).enumerate() {
+        let color = if i == 0 {
+            egui::Color32::from_rgb(60, 130, 255)
+        } else if i + 2 == points.len() {
+            egui::Color32::GREEN
+        } else if pair[1].z > pair[0].z + 1.0e-9 {
+            egui::Color32::from_rgb(255, 160, 40)
+        } else if pair[1].z < pair[0].z - 1.0e-9 {
+            egui::Color32::from_rgb(40, 190, 220)
+        } else {
+            egui::Color32::LIGHT_GRAY
+        };
+        painter.line_segment(
+            [project(pair[0]), project(pair[1])],
+            egui::Stroke::new(2.0, color),
+        );
+    }
+    painter.text(
+        plot.left_bottom() + egui::vec2(0.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        "加工结束",
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        plot.right_bottom() + egui::vec2(0.0, 8.0),
+        egui::Align2::RIGHT_TOP,
+        "下一入口",
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
+    ui.label("这是空移剖面，不代表控制器已完成速度平滑或碰撞验证。");
+}
+
 fn sync_machine_start(state: &mut ViewerState) {
     let start = [
         state.gcode_profile.initial_x,
@@ -2978,6 +3106,8 @@ fn sync_machine_start(state: &mut ViewerState) {
 }
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
+    sync_machine_start(state);
+    state.gcode_preview.clear();
     let ViewerState {
         display,
         cam,
@@ -2995,6 +3125,7 @@ fn rebuild_state_trajectory(state: &mut ViewerState) {
 }
 
 fn export_gcode_file(state: &mut ViewerState) {
+    refresh_gcode_preview(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;
@@ -3034,6 +3165,7 @@ fn export_gcode_file(state: &mut ViewerState) {
 }
 
 fn quick_export_gcode_file(state: &mut ViewerState) {
+    refresh_gcode_preview(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;

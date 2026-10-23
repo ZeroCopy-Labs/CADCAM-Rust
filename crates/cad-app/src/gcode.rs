@@ -40,6 +40,7 @@ pub struct GCodeProfile {
     pub machining_z_offset: f64,
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
+    pub transfer: crate::cam_trajectory::TransferConfig,
     pub arc_output: bool,
     pub keep_continuous_angle: bool,
     pub use_initial_position: bool,
@@ -85,6 +86,7 @@ impl Default for GCodeProfile {
             machining_z_offset: 0.0,
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
+            transfer: crate::cam_trajectory::TransferConfig::default(),
             arc_output: true,
             keep_continuous_angle: true,
             use_initial_position: false,
@@ -107,6 +109,19 @@ impl GCodeProfile {
             machining_z_offset: self.machining_z_offset,
             rotation_safety_clearance: self.rotation_safety_clearance,
             same_zone_clearance: self.same_zone_clearance,
+            transfer: self.transfer,
+            initial_position: self.use_initial_position.then_some(MachinePose {
+                x: self.initial_x,
+                y: self.initial_y,
+                z: self.initial_z,
+                a: self.initial_a,
+            }),
+            return_position: self.return_to_initial.then_some(MachinePose {
+                x: self.initial_x,
+                y: self.initial_y,
+                z: self.initial_z,
+                a: self.initial_a,
+            }),
             overcut_distance: self.overcut,
             keep_continuous_angle: self.keep_continuous_angle,
             feed: self.feed,
@@ -150,21 +165,6 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
     let mut lines: Vec<String> = Vec::new();
     push_block(&mut lines, &profile.header);
     let mut previous_pose: Option<MachinePose> = None;
-    if profile.use_initial_position {
-        let pose = MachinePose {
-            x: profile.initial_x,
-            y: profile.initial_y,
-            z: profile.initial_z,
-            a: profile.initial_a,
-        };
-        lines.push(format!(
-            "{} {}",
-            profile.rapid,
-            format_axis(pose, profile.decimals)
-        ));
-        previous_pose = Some(pose);
-    }
-
     for (index, range) in trajectory.unit_ranges.iter().enumerate() {
         let start = range.start.min(trajectory.moves.len());
         let end = range.end.min(trajectory.moves.len());
@@ -200,20 +200,6 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
         }
     }
 
-    if profile.return_to_initial {
-        let pose = MachinePose {
-            x: profile.initial_x,
-            y: profile.initial_y,
-            z: profile.initial_z,
-            a: profile.initial_a,
-        };
-        lines.push(format!(
-            "{} {}",
-            profile.rapid,
-            format_axis(pose, profile.decimals)
-        ));
-    }
-
     push_block(&mut lines, &profile.footer);
 
     let ending = if profile.line_ending.eq_ignore_ascii_case("lf") {
@@ -228,6 +214,9 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
 
 pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> Vec<String> {
     let mut issues = Vec::new();
+    if let Some(error) = profile.transfer.validation_error() {
+        issues.push(error.to_string());
+    }
     if !profile.feed.is_finite() || profile.feed <= 0.0 {
         issues.push("进给速度必须是有限正数".to_string());
     }
@@ -278,15 +267,15 @@ pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfil
         }) {
             issues.push(format!("加工单元 {} 包含非法坐标", range.order));
         }
-        for pair in moves.windows(2) {
-            if pair[0].kind == MachineMoveKind::Rapid
-                && pair[1].kind == MachineMoveKind::Rapid
-                && (pair[0].pose.a - pair[1].pose.a).abs() > 1.0e-6
-                && (pair[0].pose.z < trajectory.safe_z - 1.0e-6
-                    || pair[1].pose.z < trajectory.safe_z - 1.0e-6)
-            {
-                issues.push(format!("加工单元 {} 在非安全高度改变 A 轴", range.order));
-            }
+    }
+    // Check across unit boundaries too; initial and return transfers are now semantic moves.
+    for pair in trajectory.moves.windows(2) {
+        if pair[1].kind == MachineMoveKind::Rapid
+            && (pair[0].pose.a - pair[1].pose.a).abs() > 1.0e-6
+            && (pair[0].pose.z < trajectory.safe_z - 1.0e-6
+                || pair[1].pose.z < trajectory.safe_z - 1.0e-6)
+        {
+            issues.push("空移在非安全高度改变 A 轴".to_string());
         }
     }
     issues
