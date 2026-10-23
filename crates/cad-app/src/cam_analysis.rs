@@ -147,6 +147,12 @@ impl TubeSection {
         self.radius.clamp(0.0, self.half_y().min(self.half_z()))
     }
 
+    pub fn zone_for_point(&self, point: [f64; 3]) -> Option<TubeZone> {
+        self.boundary()
+            .nearest(point[1], point[2])
+            .map(|(_, _, zone)| zone)
+    }
+
     fn boundary(&self) -> TubeBoundary {
         TubeBoundary::new(self)
     }
@@ -990,15 +996,23 @@ impl CamAnalysis {
             }
 
             let mut previous_end: Option<[f64; 3]> = None;
+            let mut previous_zone: Option<TubeZone> = None;
             for planned_unit in &mut planned {
-                if let Some((direction, start, end)) =
-                    choose_unit_direction(display, cam, planned_unit.unit_id, previous_end)
-                {
+                if let Some((direction, start, end)) = choose_unit_entry(
+                    display,
+                    cam,
+                    self.tube_section.as_ref(),
+                    planned_unit.unit_id,
+                    planned_unit.zone,
+                    previous_end,
+                    previous_zone == Some(planned_unit.zone),
+                ) {
                     planned_unit.direction = direction;
                     planned_unit.start_point = start;
                     planned_unit.end_point = end;
                     previous_end = Some(end);
                 }
+                previous_zone = Some(planned_unit.zone);
             }
 
             if !planned.is_empty() {
@@ -1056,16 +1070,25 @@ impl CamAnalysis {
         }
         group.units.swap(index, target);
 
+        let section = self.tube_section.clone();
         let mut previous_end: Option<[f64; 3]> = None;
+        let mut previous_zone: Option<TubeZone> = None;
         for unit in &mut group.units {
-            if let Some((direction, start, end)) =
-                choose_unit_direction(display, cam, unit.unit_id, previous_end)
-            {
+            if let Some((direction, start, end)) = choose_unit_entry(
+                display,
+                cam,
+                section.as_ref(),
+                unit.unit_id,
+                unit.zone,
+                previous_end,
+                previous_zone == Some(unit.zone),
+            ) {
                 unit.direction = direction;
                 unit.start_point = start;
                 unit.end_point = end;
                 previous_end = Some(end);
             }
+            previous_zone = Some(unit.zone);
         }
 
         let mut order = 1u32;
@@ -1107,16 +1130,25 @@ impl CamAnalysis {
         let insert = to.min(group.units.len().saturating_sub(section_count));
         group.units.insert(insert, unit);
 
+        let section = self.tube_section.clone();
         let mut previous_end: Option<[f64; 3]> = None;
+        let mut previous_zone: Option<TubeZone> = None;
         for unit in &mut group.units {
-            if let Some((direction, start, end)) =
-                choose_unit_direction(display, cam, unit.unit_id, previous_end)
-            {
+            if let Some((direction, start, end)) = choose_unit_entry(
+                display,
+                cam,
+                section.as_ref(),
+                unit.unit_id,
+                unit.zone,
+                previous_end,
+                previous_zone == Some(unit.zone),
+            ) {
                 unit.direction = direction;
                 unit.start_point = start;
                 unit.end_point = end;
                 previous_end = Some(end);
             }
+            previous_zone = Some(unit.zone);
         }
 
         let mut order = 1u32;
@@ -1439,11 +1471,166 @@ pub fn oriented_unit_path(
     unit_id: UnitId,
     direction: UnitDirection,
 ) -> Option<Vec<[f64; 3]>> {
+    oriented_unit_path_from(display, cam, unit_id, direction, None)
+}
+
+pub fn oriented_unit_path_from(
+    display: &DisplayData,
+    cam: &CamModel,
+    unit_id: UnitId,
+    direction: UnitDirection,
+    start_point: Option<[f64; 3]>,
+) -> Option<Vec<[f64; 3]>> {
     let mut path = ordered_unit_points(display, cam, unit_id)?;
+    let closed = cam
+        .unit(unit_id)
+        .map(|machining_unit| machining_unit.closed)
+        .unwrap_or(false);
     if direction == UnitDirection::Reverse {
         path.reverse();
     }
+    if closed {
+        if let Some(start_point) = start_point {
+            let span = path.len().saturating_sub(1);
+            if span >= 2 {
+                let index = (0..span)
+                    .min_by(|left, right| {
+                        distance3(path[*left], start_point)
+                            .partial_cmp(&distance3(path[*right], start_point))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(0);
+                if index > 0 {
+                    let mut rotated = Vec::with_capacity(path.len());
+                    rotated.extend_from_slice(&path[index..]);
+                    rotated.extend_from_slice(&path[1..=index]);
+                    path = rotated;
+                }
+            }
+        }
+    }
     Some(path)
+}
+
+fn choose_unit_entry(
+    display: &DisplayData,
+    cam: &CamModel,
+    section: Option<&TubeSection>,
+    unit_id: UnitId,
+    zone: TubeZone,
+    previous_end: Option<[f64; 3]>,
+    same_zone_as_previous: bool,
+) -> Option<(UnitDirection, [f64; 3], [f64; 3])> {
+    let path = ordered_unit_points(display, cam, unit_id)?;
+    let closed = cam
+        .unit(unit_id)
+        .map(|machining_unit| machining_unit.closed)
+        .unwrap_or(false);
+    if closed && same_zone_as_previous {
+        if let (Some(previous_end), Some(section)) = (previous_end, section) {
+            let span = path.len().saturating_sub(1);
+            let mut best: Option<(f64, f64, UnitDirection, [f64; 3])> = None;
+            for index in 0..span {
+                let start = path[index];
+                if section.zone_for_point(start) != Some(zone) {
+                    continue;
+                }
+                for direction in [UnitDirection::Forward, UnitDirection::Reverse] {
+                    let tangent_point = match direction {
+                        UnitDirection::Forward => path[(index + 1) % span],
+                        UnitDirection::Reverse => path[(index + span - 1) % span],
+                    };
+                    let approach = [
+                        start[0] - previous_end[0],
+                        start[1] - previous_end[1],
+                        start[2] - previous_end[2],
+                    ];
+                    let tangent = [
+                        tangent_point[0] - start[0],
+                        tangent_point[1] - start[1],
+                        tangent_point[2] - start[2],
+                    ];
+                    let approach_length = vector_length(approach);
+                    let tangent_length = vector_length(tangent);
+                    if approach_length <= 1.0e-9 || tangent_length <= 1.0e-9 {
+                        continue;
+                    }
+                    let cosine = (approach[0] * tangent[0]
+                        + approach[1] * tangent[1]
+                        + approach[2] * tangent[2])
+                        / (approach_length * tangent_length);
+                    let angle = cosine.clamp(-1.0, 1.0).acos();
+                    let distance = approach_length;
+                    let candidate = (angle, distance, direction, start);
+                    if best
+                        .map(|current| {
+                            candidate.0 < current.0
+                                || (candidate.0 == current.0 && candidate.1 < current.1)
+                        })
+                        .unwrap_or(true)
+                    {
+                        best = Some(candidate);
+                    }
+                }
+            }
+            if let Some((_, _, direction, start)) = best {
+                return Some((direction, start, start));
+            }
+        }
+    } else if !closed && same_zone_as_previous {
+        if let (Some(previous_end), Some(section)) = (previous_end, section) {
+            let mut best: Option<(f64, f64, UnitDirection, [f64; 3], [f64; 3])> = None;
+            for direction in [UnitDirection::Forward, UnitDirection::Reverse] {
+                let (start, end, tangent_point) = match direction {
+                    UnitDirection::Forward => (path[0], *path.last()?, path[1]),
+                    UnitDirection::Reverse => {
+                        (*path.last()?, path[0], path[path.len().saturating_sub(2)])
+                    }
+                };
+                if section.zone_for_point(start) != Some(zone) {
+                    continue;
+                }
+                let approach = [
+                    start[0] - previous_end[0],
+                    start[1] - previous_end[1],
+                    start[2] - previous_end[2],
+                ];
+                let tangent = [
+                    tangent_point[0] - start[0],
+                    tangent_point[1] - start[1],
+                    tangent_point[2] - start[2],
+                ];
+                let approach_length = vector_length(approach);
+                let tangent_length = vector_length(tangent);
+                if approach_length <= 1.0e-9 || tangent_length <= 1.0e-9 {
+                    continue;
+                }
+                let cosine = (approach[0] * tangent[0]
+                    + approach[1] * tangent[1]
+                    + approach[2] * tangent[2])
+                    / (approach_length * tangent_length);
+                let angle = cosine.clamp(-1.0, 1.0).acos();
+                let candidate = (angle, approach_length, direction, start, end);
+                if best
+                    .map(|current| {
+                        candidate.0 < current.0
+                            || (candidate.0 == current.0 && candidate.1 < current.1)
+                    })
+                    .unwrap_or(true)
+                {
+                    best = Some(candidate);
+                }
+            }
+            if let Some((_, _, direction, start, end)) = best {
+                return Some((direction, start, end));
+            }
+        }
+    }
+    choose_unit_direction(display, cam, unit_id, previous_end)
+}
+
+fn vector_length(vector: [f64; 3]) -> f64 {
+    (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt()
 }
 
 fn ordered_zones(direction: RotationDirection) -> Vec<TubeZone> {

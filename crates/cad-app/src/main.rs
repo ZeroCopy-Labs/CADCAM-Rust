@@ -1558,11 +1558,12 @@ fn draw_machining_order_labels(
 
             // Draw the actual entry point and the local cutting tangent. The
             // tangent comes from the ordered path, not from center-to-center.
-            if let Some(path) = cam_analysis::oriented_unit_path(
+            if let Some(path) = cam_analysis::oriented_unit_path_from(
                 &state.display,
                 &state.cam,
                 unit.unit_id,
                 unit.direction,
+                Some(unit.start_point),
             ) {
                 if let Some(start_point) = path.first() {
                     if let Ok(start_screen) = camera.world_to_viewport(

@@ -5,7 +5,9 @@
 //! validated machine post-processor.
 
 use crate::cam::CamModel;
-use crate::cam_analysis::{oriented_unit_path, CamAnalysis, TubeSection, TubeZone};
+use crate::cam_analysis::{
+    oriented_unit_path, oriented_unit_path_from, CamAnalysis, TubeSection, TubeZone,
+};
 use crate::display::DisplayData;
 
 #[derive(Clone, Copy, Debug)]
@@ -153,8 +155,13 @@ pub fn build_trajectory(
 
     for group in &analysis.plan.groups {
         for unit in &group.units {
-            let Some(mut path) = oriented_unit_path(display, cam, unit.unit_id, unit.direction)
-            else {
+            let Some(mut path) = oriented_unit_path_from(
+                display,
+                cam,
+                unit.unit_id,
+                unit.direction,
+                Some(unit.start_point),
+            ) else {
                 continue;
             };
             if path.len() < 2 {
