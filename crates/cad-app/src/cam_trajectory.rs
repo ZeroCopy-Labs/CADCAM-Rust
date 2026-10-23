@@ -16,6 +16,7 @@ pub struct RotaryConfig {
     pub same_zone_clearance: f64,
     pub overcut_distance: f64,
     pub keep_continuous_angle: bool,
+    pub feed: f64,
 }
 
 impl Default for RotaryConfig {
@@ -27,6 +28,7 @@ impl Default for RotaryConfig {
             same_zone_clearance: 0.0,
             overcut_distance: 0.0,
             keep_continuous_angle: true,
+            feed: 1000.0,
         }
     }
 }
@@ -102,12 +104,31 @@ pub fn build_trajectory(
     analysis: &CamAnalysis,
     config: RotaryConfig,
 ) -> MachineTrajectory {
+    if !valid_config(config) {
+        return MachineTrajectory::default();
+    }
     let Some(section) = &analysis.tube_section else {
         return build_without_tube_section(display, cam, analysis, config);
     };
+    if !valid_section(section) {
+        return MachineTrajectory::default();
+    }
     let Some(bounds) = display.bounds else {
         return MachineTrajectory::default();
     };
+    if ![
+        bounds.min_x,
+        bounds.min_y,
+        bounds.min_z,
+        bounds.max_x,
+        bounds.max_y,
+        bounds.max_z,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return MachineTrajectory::default();
+    }
 
     let center_y = section.center_y;
     let center_z = section.center_z;
@@ -331,6 +352,20 @@ pub fn build_trajectory(
                         pose: first,
                     });
                     cutting_move_count += 2;
+                    // A closed circle may have an overcut point appended after
+                    // the geometric start. Emit it as a real move so the next
+                    // transfer starts from the position actually reached.
+                    let end_delta = ((first.x - last.x).powi(2)
+                        + (first.y - last.y).powi(2)
+                        + (first.z - last.z).powi(2))
+                    .sqrt();
+                    if end_delta > 1.0e-6 {
+                        moves.push(MachineMove {
+                            kind: MachineMoveKind::Cutting,
+                            pose: last,
+                        });
+                        cutting_move_count += 1;
+                    }
                 } else if !arc.full_circle {
                     moves.push(MachineMove {
                         kind: MachineMoveKind::Arc {
@@ -430,6 +465,34 @@ fn unit_rule_keys(
         }
     }
     keys
+}
+
+fn valid_config(config: RotaryConfig) -> bool {
+    [
+        config.a_offset_degrees,
+        config.machining_z_offset,
+        config.rotation_safety_clearance,
+        config.same_zone_clearance,
+        config.overcut_distance,
+        config.feed,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && config.rotation_safety_clearance >= 0.0
+        && config.same_zone_clearance >= 0.0
+        && config.overcut_distance >= 0.0
+        && config.feed > 0.0
+}
+
+fn valid_section(section: &TubeSection) -> bool {
+    section.center_y.is_finite()
+        && section.center_z.is_finite()
+        && section.size_y.is_finite()
+        && section.size_z.is_finite()
+        && section.radius.is_finite()
+        && section.size_y > 0.0
+        && section.size_z > 0.0
+        && section.radius >= 0.0
 }
 
 fn build_without_tube_section(

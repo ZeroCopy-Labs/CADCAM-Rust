@@ -2426,6 +2426,15 @@ fn drawing_ui(
                                                 .speed(0.1),
                                         );
                                         ui.end_row();
+                                        ui.label("圆弧折线公差");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut state.gcode_profile.arc_tolerance,
+                                            )
+                                            .speed(0.01)
+                                            .range(0.001..=10.0),
+                                        );
+                                        ui.end_row();
                                         ui.label("A 轴偏移");
                                         ui.add(
                                             egui::DragValue::new(
