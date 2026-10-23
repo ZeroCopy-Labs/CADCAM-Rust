@@ -12,7 +12,7 @@ use crate::display::DisplayData;
 pub const SURFACE_TOLERANCE: f64 = 0.25;
 pub const JOIN_TOLERANCE: f64 = 1.0e-3;
 const BOUNDARY_BINS: usize = 512;
-const ENTRY_ANGLE_TOLERANCE: f64 = 1.0e-9;
+const ENTRY_ANGLE_TOLERANCE: f64 = 0.5_f64.to_radians();
 
 /// The 16 circumferential zones of a square/rounded tube.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -922,6 +922,11 @@ impl CamAnalysis {
             .iter()
             .rev()
             .find_map(|group| group.section_unit);
+        let mut plan_started = false;
+        let mut carried_end: Option<[f64; 3]> = None;
+        let mut carried_direction: Option<[f64; 3]> = None;
+        let mut carried_a: Option<f64> = None;
+        let mut carried_zone: Option<TubeZone> = None;
 
         for group in &self.groups {
             let mut planned = Vec::new();
@@ -1010,13 +1015,17 @@ impl CamAnalysis {
                 next_order += 1;
             }
 
-            let mut previous_end: Option<[f64; 3]> = None;
-            let mut previous_direction: Option<[f64; 3]> = None;
-            let mut previous_a: Option<f64> = None;
-            let mut previous_zone: Option<TubeZone> = None;
+            let (mut previous_end, mut previous_direction, mut previous_a, mut previous_zone) =
+                if self.lazy_rotation {
+                    (None, None, None, None)
+                } else {
+                    (carried_end, carried_direction, carried_a, carried_zone)
+                };
             let mut visited_zones = BTreeSet::new();
             for planned_unit in &mut planned {
                 let first_in_zone = visited_zones.insert(planned_unit.zone);
+                let plan_first_unit = !plan_started;
+                plan_started = true;
                 if planned_unit.machining_cut {
                     if let Some((direction, start, end)) =
                         self.tube_section.as_ref().and_then(|section| {
@@ -1067,8 +1076,11 @@ impl CamAnalysis {
                     previous_end,
                     previous_direction,
                     previous_a,
-                    previous_zone == Some(planned_unit.zone),
-                    first_in_zone,
+                    if self.lazy_rotation {
+                        first_in_zone
+                    } else {
+                        plan_first_unit
+                    },
                 ) {
                     planned_unit.direction = direction;
                     planned_unit.start_point = start;
@@ -1086,6 +1098,12 @@ impl CamAnalysis {
                     });
                 }
                 previous_zone = Some(planned_unit.zone);
+            }
+            if !self.lazy_rotation {
+                carried_end = previous_end;
+                carried_direction = previous_direction;
+                carried_a = previous_a;
+                carried_zone = previous_zone;
             }
 
             if !planned.is_empty() {
@@ -1131,6 +1149,13 @@ impl CamAnalysis {
             .iter()
             .rev()
             .find_map(|group| group.section_unit);
+        let lazy_rotation = self.lazy_rotation;
+        let first_plan_unit_id = self
+            .plan
+            .groups
+            .first()
+            .and_then(|group| group.units.first())
+            .map(|unit| unit.unit_id);
         let Some(group) = self
             .plan
             .groups
@@ -1158,6 +1183,11 @@ impl CamAnalysis {
         let mut visited_zones = BTreeSet::new();
         for unit in &mut group.units {
             let first_in_zone = visited_zones.insert(unit.zone);
+            let virtual_entry = if lazy_rotation {
+                first_in_zone
+            } else {
+                first_plan_unit_id == Some(unit.unit_id)
+            };
             if unit.machining_cut {
                 if let Some((direction, start, end)) = section.as_ref().and_then(|section| {
                     choose_section_entry(
@@ -1201,8 +1231,7 @@ impl CamAnalysis {
                 previous_end,
                 previous_direction,
                 previous_a,
-                previous_zone == Some(unit.zone),
-                first_in_zone,
+                virtual_entry,
             ) {
                 unit.direction = direction;
                 unit.start_point = start;
@@ -1247,6 +1276,13 @@ impl CamAnalysis {
             .iter()
             .rev()
             .find_map(|group| group.section_unit);
+        let lazy_rotation = self.lazy_rotation;
+        let first_plan_unit_id = self
+            .plan
+            .groups
+            .first()
+            .and_then(|group| group.units.first())
+            .map(|unit| unit.unit_id);
         let Some(group) = self
             .plan
             .groups
@@ -1276,6 +1312,11 @@ impl CamAnalysis {
         let mut visited_zones = BTreeSet::new();
         for unit in &mut group.units {
             let first_in_zone = visited_zones.insert(unit.zone);
+            let virtual_entry = if lazy_rotation {
+                first_in_zone
+            } else {
+                first_plan_unit_id == Some(unit.unit_id)
+            };
             if unit.machining_cut {
                 if let Some((direction, start, end)) = section.as_ref().and_then(|section| {
                     choose_section_entry(
@@ -1319,8 +1360,7 @@ impl CamAnalysis {
                 previous_end,
                 previous_direction,
                 previous_a,
-                previous_zone == Some(unit.zone),
-                first_in_zone,
+                virtual_entry,
             ) {
                 unit.direction = direction;
                 unit.start_point = start;
@@ -2220,7 +2260,6 @@ fn choose_unit_entry(
     previous_end: Option<[f64; 3]>,
     previous_direction: Option<[f64; 3]>,
     previous_a: Option<f64>,
-    same_zone_as_previous: bool,
     virtual_entry: bool,
 ) -> Option<(UnitDirection, [f64; 3], [f64; 3])> {
     let path = ordered_unit_points(display, cam, unit_id)?;
@@ -2231,7 +2270,7 @@ fn choose_unit_entry(
         .unit(unit_id)
         .map(|machining_unit| machining_unit.closed)
         .unwrap_or(false);
-    if (closed || !closed) && (same_zone_as_previous || virtual_entry) {
+    if (closed || !closed) && (previous_end.is_some() || virtual_entry) {
         if let Some(section) = section {
             if virtual_entry {
                 if let Some(entry) = scan_first_entry(&path, closed, section, zone) {
