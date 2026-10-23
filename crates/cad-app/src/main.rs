@@ -1309,6 +1309,9 @@ fn cam_analysis_ui(
                     ui.label(
                         "懒旋转：完成一个区位后再转下一个区位；关闭后按 YZ 平面沿 +X 扫描顺序。",
                     );
+                    ui.label(
+                        "落刀点：懒旋转优先局部北极点，非懒旋转取 +X 极点；开放路径只选端点。",
+                    );
                     ui.separator();
                     ui.label("加工顺序（预览）");
                     ui.label(
