@@ -1536,6 +1536,7 @@ fn draw_machining_order_labels(
     ));
     let viewport = context.viewport_rect();
     let blue = egui::Color32::from_rgb(64, 146, 255);
+    let orange = egui::Color32::from_rgb(255, 170, 64);
 
     for group in &state.analysis.plan.groups {
         for unit in &group.units {
@@ -1553,6 +1554,64 @@ fn draw_machining_order_labels(
                     .any(|rect| rect.expand(4.0).contains(position))
             {
                 continue;
+            }
+
+            // Draw the actual entry point and the local cutting tangent. The
+            // tangent comes from the ordered path, not from center-to-center.
+            if let Some(path) = cam_analysis::oriented_unit_path(
+                &state.display,
+                &state.cam,
+                unit.unit_id,
+                unit.direction,
+            ) {
+                if let Some(start_point) = path.first() {
+                    if let Ok(start_screen) = camera.world_to_viewport(
+                        camera_transform,
+                        Vec3::new(
+                            start_point[0] as f32,
+                            start_point[2] as f32,
+                            -(start_point[1] as f32),
+                        ),
+                    ) {
+                        let start = egui::pos2(start_screen.x, start_screen.y);
+                        let mut direction = None;
+                        for point in path.iter().skip(1).take(8) {
+                            if let Ok(next_screen) = camera.world_to_viewport(
+                                camera_transform,
+                                Vec3::new(point[0] as f32, point[2] as f32, -(point[1] as f32)),
+                            ) {
+                                let delta = egui::vec2(
+                                    next_screen.x - start_screen.x,
+                                    next_screen.y - start_screen.y,
+                                );
+                                if delta.length() > 2.0 {
+                                    direction = Some(delta.normalized());
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(direction) = direction {
+                            let tip = start + direction * 18.0;
+                            let free = viewport.contains(start)
+                                && viewport.contains(tip)
+                                && !blocked.iter().any(|rect| rect.expand(4.0).contains(start));
+                            if free {
+                                let stroke = egui::Stroke::new(2.0, orange);
+                                let perpendicular = egui::vec2(-direction.y, direction.x);
+                                painter.circle_filled(start, 3.0, orange);
+                                painter.line_segment([start, tip], stroke);
+                                painter.line_segment(
+                                    [tip, tip - direction * 7.0 + perpendicular * 4.5],
+                                    stroke,
+                                );
+                                painter.line_segment(
+                                    [tip, tip - direction * 7.0 - perpendicular * 4.5],
+                                    stroke,
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             if !unit.machining_cut {
