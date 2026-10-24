@@ -34,7 +34,6 @@ const MESSAGE_LIMIT: usize = 200;
 const COMMAND_MAX_HISTORY_LINES: usize = 4;
 const COMMAND_ROW_HEIGHT: f32 = 21.0;
 const COMMAND_VERTICAL_PADDING: f32 = 12.0;
-const MENU_SIDE_WIDTH: f32 = 300.0;
 const PICK_TOLERANCE: f32 = 12.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
@@ -54,7 +53,8 @@ struct ViewerState {
     manual_pair: [Option<cam::UnitId>; 2],
     trajectory: Option<cam_trajectory::MachineTrajectory>,
     gcode_profile: gcode::GCodeProfile,
-    gcode_preview: String,
+    gcode_settings_message: String,
+    gcode_settings_error: bool,
     transfer_example_distance: f64,
     transfer_example_delta_z: f64,
     gcode_settings_open: bool,
@@ -285,7 +285,6 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.analysis = analysis;
             state.manual_pair = [None, None];
             state.trajectory = trajectory;
-            state.gcode_preview.clear();
             state.load_version += 1;
             state.fit_dirty = true;
 
@@ -964,7 +963,7 @@ fn apply_reorder_click(
         }
     }
     reorder.clicked.push(unit_id);
-    refresh_gcode_preview(state);
+    rebuild_state_trajectory(state);
     true
 }
 
@@ -1859,89 +1858,69 @@ fn drawing_ui(
     );
 
     let menu_panel = egui::Panel::top("menu_bar").show(&mut root, |ui| {
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(MENU_SIDE_WIDTH, 24.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.menu_button("文件", |ui| {
-                        if ui.button("打开文件").clicked() {
-                            open_dialog = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("导出 G 代码").clicked() {
-                            export_gcode = true;
-                            ui.close();
-                        }
-                        if ui.button("G代码配置与预览").clicked() {
-                            state.gcode_settings_open = true;
-                            ui.close();
-                        }
-                        if ui.button("快速导出到 build").clicked() {
-                            quick_export_gcode = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        ui.menu_button("最近打开", |ui| {
-                            if state.recent.is_empty() {
-                                ui.label("暂无记录");
-                            } else {
-                                for path in &state.recent {
-                                    let name = path
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| path.display().to_string());
-                                    let response = ui.button(name);
-                                    let clicked = response.clicked();
-                                    response.on_hover_text(path.display().to_string());
-                                    if clicked {
-                                        pending_path = Some(path.clone());
-                                        ui.close();
-                                    }
-                                }
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("文件", |ui| {
+                if ui.button("打开文件").clicked() {
+                    open_dialog = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("快速导出到 build").clicked() {
+                    quick_export_gcode = true;
+                    ui.close();
+                }
+                ui.separator();
+                ui.menu_button("最近打开", |ui| {
+                    if state.recent.is_empty() {
+                        ui.label("暂无记录");
+                    } else {
+                        for path in &state.recent {
+                            let name = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            let response = ui.button(name);
+                            let clicked = response.clicked();
+                            response.on_hover_text(path.display().to_string());
+                            if clicked {
+                                pending_path = Some(path.clone());
+                                ui.close();
                             }
-                        });
-                    });
-                    ui.menu_button("视图", |ui| {
-                        if ui.button("适应视图").clicked() {
-                            fit_clicked = true;
-                            ui.close();
                         }
-                        if ui.button("等轴测").clicked() {
-                            camera.yaw = -FRAC_PI_4;
-                            camera.pitch = 0.55;
-                            ui.close();
-                        }
-                        if ui.button("俯视图").clicked() {
-                            camera.yaw = 0.0;
-                            camera.pitch = 1.55;
-                            ui.close();
-                        }
-                        if ui.button("前视图").clicked() {
-                            camera.yaw = 0.0;
-                            camera.pitch = 0.0;
-                            ui.close();
-                        }
-                    });
-                    ui.separator();
-                    space_switch_ui(ui, &mut space, &mut selection, &state.cam);
-                },
-            );
-
-            let center_width = (ui.available_width() - MENU_SIDE_WIDTH).max(0.0);
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(center_width, 24.0),
-                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                |ui| {
-                    ui.strong(&current_name);
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(MENU_SIDE_WIDTH, 24.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |_ui| {},
-            );
+                    }
+                });
+            });
+            ui.menu_button("视图", |ui| {
+                if ui.button("适应视图").clicked() {
+                    fit_clicked = true;
+                    ui.close();
+                }
+                if ui.button("等轴测").clicked() {
+                    camera.yaw = -FRAC_PI_4;
+                    camera.pitch = 0.55;
+                    ui.close();
+                }
+                if ui.button("俯视图").clicked() {
+                    camera.yaw = 0.0;
+                    camera.pitch = 1.55;
+                    ui.close();
+                }
+                if ui.button("前视图").clicked() {
+                    camera.yaw = 0.0;
+                    camera.pitch = 0.0;
+                    ui.close();
+                }
+            });
+            if ui.button("导出 G 代码").clicked() {
+                export_gcode = true;
+            }
+            if ui.button("G代码配置").clicked() {
+                state.gcode_settings_open = true;
+            }
+            ui.separator();
+            space_switch_ui(ui, &mut space, &mut selection, &state.cam);
+            ui.separator();
+            ui.add(egui::Label::new(&current_name).truncate());
         });
     });
     let menu_rect = menu_panel.response.rect;
@@ -2335,370 +2314,7 @@ fn drawing_ui(
     view_cube_ui(context, &mut camera);
 
     if state.gcode_settings_open {
-        if state.gcode_preview.is_empty() {
-            refresh_gcode_preview(&mut state);
-        }
-        let mut window_open = true;
-        let mut save_profile = false;
-        let mut reload_profile = false;
-        let mut validate_gcode = false;
-        let config_path = gcode_config_path();
-        let window_size = egui::vec2(960.0, 540.0);
-        let default_pos = context.content_rect().center() - window_size * 0.5;
-        egui::Window::new("G代码配置")
-            .fixed_size(window_size)
-            .default_pos(default_pos)
-            .movable(true)
-            .drag_area(egui::WindowDrag::Anywhere)
-            .open(&mut window_open)
-            .show(context, |ui| {
-                ui.label(format!("配置文件：{}", config_path.display()));
-                ui.separator();
-                let tabs = [
-                    "文件级",
-                    "图元类型",
-                    "图元颜色",
-                    "所属图层",
-                    "加工安全",
-                    "加工规划",
-                ];
-                ui.horizontal_wrapped(|ui| {
-                    for (index, title) in tabs.iter().enumerate() {
-                        if ui
-                            .selectable_label(state.gcode_settings_tab == index, *title)
-                            .clicked()
-                        {
-                            state.gcode_settings_tab = index;
-                        }
-                    }
-                });
-                ui.separator();
-                let body_height = (ui.available_height() - 90.0).max(180.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("gcode_settings_body")
-                    .max_height(body_height)
-                    .show(ui, |ui| {
-                        ui.set_min_height(body_height);
-                        match state.gcode_settings_tab {
-                            0 => {
-                                egui::Grid::new("gcode_file_tab")
-                                    .num_columns(4)
-                                    .spacing([10.0, 5.0])
-                                    .show(ui, |ui| {
-                                        ui.label("配置名称");
-                                        ui.text_edit_singleline(&mut state.gcode_profile.name);
-                                        ui.label("单元开始");
-                                        ui.text_edit_singleline(
-                                            &mut state.gcode_profile.unit_start,
-                                        );
-                                        ui.end_row();
-                                        ui.label("单元结束");
-                                        ui.text_edit_singleline(&mut state.gcode_profile.unit_end);
-                                        ui.label("快速代码");
-                                        ui.text_edit_singleline(&mut state.gcode_profile.rapid);
-                                        ui.end_row();
-                                        ui.label("切削代码");
-                                        ui.text_edit_singleline(&mut state.gcode_profile.cutting);
-                                        ui.label("进给");
-                                        ui.add(
-                                            egui::DragValue::new(&mut state.gcode_profile.feed)
-                                                .speed(1.0),
-                                        );
-                                        ui.end_row();
-                                        ui.label("小数位");
-                                        ui.add(
-                                            egui::DragValue::new(&mut state.gcode_profile.decimals)
-                                                .range(0..=6),
-                                        );
-                                        ui.label("");
-                                        ui.label("");
-                                        ui.end_row();
-                                    });
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(
-                                        &mut state.gcode_profile.arc_output,
-                                        "输出圆弧 G02/G03",
-                                    );
-                                    ui.checkbox(
-                                        &mut state.gcode_profile.keep_continuous_angle,
-                                        "A 轴保持连续角度（跨单元最短转位）",
-                                    );
-                                });
-                                let available = ui.available_height();
-                                let label_height = 18.0;
-                                let gap = 6.0;
-                                let editor_height =
-                                    ((available - 2.0 * label_height - 2.0 * gap) / 2.0).max(40.0);
-                                ui.label("文件头");
-                                ui.add_sized(
-                                    egui::vec2(ui.available_width(), editor_height),
-                                    egui::TextEdit::multiline(&mut state.gcode_profile.header)
-                                        .desired_rows(1),
-                                );
-                                ui.add_space(gap);
-                                ui.label("文件尾");
-                                ui.add_sized(
-                                    egui::vec2(ui.available_width(), editor_height),
-                                    egui::TextEdit::multiline(&mut state.gcode_profile.footer)
-                                        .desired_rows(1),
-                                );
-                            }
-                            1 => {
-                                let mut selected = state.gcode_selected_type.clone();
-                                gcode_rule_tab(
-                                    ui,
-                                    &mut state.gcode_profile.entity_type_rules,
-                                    &mut selected,
-                                    &[],
-                                    &BTreeMap::new(),
-                                    &BTreeMap::new(),
-                                    RuleTab::EntityType,
-                                );
-                                state.gcode_selected_type = selected;
-                            }
-                            2 => {
-                                let mut available =
-                                    vec!["BYLAYER".to_string(), "BYBLOCK".to_string()];
-                                for index in 1..=9 {
-                                    available.push(format!("ACI:{index}"));
-                                }
-                                let mut colors = BTreeMap::new();
-                                for key in state.gcode_profile.color_rules.keys() {
-                                    if let Some(color) = color_rule_swatch(key) {
-                                        colors.insert(key.clone(), color);
-                                    }
-                                }
-                                let mut selected = state.gcode_selected_color.clone();
-                                gcode_rule_tab(
-                                    ui,
-                                    &mut state.gcode_profile.color_rules,
-                                    &mut selected,
-                                    &available,
-                                    &colors,
-                                    &BTreeMap::new(),
-                                    RuleTab::Color,
-                                );
-                                state.gcode_selected_color = selected;
-                            }
-                            3 => {
-                                let mut layers: Vec<String> = Vec::new();
-                                let mut colors = BTreeMap::new();
-                                let mut indices = BTreeMap::new();
-                                for layer in &state.display.layers {
-                                    layers.push(layer.name.clone());
-                                    colors.insert(layer.name.clone(), layer.color);
-                                    if let Some(index) = layer.color_index {
-                                        indices.insert(layer.name.clone(), index);
-                                    }
-                                }
-                                layers.push("0".to_string());
-                                layers.sort();
-                                layers.dedup();
-                                let mut selected = state.gcode_selected_layer.clone();
-                                gcode_rule_tab(
-                                    ui,
-                                    &mut state.gcode_profile.layer_rules,
-                                    &mut selected,
-                                    &layers,
-                                    &colors,
-                                    &indices,
-                                    RuleTab::Layer,
-                                );
-                                state.gcode_selected_layer = selected;
-                            }
-                            4 => {
-                                egui::Grid::new("gcode_safety_tab")
-                                    .num_columns(2)
-                                    .spacing([10.0, 5.0])
-                                    .show(ui, |ui| {
-                                        ui.label("旋转安全抬刀");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut state.gcode_profile.rotation_safety_clearance,
-                                            )
-                                            .speed(0.1),
-                                        );
-                                        ui.end_row();
-                                        ui.label("同区离面");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut state.gcode_profile.same_zone_clearance,
-                                            )
-                                            .speed(0.1),
-                                        );
-                                        ui.end_row();
-                                    });
-                                ui.label("关闭联动时，同面且 A 不变使用同区离面参数；跨面或旋转先达到净空。");
-                                let ViewerState { gcode_profile, transfer_example_distance, transfer_example_delta_z, .. } = &mut *state;
-                                transfer_settings_ui(ui, &mut gcode_profile.transfer, transfer_example_distance, transfer_example_delta_z);
-                                ui.separator();
-                                ui.checkbox(
-                                    &mut state.gcode_profile.use_initial_position,
-                                    "启用初始机床位置",
-                                );
-                                if state.gcode_profile.use_initial_position {
-                                    egui::Grid::new("gcode_initial_position")
-                                        .num_columns(4)
-                                        .spacing([8.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.label("X");
-                                            ui.add(
-                                                egui::DragValue::new(
-                                                    &mut state.gcode_profile.initial_x,
-                                                )
-                                                .speed(0.1),
-                                            );
-                                            ui.label("Y");
-                                            ui.add(
-                                                egui::DragValue::new(
-                                                    &mut state.gcode_profile.initial_y,
-                                                )
-                                                .speed(0.1),
-                                            );
-                                            ui.end_row();
-                                            ui.label("Z");
-                                            ui.add(
-                                                egui::DragValue::new(
-                                                    &mut state.gcode_profile.initial_z,
-                                                )
-                                                .speed(0.1),
-                                            );
-                                            ui.label("A");
-                                            ui.add(
-                                                egui::DragValue::new(
-                                                    &mut state.gcode_profile.initial_a,
-                                                )
-                                                .speed(0.1),
-                                            );
-                                            ui.end_row();
-                                        });
-                                }
-                                ui.checkbox(
-                                    &mut state.gcode_profile.return_to_initial,
-                                    "程序结束返回初始位置",
-                                );
-                            }
-                            5 => {
-                                egui::Grid::new("gcode_planning_tab")
-                                    .num_columns(2)
-                                    .spacing([10.0, 5.0])
-                                    .show(ui, |ui| {
-                                        ui.label("过切距离");
-                                        ui.add(
-                                            egui::DragValue::new(&mut state.gcode_profile.overcut)
-                                                .speed(0.1),
-                                        );
-                                        ui.end_row();
-                                        ui.label("圆弧折线公差");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut state.gcode_profile.arc_tolerance,
-                                            )
-                                            .speed(0.01)
-                                            .range(0.001..=10.0),
-                                        );
-                                        ui.end_row();
-                                        ui.label("A 轴偏移");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut state.gcode_profile.a_offset_degrees,
-                                            )
-                                            .speed(0.1),
-                                        );
-                                        ui.end_row();
-                                        ui.label("加工面 Z 修正");
-                                        ui.add(
-                                            egui::DragValue::new(
-                                                &mut state.gcode_profile.machining_z_offset,
-                                            )
-                                            .speed(0.1),
-                                        );
-                                        ui.end_row();
-                                        ui.label("方管壁厚");
-                                        ui.add(egui::DragValue::new(&mut state.gcode_profile.wall_thickness).speed(0.1));
-                                        ui.end_row();
-                                    });
-                                ui.checkbox(&mut state.gcode_profile.end_cut_correction,"启用成品端面壁厚补偿（左 +X / 右 −X）");
-                                if let Some(error)=state.gcode_profile.wall_validation_error() {ui.colored_label(egui::Color32::RED,error);}
-                                ui.label("壁厚补偿仅作用于已配对端面；修边断面不补偿。刀头轨迹可能不共面。");
-                                ui.label("跨区位 Z 修正会按断面方向联动补偿 X，保持刀头轨迹形状。");
-                                ui.label(
-                                    "加工规划参数会改变四轴姿态或轨迹，保存后会重新计算轨迹。",
-                                );
-                            }
-                            _ => {}
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("保存配置并重算").clicked() {
-                        save_profile = true;
-                    }
-                    if ui.button("重新加载").clicked() {
-                        reload_profile = true;
-                    }
-                    if ui.button("刷新预览").clicked() {
-                        refresh_gcode_preview(&mut state);
-                    }
-                    if ui.button("校验 G 代码").clicked() {
-                        validate_gcode = true;
-                    }
-                });
-                ui.separator();
-                let preview: String = state
-                    .gcode_preview
-                    .lines()
-                    .take(300)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                egui::CollapsingHeader::new("G代码预览（前 300 行）")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("gcode_preview")
-                            .max_height(220.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.monospace(preview);
-                            });
-                    });
-            });
-        state.gcode_settings_open = window_open;
-
-        if reload_profile {
-            state.gcode_profile = gcode::GCodeProfile::load(&config_path).unwrap_or_default();
-            refresh_gcode_preview(&mut state);
-            push_message(&mut state, "已重新加载 G 代码配置");
-        }
-        if save_profile {
-            let saved = if let Some(error) = state.gcode_profile.transfer.validation_error() {
-                Err(error.to_string())
-            } else {
-                state.gcode_profile.save(&config_path)
-            };
-            match saved {
-                Ok(()) => {
-                    refresh_gcode_preview(&mut state);
-                    push_message(&mut state, "G 代码配置已保存，轨迹已重新计算");
-                }
-                Err(error) => push_message(&mut state, format!("保存配置失败：{error}")),
-            }
-        }
-        if validate_gcode {
-            refresh_gcode_preview(&mut state);
-            if let Some(trajectory) = state.trajectory.as_ref() {
-                let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
-                if issues.is_empty() {
-                    push_message(&mut state, "G 代码校验通过");
-                } else {
-                    for issue in issues.into_iter().take(5) {
-                        push_message(&mut state, format!("G 代码校验：{issue}"));
-                    }
-                }
-            } else {
-                push_message(&mut state, "没有可校验的四轴轨迹");
-            }
-        }
+        gcode_settings_ui(context, &mut state);
     }
 
     let pointer = context.input(|input| input.pointer.hover_pos());
@@ -2709,8 +2325,10 @@ fn drawing_ui(
                 || command_rect.expand(6.0).contains(position)
         })
         .unwrap_or(false);
-    ui_state.pointer_over_ui =
-        over_panels || context.egui_is_using_pointer() || context.egui_wants_pointer_input();
+    ui_state.pointer_over_ui = state.gcode_settings_open
+        || over_panels
+        || context.egui_is_using_pointer()
+        || context.egui_wants_pointer_input();
     Ok(())
 }
 
@@ -2926,13 +2544,558 @@ fn gcode_config_path() -> PathBuf {
     base.join("CADCAM-Rust").join("gcode.toml")
 }
 
-fn refresh_gcode_preview(state: &mut ViewerState) {
-    rebuild_state_trajectory(state);
-    state.gcode_preview = state
-        .trajectory
-        .as_ref()
-        .map(|trajectory| gcode::render_gcode(trajectory, &state.gcode_profile))
-        .unwrap_or_default();
+fn gcode_settings_ui(context: &egui::Context, state: &mut ViewerState) {
+    let mut window_open = true;
+    let mut action = None;
+    let tabs = [
+        "文件级",
+        "图元类型",
+        "图元颜色",
+        "所属图层",
+        "加工安全",
+        "加工规划",
+    ];
+    let hints = [
+        "设置程序头尾、加工指令和输出格式",
+        "按图元类型设置头尾代码；类型头最先输出，类型尾最后输出",
+        "按图元颜色设置头尾代码；颜色头在图层头之后，颜色尾在图层尾之前",
+        "按所属图层设置头尾代码；执行顺序位于类型规则与颜色规则之间",
+        "设置安全净空、同面转移和初始位置",
+        "设置过切、旋转偏移及端面补偿",
+    ];
+    let modal = egui::Modal::new(egui::Id::new("gcode_settings_modal"))
+        .frame(egui::Frame::new().fill(egui::Color32::from_rgb(18, 24, 33)))
+        .show(context, |ui| {
+            let size = context.content_rect().size();
+            ui.set_min_size(size);
+            ui.set_max_size(size);
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 6.0);
+            egui::Panel::top("gcode_settings_header")
+                .exact_size(108.0)
+                .resizable(false)
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 10)))
+                .show(ui, |ui| {
+                    ui.columns(2, |columns| {
+                        columns[0].heading("G代码配置");
+                        columns[0].add(egui::Label::new(egui::RichText::new(format!(
+                            "保存位置：{}", gcode_config_path().display()
+                        )).size(16.0)).truncate())
+                            .on_hover_text(gcode_config_path().display().to_string());
+                        columns[0].horizontal(|ui| {
+                            for (label, selected_action, hint) in [
+                                ("导入配置…", GCodeConfigAction::Import, "从 TOML 文件导入当前配置，不自动覆盖已保存的配置"),
+                                ("导出配置…", GCodeConfigAction::Export, "将当前配置另存为 TOML 文件"),
+                                ("重新加载", GCodeConfigAction::Reload, "从默认保存位置重新加载配置并重算"),
+                                ("恢复默认", GCodeConfigAction::Reset, "恢复内置默认值，点击保存后才写入磁盘"),
+                            ] {
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    action = Some(selected_action);
+                                }
+                            }
+                        });
+                        columns[1].horizontal(|ui| {
+                            ui.strong("规则代码执行顺序");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("关闭  ×").clicked() { window_open = false; }
+                            });
+                        });
+                        columns[1].label("前置：图元类型 → 所属图层 → 图元颜色 → 单元开始");
+                        columns[1].label("后置：单元结束 → 图元颜色 → 所属图层 → 图元类型")
+                            .on_hover_text("每个连续切削段使用此顺序；多个类型/图层/颜色组合的尾部按组合逆序输出。文件头和文件尾位于整个程序最外层。");
+                    });
+                });
+            egui::Panel::bottom("gcode_settings_footer")
+                .exact_size(70.0)
+                .resizable(false)
+                .frame(egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(24, 32, 44))
+                    .inner_margin(egui::Margin::symmetric(18, 8)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("保存配置并重算")
+                            .fill(egui::Color32::from_rgb(40, 100, 170)))
+                            .on_hover_text("写入默认配置位置并重新计算轨迹，下次启动使用此配置")
+                            .clicked() {
+                            action = Some(GCodeConfigAction::Save);
+                        }
+                        if ui.button("校验 G 代码")
+                            .on_hover_text("按当前内存配置重算并校验轨迹，不保存配置或输出文件")
+                            .clicked() {
+                            action = Some(GCodeConfigAction::Validate);
+                        }
+                    });
+                    let (message, error) = if let Some(error) = state.gcode_profile.validation_error() {
+                        (error, true)
+                    } else {
+                        (state.gcode_settings_message.as_str(), state.gcode_settings_error)
+                    };
+                    let color = if error { egui::Color32::LIGHT_RED } else {
+                        egui::Color32::from_rgb(120, 210, 170)
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(message).color(color)).truncate())
+                        .on_hover_text(message);
+                });
+            egui::Panel::left("gcode_settings_navigation")
+                .exact_size(148.0)
+                .resizable(false)
+                .frame(egui::Frame::new().inner_margin(8))
+                .show(ui, |ui| {
+                    let gap = ui.spacing().item_spacing.y;
+                    let height = ((ui.available_height() - gap * 5.0) / 6.0).max(1.0);
+                    for (index, title) in tabs.iter().enumerate() {
+                        if ui.add_sized([ui.available_width(), height],
+                            egui::Button::selectable(state.gcode_settings_tab == index, *title))
+                            .on_hover_text(hints[index]).clicked() {
+                            state.gcode_settings_tab = index;
+                        }
+                    }
+                });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().inner_margin(16))
+                .show(ui, |ui| {
+                    ui.push_id(state.gcode_settings_tab, |ui| {
+                        match state.gcode_settings_tab {
+                            0 => gcode_file_tab(ui, &mut state.gcode_profile),
+                            1 => {
+                                let mut selected = state.gcode_selected_type.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.entity_type_rules,
+                                    &mut selected,
+                                    &[],
+                                    &BTreeMap::new(),
+                                    &BTreeMap::new(),
+                                    RuleTab::EntityType,
+                                );
+                                state.gcode_selected_type = selected;
+                            }
+                            2 => {
+                                let mut available =
+                                    vec!["BYLAYER".to_string(), "BYBLOCK".to_string()];
+                                for index in 1..=9 {
+                                    available.push(format!("ACI:{index}"));
+                                }
+                                let mut colors = BTreeMap::new();
+                                for key in state.gcode_profile.color_rules.keys() {
+                                    if let Some(color) = color_rule_swatch(key) {
+                                        colors.insert(key.clone(), color);
+                                    }
+                                }
+                                let mut selected = state.gcode_selected_color.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.color_rules,
+                                    &mut selected,
+                                    &available,
+                                    &colors,
+                                    &BTreeMap::new(),
+                                    RuleTab::Color,
+                                );
+                                state.gcode_selected_color = selected;
+                            }
+                            3 => {
+                                let mut layers: Vec<String> = Vec::new();
+                                let mut colors = BTreeMap::new();
+                                let mut indices = BTreeMap::new();
+                                for layer in &state.display.layers {
+                                    layers.push(layer.name.clone());
+                                    colors.insert(layer.name.clone(), layer.color);
+                                    if let Some(index) = layer.color_index {
+                                        indices.insert(layer.name.clone(), index);
+                                    }
+                                }
+                                layers.push("0".to_string());
+                                layers.sort();
+                                layers.dedup();
+                                let mut selected = state.gcode_selected_layer.clone();
+                                gcode_rule_tab(
+                                    ui,
+                                    &mut state.gcode_profile.layer_rules,
+                                    &mut selected,
+                                    &layers,
+                                    &colors,
+                                    &indices,
+                                    RuleTab::Layer,
+                                );
+                                state.gcode_selected_layer = selected;
+                            }
+                            4 => gcode_safety_tab(ui, state),
+                            5 => gcode_planning_tab(ui, &mut state.gcode_profile),
+                            _ => {}
+                        }
+                    });
+                });
+        });
+    if modal.should_close() {
+        window_open = false;
+    }
+    state.gcode_settings_open = window_open;
+    if let Some(action) = action {
+        let (message, error) = match gcode_config_action(state, action) {
+            Ok(Some(message)) => (message, false),
+            Ok(None) => (String::new(), false),
+            Err(error) => (error, true),
+        };
+        if !message.is_empty() {
+            state.gcode_settings_message = message.clone();
+            state.gcode_settings_error = error;
+            push_message(state, message);
+        }
+    }
+    if !window_open {
+        rebuild_state_trajectory(state);
+    }
+}
+
+fn gcode_code_pair(
+    ui: &mut egui::Ui,
+    header: &mut String,
+    footer: &mut String,
+    comment: &mut String,
+    file: bool,
+) {
+    let gap = ui.spacing().item_spacing.y;
+    let label_height = ui.text_style_height(&egui::TextStyle::Body);
+    let comment_height = 28.0;
+    let height =
+        ((ui.available_height() - label_height * 2.0 - comment_height - gap * 4.0) / 2.0).max(24.0);
+    let titles = if file {
+        ["文件头", "文件尾"]
+    } else {
+        ["头部代码", "尾部代码"]
+    };
+    for (title, text) in titles.into_iter().zip([header, footer]) {
+        ui.label(title).on_hover_text(if file {
+            "按原样输出到整个程序的开头或结尾，支持多行代码"
+        } else {
+            "按顶栏说明的规则顺序输出，支持多行代码"
+        });
+        egui::ScrollArea::vertical()
+            .id_salt(title)
+            .max_height(height)
+            .min_scrolled_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_sized(
+                    [ui.available_width(), (height - 2.0).max(20.0)],
+                    egui::TextEdit::multiline(text).code_editor(),
+                );
+            });
+    }
+    ui.horizontal(|ui| {
+        ui.label("说明")
+            .on_hover_text("仅作为配置备注保存，不输出到 G 代码");
+        ui.add_sized(
+            [ui.available_width(), comment_height],
+            egui::TextEdit::singleline(comment).hint_text("配置备注，不输出到 G 代码"),
+        );
+    });
+}
+
+fn gcode_file_tab(ui: &mut egui::Ui, profile: &mut gcode::GCodeProfile) {
+    ui.columns(2, |columns| {
+        egui::ScrollArea::vertical()
+            .id_salt("file_options")
+            .auto_shrink([false, false])
+            .show(&mut columns[0], |ui| {
+                ui.spacing_mut().text_edit_width = (ui.available_width() - 100.0).max(80.0);
+                egui::Grid::new("gcode_file_options")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .min_row_height(24.0)
+                    .show(ui, |ui| {
+                        for (label, value, hint) in [
+                            ("配置名称", &mut profile.name, "用于识别和管理当前配置"),
+                            (
+                                "单元开始",
+                                &mut profile.unit_start,
+                                "在类型、图层、颜色前置规则之后输出，例如开启激光 M03",
+                            ),
+                            (
+                                "单元结束",
+                                &mut profile.unit_end,
+                                "在颜色、图层、类型后置规则之前输出，例如关闭激光 M05",
+                            ),
+                            (
+                                "快速代码",
+                                &mut profile.rapid,
+                                "空走使用的运动指令，通常为 G00",
+                            ),
+                            (
+                                "切削代码",
+                                &mut profile.cutting,
+                                "直线切削使用的运动指令，通常为 G01",
+                            ),
+                        ] {
+                            ui.label(label).on_hover_text(hint);
+                            ui.text_edit_singleline(value).on_hover_text(hint);
+                            ui.end_row();
+                        }
+                        gcode_number_row(
+                            ui,
+                            "进给速度",
+                            &mut profile.feed,
+                            1.0,
+                            "切削移动使用的进给速度 F，必须大于零",
+                        );
+                        ui.label("小数位")
+                            .on_hover_text("输出坐标的小数位数，范围为 0–9");
+                        ui.add(egui::DragValue::new(&mut profile.decimals).range(0..=9));
+                        ui.end_row();
+                        ui.label("换行格式")
+                            .on_hover_text("根据控制器要求选择 CRLF 或 LF");
+                        egui::ComboBox::from_id_salt("gcode_line_ending")
+                            .selected_text(if profile.line_ending.eq_ignore_ascii_case("lf") {
+                                "LF"
+                            } else {
+                                "CRLF"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut profile.line_ending,
+                                    "crlf".to_string(),
+                                    "CRLF",
+                                );
+                                ui.selectable_value(
+                                    &mut profile.line_ending,
+                                    "lf".to_string(),
+                                    "LF",
+                                );
+                            });
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.checkbox(&mut profile.arc_output, "输出圆弧 G02/G03")
+                    .on_hover_text("关闭后按圆弧折线公差展开已识别的圆弧运动");
+                ui.checkbox(&mut profile.keep_continuous_angle, "A 轴保持连续角度")
+                    .on_hover_text("跨单元选择最接近上一姿态的等价 A 角，避免多绕整圈");
+            });
+        gcode_code_pair(
+            &mut columns[1],
+            &mut profile.header,
+            &mut profile.footer,
+            &mut profile.comment,
+            true,
+        );
+    });
+}
+
+fn gcode_number_row(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64, hint: &str) {
+    ui.label(label).on_hover_text(hint);
+    ui.add(egui::DragValue::new(value).speed(speed))
+        .on_hover_text(hint);
+    ui.end_row();
+}
+
+fn gcode_safety_tab(ui: &mut egui::Ui, state: &mut ViewerState) {
+    let ViewerState {
+        gcode_profile: profile,
+        transfer_example_distance,
+        transfer_example_delta_z,
+        ..
+    } = state;
+    ui.columns(2, |columns| {
+        egui::ScrollArea::vertical()
+            .id_salt("safety_options")
+            .auto_shrink([false, false])
+            .show(&mut columns[0], |ui| {
+                egui::Grid::new("gcode_safety_options")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .min_row_height(22.0)
+                    .show(ui, |ui| {
+                        gcode_number_row(
+                            ui,
+                            "旋转安全抬刀",
+                            &mut profile.rotation_safety_clearance,
+                            0.1,
+                            "跨区位或旋转时，在管材最大碰撞半径之外增加的安全净空",
+                        );
+                        gcode_number_row(
+                            ui,
+                            "同区离面",
+                            &mut profile.same_zone_clearance,
+                            0.1,
+                            "关闭同面联动后，同面且 A 不变的空走离面高度；0 表示沿表面转移",
+                        );
+                    });
+                transfer_settings_ui(ui, &mut profile.transfer);
+                ui.separator();
+                ui.checkbox(&mut profile.use_initial_position, "启用初始机床位置")
+                    .on_hover_text("从下方配置的机床位置经安全净空进入第一个加工单元");
+                ui.checkbox(&mut profile.return_to_initial, "结束返回初始位置")
+                    .on_hover_text("程序结束返回配置的 XYZ，A 选择靠近末姿态的等价角度");
+                egui::Grid::new("gcode_initial_position")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .min_row_height(22.0)
+                    .show(ui, |ui| {
+                        for (label, value) in [
+                            ("初始 X", &mut profile.initial_x),
+                            ("初始 Y", &mut profile.initial_y),
+                            ("初始 Z", &mut profile.initial_z),
+                            ("初始 A", &mut profile.initial_a),
+                        ] {
+                            gcode_number_row(
+                                ui,
+                                label,
+                                value,
+                                0.1,
+                                "初始及返回位置使用此坐标；初始 XYZ 也作为加工规划的参考位置",
+                            );
+                        }
+                    });
+            });
+        transfer_diagram_ui(
+            &mut columns[1],
+            &profile.transfer,
+            transfer_example_distance,
+            transfer_example_delta_z,
+        );
+    });
+}
+
+fn gcode_planning_tab(ui: &mut egui::Ui, profile: &mut gcode::GCodeProfile) {
+    let field_width = ((ui.available_width() - 16.0) * 0.5).max(80.0);
+    egui::Grid::new("gcode_planning_options")
+        .num_columns(2)
+        .min_col_width(field_width)
+        .spacing([16.0, 12.0])
+        .min_row_height(40.0)
+        .show(ui, |ui| {
+            for (label, value, hint) in [
+                (
+                    "过切距离",
+                    &mut profile.overcut,
+                    "闭合轮廓加工一周后沿切向继续切削的距离，0 表示不过切",
+                ),
+                (
+                    "A 轴偏移",
+                    &mut profile.a_offset_degrees,
+                    "附加到几何姿态的 A 角偏移，按 360° 周期解释",
+                ),
+                (
+                    "加工面 Z 修正",
+                    &mut profile.machining_z_offset,
+                    "调整加工高度；启用壁厚补偿时纳入内壁投影统一求 X，其余跨区位单元采用 Z/X 联动",
+                ),
+                (
+                    "方管壁厚",
+                    &mut profile.wall_thickness,
+                    "启用端面补偿时必须大于零，并小于截面较小尺寸的一半",
+                ),
+            ] {
+                ui.label(label).on_hover_text(hint);
+                ui.add_sized([field_width, 32.0], egui::DragValue::new(value).speed(0.1))
+                    .on_hover_text(hint);
+                ui.end_row();
+            }
+            ui.label("圆弧折线公差")
+                .on_hover_text("关闭圆弧输出时，将语义圆弧展开为折线所用的公差，范围为 0.001–10");
+            ui.add_sized(
+                [field_width, 32.0],
+                egui::DragValue::new(&mut profile.arc_tolerance)
+                    .speed(0.01)
+                    .range(0.001..=10.0),
+            );
+            ui.end_row();
+            ui.label("成品端面壁厚补偿")
+                .on_hover_text("仅补偿已配对的左右端面，修边断面不补偿；刀头轨迹允许弯折或不共面");
+            ui.checkbox(&mut profile.end_cut_correction, "启用（左 +X / 右 −X）")
+                .on_hover_text("从含 Z 偏移的刀头姿态求内壁作用位置，一次性修正 X");
+            ui.end_row();
+        });
+}
+
+#[derive(Clone, Copy)]
+enum GCodeConfigAction {
+    Import,
+    Export,
+    Save,
+    Reload,
+    Reset,
+    Validate,
+}
+
+fn gcode_config_action(
+    state: &mut ViewerState,
+    action: GCodeConfigAction,
+) -> Result<Option<String>, String> {
+    let config_path = gcode_config_path();
+    let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let message = match action {
+        GCodeConfigAction::Import | GCodeConfigAction::Reload => {
+            let path = if matches!(action, GCodeConfigAction::Import) {
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title("导入 G 代码配置")
+                    .add_filter("TOML 配置", &["toml"])
+                    .set_directory(directory)
+                    .pick_file()
+                else {
+                    return Ok(None);
+                };
+                path
+            } else {
+                config_path.clone()
+            };
+            let profile = gcode::GCodeProfile::load(&path)
+                .map_err(|error| format!("加载配置失败，当前配置已保留：{error}"))?;
+            state.gcode_profile = profile;
+            rebuild_state_trajectory(state);
+            if matches!(action, GCodeConfigAction::Import) {
+                format!(
+                    "已导入配置并重算：{}；点击保存以供下次启动使用",
+                    path.display()
+                )
+            } else {
+                "已重新加载保存的配置并重算".to_string()
+            }
+        }
+        GCodeConfigAction::Export | GCodeConfigAction::Save => {
+            let path = if matches!(action, GCodeConfigAction::Export) {
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title("导出 G 代码配置")
+                    .add_filter("TOML 配置", &["toml"])
+                    .set_directory(directory)
+                    .set_file_name("gcode.toml")
+                    .save_file()
+                else {
+                    return Ok(None);
+                };
+                path
+            } else {
+                config_path
+            };
+            state
+                .gcode_profile
+                .save(&path)
+                .map_err(|error| format!("写入配置失败：{error}"))?;
+            if matches!(action, GCodeConfigAction::Save) {
+                rebuild_state_trajectory(state);
+                format!("配置已保存，轨迹已重新计算：{}", path.display())
+            } else {
+                format!("配置已导出：{}", path.display())
+            }
+        }
+        GCodeConfigAction::Reset => {
+            state.gcode_profile = gcode::GCodeProfile::default();
+            rebuild_state_trajectory(state);
+            "已恢复全部默认配置并重算；点击保存以供下次启动使用".to_string()
+        }
+        GCodeConfigAction::Validate => {
+            rebuild_state_trajectory(state);
+            let trajectory = state
+                .trajectory
+                .as_ref()
+                .ok_or_else(|| "没有可校验的四轴轨迹".to_string())?;
+            let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
+            if !issues.is_empty() {
+                return Err(format!("G 代码校验：{}", issues.join("；")));
+            }
+            "G 代码校验通过".to_string()
+        }
+    };
+    Ok(Some(message))
 }
 
 fn color_rule_swatch(key: &str) -> Option<[f32; 3]> {
@@ -3005,98 +3168,99 @@ fn gcode_rule_tab(
     if selected.is_empty() || !rules.contains_key(selected) {
         *selected = keys[0].clone();
     }
-    let panel_height = ui.available_height();
-
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.set_min_width(190.0);
-            for key in &keys {
-                let mut label = match tab {
-                    RuleTab::EntityType => entity_type_label(key),
-                    RuleTab::Color => color_key_label(key),
-                    RuleTab::Layer => key.clone(),
-                };
-                if tab == RuleTab::Layer {
-                    if let Some(index) = key_indices.get(key) {
-                        label = format!("{label}  ACI {index}");
+    ui.columns(2, |columns| {
+        let list_height = columns[0].available_height().max(24.0);
+        egui::ScrollArea::vertical()
+            .id_salt("gcode_rule_keys")
+            .max_height(list_height)
+            .min_scrolled_height(list_height)
+            .auto_shrink([false, false])
+            .show(&mut columns[0], |ui| {
+                for key in &keys {
+                    let mut label = match tab {
+                        RuleTab::EntityType => entity_type_label(key),
+                        RuleTab::Color => color_key_label(key),
+                        RuleTab::Layer => key.clone(),
+                    };
+                    if tab == RuleTab::Layer {
+                        if let Some(index) = key_indices.get(key) {
+                            label = format!("{label}  ACI {index}");
+                        }
                     }
+                    ui.horizontal(|ui| {
+                        if let Some(color) = key_colors.get(key) {
+                            let (rect, response) = ui
+                                .allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, 3.0, egui::Color32::from_gray(150));
+                            let color = color32(*color);
+                            ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
+                            response.on_hover_text(format!(
+                                "#{:02X}{:02X}{:02X}",
+                                color.r(),
+                                color.g(),
+                                color.b()
+                            ));
+                        }
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::selectable(selected == key, label),
+                            )
+                            .on_hover_text(format!("编辑 {key} 的头部代码、尾部代码和说明"))
+                            .clicked()
+                        {
+                            *selected = key.clone();
+                        }
+                    });
                 }
-                ui.horizontal(|ui| {
-                    if let Some(color) = key_colors.get(key) {
-                        ui.colored_label(color32(*color), "■");
-                    }
-                    if ui
-                        .selectable_label(selected.as_str() == key.as_str(), label)
-                        .clicked()
-                    {
-                        *selected = key.clone();
-                    }
-                });
-            }
-        });
-        ui.separator();
-        ui.vertical(|ui| {
-            ui.set_min_width(360.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(format!("规则：{selected}"));
-            if let Some(rule) = rules.get_mut(selected) {
-                let editor_height =
-                    ((panel_height - 4.0 * 18.0 - 3.0 * 5.0 - 22.0) / 2.0).max(45.0);
-                ui.label("头部代码");
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), editor_height),
-                    egui::TextEdit::multiline(&mut rule.header).desired_rows(1),
-                );
-                ui.label("尾部代码");
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), editor_height),
-                    egui::TextEdit::multiline(&mut rule.footer).desired_rows(1),
-                );
-                ui.label("说明");
-                ui.add_sized(
-                    egui::vec2(ui.available_width(), 22.0),
-                    egui::TextEdit::singleline(&mut rule.comment),
-                );
-            }
-        });
+            });
+        if let Some(rule) = rules.get_mut(selected) {
+            gcode_code_pair(
+                &mut columns[1],
+                &mut rule.header,
+                &mut rule.footer,
+                &mut rule.comment,
+                false,
+            );
+        }
     });
 }
 
-fn transfer_settings_ui(
-    ui: &mut egui::Ui,
-    config: &mut cam_trajectory::TransferConfig,
-    distance: &mut f64,
-    delta_z: &mut f64,
-) {
+fn transfer_settings_ui(ui: &mut egui::Ui, config: &mut cam_trajectory::TransferConfig) {
     ui.separator();
-    ui.checkbox(&mut config.enabled, "启用同面联动抬落刀");
+    ui.checkbox(&mut config.enabled, "启用同面联动抬落刀")
+        .on_hover_text("同区位且 A 不变时使用联动抬刀、平移和落刀；跨面或旋转使用安全净空");
     egui::Grid::new("transfer_settings")
         .num_columns(2)
+        .spacing([12.0, 6.0])
+        .min_row_height(22.0)
         .show(ui, |ui| {
-            ui.label("最小安全抬刀高度");
-            ui.add(
-                egui::DragValue::new(&mut config.retract_height)
-                    .speed(0.1)
-                    .suffix(" mm"),
+            gcode_number_row(
+                ui,
+                "最小安全抬刀高度",
+                &mut config.retract_height,
+                0.1,
+                "离开上一加工单元前垂直抬刀的最小高度",
             );
-            ui.end_row();
-            ui.label("最小安全落刀高度");
-            ui.add(
-                egui::DragValue::new(&mut config.approach_height)
-                    .speed(0.1)
-                    .suffix(" mm"),
+            gcode_number_row(
+                ui,
+                "最小安全落刀高度",
+                &mut config.approach_height,
+                0.1,
+                "进入下一加工单元前垂直落刀的最小高度",
             );
-            ui.end_row();
-            ui.label("联动总高度");
+            ui.label("联动总高度")
+                .on_hover_text("相对两端较高点的峰值高度，不能小于最小抬刀和落刀高度");
             ui.add_enabled(
                 !config.auto_height,
-                egui::DragValue::new(&mut config.height)
-                    .speed(0.1)
-                    .suffix(" mm"),
-            );
+                egui::DragValue::new(&mut config.height).speed(0.1),
+            )
+            .on_hover_text("启用自动总高度时由两个最小高度的较大值决定");
             ui.end_row();
             let mut rise = config.rise_ratio * 100.0;
-            ui.label("联动抬刀水平占比");
+            ui.label("抬刀水平占比")
+                .on_hover_text("抬升阶段占 XY 总行程的百分比，与落刀占比之和不能超过 100%");
             if ui
                 .add(egui::DragValue::new(&mut rise).speed(1.0).suffix(" %"))
                 .changed()
@@ -3105,7 +3269,8 @@ fn transfer_settings_ui(
             }
             ui.end_row();
             let mut fall = config.fall_ratio * 100.0;
-            ui.label("联动落刀水平占比");
+            ui.label("落刀水平占比")
+                .on_hover_text("下降阶段占 XY 总行程的百分比，与抬刀占比之和不能超过 100%");
             if ui
                 .add(egui::DragValue::new(&mut fall).speed(1.0).suffix(" %"))
                 .changed()
@@ -3114,18 +3279,36 @@ fn transfer_settings_ui(
             }
             ui.end_row();
         });
-    ui.checkbox(&mut config.auto_height, "总高度取两个最小高度的较大值");
+    ui.checkbox(&mut config.auto_height, "总高度取最小抬落高度的较大值")
+        .on_hover_text("自动总高度不再单独读取联动总高度输入值");
+}
+
+fn transfer_diagram_ui(
+    ui: &mut egui::Ui,
+    config: &cam_trajectory::TransferConfig,
+    distance: &mut f64,
+    delta_z: &mut f64,
+) {
+    ui.label("空移剖面示意").on_hover_text(
+        "横轴为 XY 行程，纵轴为 Z，非等比例；与实际转移共用计算，不代表速度平滑或碰撞验证",
+    );
+    egui::Grid::new("transfer_example")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("示例 XY 距离")
+                .on_hover_text("仅用于右侧示意，不保存到配置");
+            ui.add(egui::DragValue::new(distance).range(0.0..=1.0e6).speed(1.0));
+            ui.end_row();
+            ui.label("终点 Z 差")
+                .on_hover_text("仅用于右侧示意，不保存到配置");
+            ui.add(egui::DragValue::new(delta_z).speed(0.1));
+            ui.end_row();
+        });
     if let Some(error) = config.validation_error() {
         ui.colored_label(egui::Color32::LIGHT_RED, error);
         return;
     }
-    ui.horizontal(|ui| {
-        ui.label("示例 XY 距离");
-        ui.add(egui::DragValue::new(distance).range(0.0..=1.0e6).speed(1.0));
-        ui.label("终点 Z 差");
-        ui.add(egui::DragValue::new(delta_z).speed(0.1));
-    });
-    ui.label("示例参数不保存。横轴 XY 行程，纵轴 Z（非等比）；示意与实际转移共用计算。");
     let start = cam_trajectory::MachinePose {
         x: 0.0,
         y: 0.0,
@@ -3146,10 +3329,11 @@ fn transfer_settings_ui(
         *config,
         0.0,
     );
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 160.0),
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ui.available_height().max(80.0)),
         egui::Sense::hover(),
     );
+    response.on_hover_text("示意参数不保存；横轴 XY 行程、纵轴 Z 非等比。蓝色为安全抬刀，橙色为联动抬升，青色为联动下降，绿色为安全落刀。");
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(24, 30, 38));
     let plot = rect.shrink(22.0);
@@ -3195,7 +3379,6 @@ fn transfer_settings_ui(
         egui::FontId::proportional(11.0),
         egui::Color32::WHITE,
     );
-    ui.label("这是空移剖面，不代表控制器已完成速度平滑或碰撞验证。");
 }
 
 fn sync_machine_start(state: &mut ViewerState) {
@@ -3215,7 +3398,6 @@ fn sync_machine_start(state: &mut ViewerState) {
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
     sync_machine_start(state);
-    state.gcode_preview.clear();
     let ViewerState {
         display,
         cam,
@@ -3233,7 +3415,7 @@ fn rebuild_state_trajectory(state: &mut ViewerState) {
 }
 
 fn export_gcode_file(state: &mut ViewerState) {
-    refresh_gcode_preview(state);
+    rebuild_state_trajectory(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;
@@ -3269,7 +3451,7 @@ fn export_gcode_file(state: &mut ViewerState) {
 }
 
 fn quick_export_gcode_file(state: &mut ViewerState) {
-    refresh_gcode_preview(state);
+    rebuild_state_trajectory(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;

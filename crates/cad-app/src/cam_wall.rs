@@ -2,18 +2,18 @@
 
 use crate::cam_analysis::{EndCutSide, TubeSection};
 
-/// Return the extra X movement from the already Z-corrected pose.
+/// Return the one-sided X correction from the pose with Z offset but unchanged source X.
 pub fn end_cut_allowance(
     section: &TubeSection,
     thickness: f64,
     source: [f64; 3],
-    pose: [f64; 4],
+    tool_pose: [f64; 4],
     slopes: [f64; 2],
     side: EndCutSide,
 ) -> Result<f64, String> {
-    let (sin, cos) = pose[3].to_radians().sin_cos();
-    let y = pose[1] - section.center_y;
-    let z = pose[2] - section.center_z;
+    let (sin, cos) = tool_pose[3].to_radians().sin_cos();
+    let y = tool_pose[1] - section.center_y;
+    let z = tool_pose[2] - section.center_z;
     // Move one wall thickness along the tool direction, then project onto the inner shell.
     let candidate = [
         y * cos + z * sin - thickness * sin,
@@ -25,12 +25,11 @@ pub fn end_cut_allowance(
         section.half_z() - thickness,
         (section.corner_radius() - thickness).max(0.0),
     );
-    let inner_x = source[0]
-        + slopes[0] * (section.center_y + inner[0] - source[1])
+    let delta_x = slopes[0] * (section.center_y + inner[0] - source[1])
         + slopes[1] * (section.center_z + inner[1] - source[2]);
     let extra = match side {
-        EndCutSide::Left => (source[0].max(inner_x) - pose[0]).max(0.0),
-        EndCutSide::Right => (source[0].min(inner_x) - pose[0]).min(0.0),
+        EndCutSide::Left => delta_x.max(0.0),
+        EndCutSide::Right => delta_x.min(0.0),
         EndCutSide::Section => 0.0,
     };
     if extra.is_finite() {

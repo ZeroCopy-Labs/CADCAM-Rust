@@ -395,7 +395,7 @@ pub fn build_trajectory(
                     Err(error) => {
                         return MachineTrajectory {
                             error: Some(format!(
-                                "加工单元 {} 的 Z 联动修正失败：{error}",
+                                "加工单元 {} 的修正方向求解失败：{error}",
                                 unit.order
                             )),
                             ..Default::default()
@@ -403,11 +403,6 @@ pub fn build_trajectory(
                     }
                 };
                 cut_slopes = Some([y_slope, z_slope]);
-                for pose in &mut poses {
-                    let (sin, cos) = pose.a.to_radians().sin_cos();
-                    // In workpiece coordinates the machine-Z offset is (dY, dZ) = h*(sin A, cos A).
-                    pose.x += config.machining_z_offset * (y_slope * sin + z_slope * cos);
-                }
             }
             if wall_cut {
                 // Correct only geometric samples; extend the resulting cutting tangent for overcut.
@@ -432,6 +427,15 @@ pub fn build_trajectory(
                         }
                     }
                 }
+            } else if let Some([y_slope, z_slope]) = cut_slopes {
+                // End cuts already account for Z in their inner-wall projection.
+                for pose in &mut poses {
+                    let (sin, cos) = pose.a.to_radians().sin_cos();
+                    // In workpiece coordinates the machine-Z offset is (dY, dZ) = h*(sin A, cos A).
+                    pose.x += config.machining_z_offset * (y_slope * sin + z_slope * cos);
+                }
+            }
+            if wall_cut {
                 corrected_sections.insert(
                     unit.unit_id,
                     path.iter()

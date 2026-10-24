@@ -25,6 +25,7 @@ pub struct CodeRule {
 #[serde(default)]
 pub struct GCodeProfile {
     pub name: String,
+    pub comment: String,
     pub header: String,
     pub footer: String,
     pub unit_start: String,
@@ -73,6 +74,7 @@ impl Default for GCodeProfile {
 
         Self {
             name: "default".to_string(),
+            comment: String::new(),
             header: "G90\nG21".to_string(),
             footer: "M30".to_string(),
             unit_start: "M03".to_string(),
@@ -107,6 +109,49 @@ impl Default for GCodeProfile {
 }
 
 impl GCodeProfile {
+    pub fn validation_error(&self) -> Option<&'static str> {
+        if let Some(error) = self
+            .wall_validation_error()
+            .or_else(|| self.a_validation_error())
+            .or_else(|| self.transfer.validation_error())
+        {
+            return Some(error);
+        }
+        if !self.feed.is_finite() || self.feed <= 0.0 {
+            return Some("进给速度必须是有限正数");
+        }
+        if !self.machining_z_offset.is_finite() {
+            return Some("加工面 Z 修正必须是有限数值");
+        }
+        if !self.rotation_safety_clearance.is_finite() || self.rotation_safety_clearance < 0.0 {
+            return Some("旋转安全抬刀距离非法");
+        }
+        if !self.same_zone_clearance.is_finite() || self.same_zone_clearance < 0.0 {
+            return Some("同区离面距离非法");
+        }
+        if !self.overcut.is_finite() || self.overcut < 0.0 {
+            return Some("过切距离非法");
+        }
+        if !self.arc_tolerance.is_finite() || self.arc_tolerance <= 0.0 {
+            return Some("圆弧折线公差必须是有限正数");
+        }
+        if self.decimals > 9 {
+            return Some("小数位不能超过 9");
+        }
+        if ![
+            self.initial_x,
+            self.initial_y,
+            self.initial_z,
+            self.initial_a,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+        {
+            return Some("初始机床位置包含非法数值");
+        }
+        None
+    }
+
     pub fn wall_validation_error(&self) -> Option<&'static str> {
         if !self.wall_thickness.is_finite()
             || self.wall_thickness < 0.0
@@ -156,14 +201,15 @@ impl GCodeProfile {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        toml::from_str(&text).map_err(|error| error.to_string())
+        let profile: Self = toml::from_str(&text).map_err(|error| error.to_string())?;
+        if let Some(error) = profile.validation_error() {
+            return Err(error.to_string());
+        }
+        Ok(profile)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(error) = self.wall_validation_error() {
-            return Err(error.to_string());
-        }
-        if let Some(error) = self.a_validation_error() {
+        if let Some(error) = self.validation_error() {
             return Err(error.to_string());
         }
         if let Some(parent) = path.parent() {
