@@ -161,6 +161,7 @@ pub struct UnitRuleKeys {
 
 #[derive(Clone, Debug, Default)]
 pub struct MachineTrajectory {
+    pub error: Option<String>,
     pub moves: Vec<MachineMove>,
     pub unit_ranges: Vec<TrajectoryUnitRange>,
     pub unit_rules: Vec<Vec<UnitRuleKeys>>,
@@ -252,6 +253,9 @@ pub fn build_trajectory(
                 if distance3(path[0], *path.last().unwrap()) > 1.0e-6 {
                     path.push(path[0]);
                 }
+            }
+            let source_point_count = path.len();
+            if closed {
                 // Optional overcut continues along the initial cutting tangent.
                 if config.overcut_distance > 1.0e-9 && path.len() >= 2 {
                     let start = path[0];
@@ -322,6 +326,35 @@ pub fn build_trajectory(
                 };
                 poses.push(pose);
                 previous_a = aligned;
+            }
+            if config.machining_z_offset != 0.0
+                && poses
+                    .iter()
+                    .any(|pose| (pose.a - poses[0].a).abs() > 1.0e-9)
+            {
+                let source = &path[..source_point_count];
+                let direction = if unit.machining_cut {
+                    section_cut_direction(source, section)
+                } else {
+                    fit_cut_direction(source).map_err(str::to_string)
+                };
+                let [y_slope, z_slope] = match direction {
+                    Ok(direction) => direction,
+                    Err(error) => {
+                        return MachineTrajectory {
+                            error: Some(format!(
+                                "加工单元 {} 的 Z 联动修正失败：{error}",
+                                unit.order
+                            )),
+                            ..Default::default()
+                        }
+                    }
+                };
+                for pose in &mut poses {
+                    let (sin, cos) = pose.a.to_radians().sin_cos();
+                    // In workpiece coordinates the machine-Z offset is (dY, dZ) = h*(sin A, cos A).
+                    pose.x += config.machining_z_offset * (y_slope * sin + z_slope * cos);
+                }
             }
             if poses.iter().any(|pose| !finite_pose(*pose)) {
                 return MachineTrajectory::default();
@@ -464,6 +497,7 @@ pub fn build_trajectory(
         .filter(|movement| movement.kind.is_cutting())
         .count();
     MachineTrajectory {
+        error: None,
         moves,
         unit_ranges,
         unit_rules,
@@ -479,6 +513,101 @@ fn finite_pose(pose: MachinePose) -> bool {
     [pose.x, pose.y, pose.z, pose.a]
         .iter()
         .all(|v| v.is_finite())
+}
+
+fn fit_cut_direction(points: &[[f64; 3]]) -> Result<[f64; 2], &'static str> {
+    if points.len() < 3 {
+        return Err("方向采样不足，至少需要三个非共线点");
+    }
+    let mut mean = [0.0; 3];
+    for point in points {
+        for (value, coordinate) in mean.iter_mut().zip(point) {
+            *value += coordinate / points.len() as f64;
+        }
+    }
+    let (mut yy, mut yz, mut zz, mut xy, mut xz) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for point in points {
+        let [x, y, z] = [point[0] - mean[0], point[1] - mean[1], point[2] - mean[2]];
+        yy += y * y;
+        yz += y * z;
+        zz += z * z;
+        xy += x * y;
+        xz += x * z;
+    }
+    let determinant = yy * zz - yz * yz;
+    if !determinant.is_finite() || yy <= 0.0 || zz <= 0.0 || determinant <= yy * zz * 1.0e-6 {
+        return Err("YZ 采样退化，无法确定断面方向");
+    }
+    let slopes = [
+        (xy * zz - xz * yz) / determinant,
+        (xz * yy - xy * yz) / determinant,
+    ];
+    if !slopes.iter().all(|v| v.is_finite()) {
+        return Err("断面方向包含非法数值");
+    }
+    if points.iter().any(|p| {
+        (p[0] - mean[0] - slopes[0] * (p[1] - mean[1]) - slopes[1] * (p[2] - mean[2])).abs() > 0.01
+    }) {
+        return Err("采样不共面，不能可靠确定联动修正方向");
+    }
+    Ok(slopes)
+}
+
+fn section_cut_direction(path: &[[f64; 3]], section: &TubeSection) -> Result<[f64; 2], String> {
+    let points = if path.len() > 1 && distance3(path[0], *path.last().unwrap()) <= 1.0e-9 {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    if points.is_empty() {
+        return Err("断面采样为空".to_string());
+    }
+    if points.iter().all(|p| (p[0] - points[0][0]).abs() <= 1.0e-9) {
+        return Ok([0.0, 0.0]);
+    }
+    let r = section.corner_radius();
+    let corners = [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
+    let names = ["右上", "右下", "左下", "左上"];
+    let mut directions = [[0.0; 2]; 4];
+    for (corner, (sy, sz)) in corners.iter().enumerate() {
+        let cy = section.center_y + sy * (section.half_y() - r);
+        let cz = section.center_z + sz * (section.half_z() - r);
+        let mut samples = Vec::new();
+        for (index, point) in points.iter().enumerate() {
+            let dy = point[1] - cy;
+            let dz = point[2] - cz;
+            if r > 1.0e-9 {
+                if dy * sy >= -1.0e-8 && dz * sz >= -1.0e-8 && (dy.hypot(dz) - r).abs() <= 0.01 {
+                    samples.push(*point);
+                }
+            } else if dy.hypot(dz) <= 1.0e-8 {
+                // A sharp corner obtains its direction from the two adjacent edge segments.
+                samples.extend_from_slice(&[
+                    points[(index + points.len() - 1) % points.len()],
+                    *point,
+                    points[(index + 1) % points.len()],
+                ]);
+            }
+        }
+        directions[corner] = fit_cut_direction(&samples)
+            .map_err(|error| format!("{}圆角/转角：{error}", names[corner]))?;
+    }
+    for i in 0..4 {
+        for j in 0..i {
+            let [a, b] = directions[i];
+            let [c, d] = directions[j];
+            let cosine =
+                (1.0 + a * c + b * d) / (1.0_f64.hypot(a.hypot(b)) * 1.0_f64.hypot(c.hypot(d)));
+            if cosine < 1.0_f64.to_radians().cos() {
+                return Err(format!("{}与{}转角的断面方向不一致", names[i], names[j]));
+            }
+        }
+    }
+    // Equal corner weights keep dense sampling on one side from biasing the direction.
+    Ok([
+        directions.iter().map(|d| d[0] / 4.0).sum(),
+        directions.iter().map(|d| d[1] / 4.0).sum(),
+    ])
 }
 
 fn align_entry_angle(previous: f64, target: f64, continuous: bool) -> f64 {
@@ -781,6 +910,7 @@ fn build_without_tube_section(
         .map(|movement| movement.pose.a)
         .fold(f64::NEG_INFINITY, f64::max);
     MachineTrajectory {
+        error: None,
         moves,
         unit_ranges,
         unit_rules,

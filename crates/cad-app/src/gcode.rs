@@ -175,6 +175,9 @@ impl GCodeProfile {
 }
 
 pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> String {
+    if trajectory.error.is_some() {
+        return String::new();
+    }
     let mut lines: Vec<String> = Vec::new();
     push_block(&mut lines, &profile.header);
     let mut previous_pose: Option<MachinePose> = None;
@@ -224,6 +227,9 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
 
 pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> Vec<String> {
     let mut issues = Vec::new();
+    if let Some(error) = &trajectory.error {
+        issues.push(error.clone());
+    }
     if let Some(error) = profile.a_validation_error() {
         issues.push(error.to_string());
     }
@@ -556,6 +562,7 @@ mod tests {
     #[test]
     fn disabled_arc_output_uses_polyline() {
         let trajectory = MachineTrajectory {
+            error: None,
             moves: vec![
                 MachineMove {
                     kind: MachineMoveKind::Rapid,

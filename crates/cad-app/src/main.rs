@@ -1387,7 +1387,9 @@ fn cam_analysis_ui(
             });
 
         if let Some(trajectory) = trajectory {
-            if trajectory.moves.is_empty() {
+            if let Some(error) = &trajectory.error {
+                ui.colored_label(egui::Color32::RED, error);
+            } else if trajectory.moves.is_empty() {
                 ui.label("四轴轨迹：暂无");
             } else {
                 egui::CollapsingHeader::new("四轴轨迹（预览）")
@@ -2514,6 +2516,7 @@ fn drawing_ui(
                                         );
                                         ui.end_row();
                                     });
+                                ui.label("跨区位 Z 修正会按断面方向联动补偿 X，保持刀头轨迹形状。");
                                 ui.label(
                                     "加工规划参数会改变四轴姿态或轨迹，保存后会重新计算轨迹。",
                                 );
@@ -3130,10 +3133,6 @@ fn export_gcode_file(state: &mut ViewerState) {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;
     };
-    if trajectory.unit_ranges.is_empty() {
-        push_message(state, "没有可导出的加工单元");
-        return;
-    }
     let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
     if !issues.is_empty() {
         for issue in issues.into_iter().take(5) {
@@ -3170,10 +3169,6 @@ fn quick_export_gcode_file(state: &mut ViewerState) {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
         return;
     };
-    if trajectory.unit_ranges.is_empty() {
-        push_message(state, "没有可导出的加工单元");
-        return;
-    }
     let issues = gcode::validate_trajectory(trajectory, &state.gcode_profile);
     if !issues.is_empty() {
         for issue in issues.into_iter().take(5) {
