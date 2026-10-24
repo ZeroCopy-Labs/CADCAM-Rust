@@ -24,6 +24,7 @@ use cad_core::read_document;
 mod cam;
 mod cam_analysis;
 mod cam_trajectory;
+mod cam_wall;
 mod display;
 mod gcode;
 
@@ -50,6 +51,7 @@ struct ViewerState {
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
     manual_tube: cam_analysis::TubeSection,
+    manual_pair: [Option<cam::UnitId>; 2],
     trajectory: Option<cam_trajectory::MachineTrajectory>,
     gcode_profile: gcode::GCodeProfile,
     gcode_preview: String,
@@ -281,6 +283,7 @@ fn open_drawing(state: &mut ViewerState, raw_path: &str) {
             state.display = display;
             state.cam = cam_model;
             state.analysis = analysis;
+            state.manual_pair = [None, None];
             state.trajectory = trajectory;
             state.gcode_preview.clear();
             state.load_version += 1;
@@ -1043,6 +1046,9 @@ fn entity_info_ui(ui: &mut egui::Ui, entity: &display::DisplayEntity, scope: &st
 
 #[derive(Default)]
 struct CamAnalysisUiAction {
+    pair_sections: Option<(cam::UnitId, cam::UnitId)>,
+    reset_pairs: bool,
+    trim_section: Option<(cam::UnitId, bool)>,
     apply_tube: Option<usize>,
     manual_tube: Option<cam_analysis::TubeSection>,
     clear_tube: bool,
@@ -1059,6 +1065,7 @@ fn cam_analysis_ui(
     analysis: &cam_analysis::CamAnalysis,
     trajectory: Option<&cam_trajectory::MachineTrajectory>,
     manual_tube: &mut cam_analysis::TubeSection,
+    manual_pair: &mut [Option<cam::UnitId>; 2],
 ) -> CamAnalysisUiAction {
     let mut action = CamAnalysisUiAction::default();
 
@@ -1211,17 +1218,73 @@ fn cam_analysis_ui(
                         "已应用加工断面 {} 个",
                         analysis.machining_sections.len()
                     ));
-                    for section in &analysis.machining_sections {
+                    for (index, section) in analysis.machining_sections.iter().enumerate() {
                         let covered = section.zone_mask.iter().filter(|value| **value).count();
                         ui.label(format!(
-                            "X {:.2}..{:.2}  绕数 {}  成员 {}  区位 {}",
+                            "断面 {} · {} · X {:.2}..{:.2}  绕数 {}  成员 {}  区位 {}",
+                            index + 1,
+                            analysis.end_cut_side(section.unit_id).label(),
                             section.x_min,
                             section.x_max,
                             section.winding,
                             section.boundary_units.len(),
                             covered
                         ));
+                        let mut trim = analysis.trim_sections.contains(&section.unit_id);
+                        if ui
+                            .checkbox(
+                                &mut trim,
+                                format!("断面 {} 仅作修边（不参与配对和壁厚补偿）", index + 1),
+                            )
+                            .changed()
+                        {
+                            action.trim_section = Some((section.unit_id, trim));
+                        }
                     }
+                    ui.separator();
+                    ui.label("手动成品段配对");
+                    for (side, selected) in manual_pair.iter_mut().enumerate() {
+                        let label = if side == 0 { "左断面" } else { "右断面" };
+                        let text = analysis
+                            .machining_sections
+                            .iter()
+                            .position(|s| Some(s.unit_id) == *selected)
+                            .map(|i| format!("断面 {}", i + 1))
+                            .unwrap_or_else(|| "请选择".to_string());
+                        egui::ComboBox::from_id_salt(("part_pair", side))
+                            .selected_text(format!("{label}：{text}"))
+                            .show_ui(ui, |ui| {
+                                for (i, s) in analysis.machining_sections.iter().enumerate() {
+                                    ui.selectable_value(
+                                        selected,
+                                        Some(s.unit_id),
+                                        format!(
+                                            "断面 {} · X {:.2}..{:.2}",
+                                            i + 1,
+                                            s.x_min,
+                                            s.x_max
+                                        ),
+                                    );
+                                }
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("应用左右配对").clicked() {
+                            if let [Some(left), Some(right)] = *manual_pair {
+                                action.pair_sections = Some((left, right));
+                            }
+                        }
+                        if ui.button("恢复自动配对").clicked() {
+                            action.reset_pairs = true;
+                        }
+                    });
+                    ui.label(
+                        "自动按轴向位置两两配对；相邻成品不共用断面。未配对断面可指定为修边。",
+                    );
+                }
+
+                for error in &analysis.grouping_errors {
+                    ui.colored_label(egui::Color32::RED, error);
                 }
 
                 if !analysis.intervals.is_empty() {
@@ -1243,7 +1306,12 @@ fn cam_analysis_ui(
                     ui.label("断面加工组");
                     for group in &analysis.groups {
                         let title = format!(
-                            "组 {} · X {:.2}..{:.2} · {} 个单元",
+                            "{} {} · X {:.2}..{:.2} · {} 个单元",
+                            if group.left_section.is_some() {
+                                "成品段"
+                            } else {
+                                "组外/修边组"
+                            },
                             group.id + 1,
                             group.x_start,
                             group.x_end,
@@ -1253,17 +1321,23 @@ fn cam_analysis_ui(
                             .id_salt(("machining_group", group.id))
                             .default_open(false)
                             .show(ui, |ui| {
-                                if let Some(section_unit) = group.section_unit {
-                                    let section_index = analysis
-                                        .machining_sections
-                                        .iter()
-                                        .position(|section| section.unit_id == section_unit);
-                                    ui.label(format!(
-                                        "组末加工断面：{}",
-                                        section_index
-                                            .map(|index| format!("#{}", index + 1))
-                                            .unwrap_or_else(|| "未编号".to_string())
-                                    ));
+                                for (label, boundary) in [
+                                    ("左端面", group.left_section),
+                                    ("右端面", group.right_section),
+                                ] {
+                                    if let Some(section_unit) = boundary {
+                                        let section_index = analysis
+                                            .machining_sections
+                                            .iter()
+                                            .position(|section| section.unit_id == section_unit);
+                                        ui.label(format!(
+                                            "{}：{}",
+                                            label,
+                                            section_index
+                                                .map(|index| format!("#{}", index + 1))
+                                                .unwrap_or_else(|| "未编号".to_string())
+                                        ));
+                                    }
                                 }
                                 for zone_group in &group.zone_groups {
                                     if zone_group.units.is_empty() {
@@ -1320,7 +1394,8 @@ fn cam_analysis_ui(
                     ui.label(
                         "框选连续编号的加工单元后，按住 Ctrl 依次点击单元，点击顺序即最终顺序。",
                     );
-                    ui.label("加工断面固定在组末，不参与排序。");
+                    ui.label("成品段顺序固定：左端面 → 各区位加工单元 → 右端面。");
+                    ui.label("左右端面固定在组首、组末；普通单元仅在两者之间排序。");
                     for plan_group in &analysis.plan.groups {
                         let title = format!(
                             "组 {} · X {:.2}..{:.2}",
@@ -1334,7 +1409,7 @@ fn cam_analysis_ui(
                             .show(ui, |ui| {
                                 for (unit_index, unit) in plan_group.units.iter().enumerate() {
                                     let kind = if unit.machining_cut {
-                                        "断面".to_string()
+                                        analysis.end_cut_side(unit.unit_id).label().to_string()
                                     } else {
                                         unit.zone.label().to_string()
                                     };
@@ -1993,10 +2068,16 @@ fn drawing_ui(
                             analysis,
                             trajectory,
                             manual_tube,
+                            manual_pair,
                             ..
                         } = &mut *state;
-                        cam_action =
-                            cam_analysis_ui(ui, analysis, trajectory.as_ref(), manual_tube);
+                        cam_action = cam_analysis_ui(
+                            ui,
+                            analysis,
+                            trajectory.as_ref(),
+                            manual_tube,
+                            manual_pair,
+                        );
                         ui.separator();
 
                         let selected_units: Vec<&cam::MachiningUnit> = state
@@ -2089,6 +2170,7 @@ fn drawing_ui(
     let feature_rect = feature_panel.response.rect;
 
     let mut cam_input_changed = false;
+    let mut pairing_error = None;
     {
         let ViewerState {
             display,
@@ -2098,6 +2180,20 @@ fn drawing_ui(
         } = &mut *state;
         if cam_action.clear_tube {
             analysis.clear_tube_section(display, cam);
+            cam_input_changed = true;
+        }
+        if cam_action.reset_pairs {
+            analysis.reset_section_pairs(display, cam);
+            cam_input_changed = true;
+        }
+        if let Some((left, right)) = cam_action.pair_sections {
+            match analysis.pair_sections(left, right, display, cam) {
+                Ok(()) => cam_input_changed = true,
+                Err(error) => pairing_error = Some(error),
+            }
+        }
+        if let Some((unit, trim)) = cam_action.trim_section {
+            analysis.set_trim_section(unit, trim, display, cam);
             cam_input_changed = true;
         }
         if let Some(index) = cam_action.apply_tube {
@@ -2137,6 +2233,9 @@ fn drawing_ui(
                 cam_input_changed = true;
             }
         }
+    }
+    if let Some(error) = pairing_error {
+        push_message(&mut state, format!("断面配对失败：{error}"));
     }
     if cam_input_changed {
         rebuild_state_trajectory(&mut state);
@@ -2515,7 +2614,13 @@ fn drawing_ui(
                                             .speed(0.1),
                                         );
                                         ui.end_row();
+                                        ui.label("方管壁厚");
+                                        ui.add(egui::DragValue::new(&mut state.gcode_profile.wall_thickness).speed(0.1));
+                                        ui.end_row();
                                     });
+                                ui.checkbox(&mut state.gcode_profile.end_cut_correction,"启用成品端面壁厚补偿（左 +X / 右 −X）");
+                                if let Some(error)=state.gcode_profile.wall_validation_error() {ui.colored_label(egui::Color32::RED,error);}
+                                ui.label("壁厚补偿仅作用于已配对端面；修边断面不补偿。刀头轨迹可能不共面。");
                                 ui.label("跨区位 Z 修正会按断面方向联动补偿 X，保持刀头轨迹形状。");
                                 ui.label(
                                     "加工规划参数会改变四轴姿态或轨迹，保存后会重新计算轨迹。",

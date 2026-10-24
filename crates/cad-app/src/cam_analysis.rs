@@ -4,7 +4,7 @@
 //! This module is intentionally independent from Bevy/egui. It consumes the
 //! display paths and machining units already produced by `display.rs` / `cam.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cam::{CamModel, UnitId};
 use crate::display::DisplayData;
@@ -399,14 +399,33 @@ pub struct ZoneUnitGroup {
     pub units: Vec<UnitId>,
 }
 
-/// A group delimited by machining cuts. Machining reaches `section_unit` at the
-/// end of the group; everything before it is then released.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndCutSide {
+    #[default]
+    Section,
+    Left,
+    Right,
+}
+
+impl EndCutSide {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Section => "未配对/修边断面",
+            Self::Left => "左端面（+X 修正）",
+            Self::Right => "右端面（−X 修正）",
+        }
+    }
+}
+
+/// A finished part has two boundaries. Units outside paired parts stay visible
+/// in a separate group rather than being silently attached to a cut.
 #[derive(Clone, Debug)]
 pub struct MachiningGroup {
     pub id: u32,
     pub x_start: f64,
     pub x_end: f64,
-    pub section_unit: Option<UnitId>,
+    pub left_section: Option<UnitId>,
+    pub right_section: Option<UnitId>,
     pub units: Vec<UnitId>,
     pub zone_groups: Vec<ZoneUnitGroup>,
 }
@@ -472,6 +491,9 @@ pub struct CamAnalysis {
     pub lazy_rotation: bool,
     pub rotation_direction: RotationDirection,
     pub machine_start: [f64; 3],
+    pub section_pairs: Vec<(UnitId, UnitId)>,
+    pub trim_sections: BTreeSet<UnitId>,
+    pub grouping_errors: Vec<String>,
 }
 
 impl Default for CamAnalysis {
@@ -488,11 +510,81 @@ impl Default for CamAnalysis {
             lazy_rotation: true,
             rotation_direction: RotationDirection::CounterClockwise,
             machine_start: [0.0; 3],
+            section_pairs: Vec::new(),
+            trim_sections: BTreeSet::new(),
+            grouping_errors: Vec::new(),
         }
     }
 }
 
 impl CamAnalysis {
+    pub fn end_cut_side(&self, unit: UnitId) -> EndCutSide {
+        for group in &self.groups {
+            if group.left_section.is_some() && group.right_section.is_some() {
+                if group.left_section == Some(unit) {
+                    return EndCutSide::Left;
+                }
+                if group.right_section == Some(unit) {
+                    return EndCutSide::Right;
+                }
+            }
+        }
+        EndCutSide::Section
+    }
+
+    pub fn pair_sections(
+        &mut self,
+        left: UnitId,
+        right: UnitId,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) -> Result<(), String> {
+        if left == right
+            || ![left, right]
+                .iter()
+                .all(|id| self.machining_sections.iter().any(|s| s.unit_id == *id))
+        {
+            return Err("请选择两个不同的加工断面".to_string());
+        }
+        let l = ordered_unit_points(display, cam, left).ok_or("左断面路径不完整")?;
+        let r = ordered_unit_points(display, cam, right).ok_or("右断面路径不完整")?;
+        check_boundary_pair(&l, &r)?;
+        self.section_pairs
+            .retain(|(a, b)| ![left, right].contains(a) && ![left, right].contains(b));
+        self.section_pairs.push((left, right));
+        self.trim_sections.remove(&left);
+        self.trim_sections.remove(&right);
+        self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
+        self.rebuild_plan(display, cam);
+        Ok(())
+    }
+
+    pub fn reset_section_pairs(&mut self, display: &DisplayData, cam: &CamModel) {
+        self.section_pairs.clear();
+        self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
+        self.rebuild_plan(display, cam);
+    }
+
+    pub fn set_trim_section(
+        &mut self,
+        unit: UnitId,
+        trim: bool,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) {
+        if trim {
+            self.trim_sections.insert(unit);
+        } else {
+            self.trim_sections.remove(&unit);
+        }
+        self.section_pairs.retain(|(l, r)| *l != unit && *r != unit);
+        self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
+        self.rebuild_plan(display, cam);
+    }
+
     pub fn set_machine_start(&mut self, display: &DisplayData, cam: &CamModel, start: [f64; 3]) {
         if self.machine_start != start {
             self.machine_start = start;
@@ -557,8 +649,8 @@ impl CamAnalysis {
                 .partial_cmp(&right.x_min)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
         self.rebuild_plan(display, cam);
     }
 
@@ -604,8 +696,8 @@ impl CamAnalysis {
                 .partial_cmp(&right.x_min)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
         self.rebuild_plan(display, cam);
         true
     }
@@ -623,8 +715,8 @@ impl CamAnalysis {
         if self.machining_sections.len() == before {
             return false;
         }
-        self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
         self.rebuild_plan(display, cam);
         true
     }
@@ -639,6 +731,9 @@ impl CamAnalysis {
     fn rebuild_without_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
         self.machining_candidates.clear();
         self.machining_sections.clear();
+        self.section_pairs.clear();
+        self.trim_sections.clear();
+        self.grouping_errors.clear();
         self.zone_profiles.clear();
         self.intervals.clear();
         self.groups.clear();
@@ -702,7 +797,8 @@ impl CamAnalysis {
             id: 0,
             x_start,
             x_end,
-            section_unit: None,
+            left_section: None,
+            right_section: None,
             units: unit_ids.clone(),
             zone_groups: Vec::new(),
         });
@@ -770,117 +866,194 @@ impl CamAnalysis {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         self.zone_profiles = classify_units(display, cam, &section);
-        self.rebuild_intervals(display, cam);
         self.rebuild_groups(display, cam);
+        self.rebuild_intervals();
         self.rebuild_plan(display, cam);
     }
 
-    fn rebuild_intervals(&mut self, display: &DisplayData, cam: &CamModel) {
-        self.intervals.clear();
-        let Some(bounds) = display.bounds else {
-            return;
-        };
-        let mut boundaries: Vec<f64> = self
-            .machining_sections
+    fn rebuild_intervals(&mut self) {
+        self.intervals = self
+            .groups
             .iter()
-            .map(|section| section.x_min)
+            .map(|group| MachiningInterval {
+                id: group.id,
+                x_start: group.x_start,
+                x_end: group.x_end,
+                units: group
+                    .units
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.machining_sections.iter().any(|s| s.unit_id == *id))
+                    .collect(),
+            })
             .collect();
-        boundaries
-            .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-        boundaries.dedup_by(|left, right| (*left - *right).abs() <= JOIN_TOLERANCE);
-
-        let section_units: std::collections::BTreeSet<UnitId> = self
-            .machining_sections
-            .iter()
-            .map(|section| section.unit_id)
-            .collect();
-
-        let mut edges = Vec::with_capacity(boundaries.len() + 2);
-        edges.push(bounds.min_x);
-        edges.extend(boundaries);
-        edges.push(bounds.max_x);
-
-        let mut intervals = Vec::new();
-        for index in 0..edges.len().saturating_sub(1) {
-            let x_start = edges[index];
-            let x_end = edges[index + 1];
-            if x_end - x_start <= JOIN_TOLERANCE {
-                continue;
-            }
-            let units = cam
-                .units
-                .iter()
-                .filter(|unit| !section_units.contains(&unit.id))
-                .filter(|unit| {
-                    unit_x_center(display, cam, unit.id)
-                        .map(|x| x > x_start && x <= x_end)
-                        .unwrap_or(false)
-                })
-                .map(|unit| unit.id)
-                .collect();
-            intervals.push(MachiningInterval {
-                id: intervals.len() as u32,
-                x_start,
-                x_end,
-                units,
-            });
-        }
-        self.intervals = intervals;
     }
 
     fn rebuild_groups(&mut self, display: &DisplayData, cam: &CamModel) {
         self.groups.clear();
-        let Some(bounds) = display.bounds else {
-            return;
-        };
-
-        let mut sections: Vec<(f64, UnitId)> = self
+        self.grouping_errors.clear();
+        let ids: BTreeSet<_> = self.machining_sections.iter().map(|s| s.unit_id).collect();
+        self.trim_sections.retain(|id| ids.contains(id));
+        self.section_pairs.retain(|(l, r)| {
+            ids.contains(l)
+                && ids.contains(r)
+                && !self.trim_sections.contains(l)
+                && !self.trim_sections.contains(r)
+        });
+        let paths: BTreeMap<_, _> = ids
+            .iter()
+            .filter_map(|id| ordered_unit_points(display, cam, *id).map(|p| (*id, p)))
+            .collect();
+        for id in &ids {
+            if !paths.contains_key(id) {
+                self.grouping_errors
+                    .push(format!("断面 #{:08X} 的路径不完整", id.0));
+            }
+        }
+        let paired: BTreeSet<_> = self
+            .section_pairs
+            .iter()
+            .flat_map(|(l, r)| [*l, *r])
+            .collect();
+        let mut automatic: Vec<_> = self
             .machining_sections
             .iter()
-            .map(|section| (section.x_min, section.unit_id))
+            .filter(|s| !paired.contains(&s.unit_id) && !self.trim_sections.contains(&s.unit_id))
+            .map(|s| s.unit_id)
             .collect();
-        sections.sort_by(|left, right| {
-            left.0
-                .partial_cmp(&right.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        automatic.sort_by(|l, r| {
+            unit_x_center(display, cam, *l)
+                .unwrap_or(0.0)
+                .total_cmp(&unit_x_center(display, cam, *r).unwrap_or(0.0))
+                .then_with(|| l.cmp(r))
         });
-        sections.dedup_by(|left, right| (left.0 - right.0).abs() <= JOIN_TOLERANCE);
-
-        let section_units: std::collections::BTreeSet<UnitId> =
-            sections.iter().map(|(_, unit_id)| *unit_id).collect();
-
-        let mut edges = Vec::with_capacity(sections.len() + 2);
-        edges.push(bounds.min_x);
-        edges.extend(sections.iter().map(|(x, _)| *x));
-        edges.push(bounds.max_x);
-
-        let mut groups = Vec::new();
-        for index in 0..edges.len().saturating_sub(1) {
-            let x_start = edges[index];
-            let x_end = edges[index + 1];
-            let section_unit = sections.get(index).map(|(_, unit_id)| *unit_id);
-
-            let mut units: Vec<UnitId> = cam
-                .units
-                .iter()
-                .filter(|unit| !section_units.contains(&unit.id))
-                .filter(|unit| {
-                    unit_x_center(display, cam, unit.id)
-                        .map(|x| x > x_start - JOIN_TOLERANCE && x <= x_end + JOIN_TOLERANCE)
-                        .unwrap_or(false)
-                })
-                .map(|unit| unit.id)
-                .collect();
-            if let Some(section_unit) = section_unit {
-                units.push(section_unit);
-            }
-            if units.is_empty() && section_unit.is_none() {
+        let mut pairs = self.section_pairs.clone();
+        pairs.extend(automatic.chunks_exact(2).map(|p| (p[0], p[1])));
+        pairs.sort_by(|(l, _), (r, _)| {
+            unit_x_center(display, cam, *l)
+                .unwrap_or(0.0)
+                .total_cmp(&unit_x_center(display, cam, *r).unwrap_or(0.0))
+        });
+        for (left, right) in pairs {
+            let (Some(l), Some(r)) = (paths.get(&left), paths.get(&right)) else {
                 continue;
+            };
+            if let Err(error) = check_boundary_pair(l, r) {
+                self.grouping_errors.push(format!(
+                    "断面 #{:08X}/#{:08X} 无法组成成品段：{error}",
+                    left.0, right.0
+                ));
             }
-            units.sort_unstable();
-            units.dedup();
-
-            let mut zone_groups: Vec<ZoneUnitGroup> = TubeZone::ALL
+            self.groups.push(MachiningGroup {
+                id: self.groups.len() as u32,
+                x_start: l.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min),
+                x_end: r.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max),
+                left_section: Some(left),
+                right_section: Some(right),
+                units: vec![left, right],
+                zone_groups: Vec::new(),
+            });
+        }
+        for i in 0..self.groups.len() {
+            for j in 0..i {
+                let (a, b) = (&self.groups[i], &self.groups[j]);
+                let (al, ar, bl, br) = (
+                    &paths[&a.left_section.unwrap()],
+                    &paths[&a.right_section.unwrap()],
+                    &paths[&b.left_section.unwrap()],
+                    &paths[&b.right_section.unwrap()],
+                );
+                if al.iter().chain(ar).chain(bl).chain(br).any(|p| {
+                    let y = p[1];
+                    let z = p[2];
+                    match (
+                        boundary_x_at(al, y, z),
+                        boundary_x_at(ar, y, z),
+                        boundary_x_at(bl, y, z),
+                        boundary_x_at(br, y, z),
+                    ) {
+                        (Some(a), Some(b), Some(c), Some(d)) => {
+                            b.min(d) - a.max(c) > JOIN_TOLERANCE
+                        }
+                        _ => false,
+                    }
+                }) {
+                    self.grouping_errors.push(format!(
+                        "成品组 {} 与 {} 重叠，不支持自动共切",
+                        j + 1,
+                        i + 1
+                    ));
+                }
+            }
+        }
+        let mut loose: Vec<_> = ids
+            .iter()
+            .filter(|id| !self.groups.iter().any(|g| g.units.contains(id)))
+            .copied()
+            .collect();
+        for unit in cam.units.iter().filter(|u| !ids.contains(&u.id)) {
+            let Some(points) = ordered_unit_points(display, cam, unit.id) else {
+                self.grouping_errors
+                    .push(format!("加工单元 #{:08X} 的路径不完整", unit.id.0));
+                loose.push(unit.id);
+                continue;
+            };
+            let mut owners = Vec::new();
+            let mut partial = false;
+            for group in &self.groups {
+                let (l, r) = (
+                    &paths[&group.left_section.unwrap()],
+                    &paths[&group.right_section.unwrap()],
+                );
+                let inside: Vec<_> = points
+                    .iter()
+                    .map(
+                        |p| match (boundary_x_at(l, p[1], p[2]), boundary_x_at(r, p[1], p[2])) {
+                            (Some(l), Some(r)) => {
+                                p[0] >= l - JOIN_TOLERANCE && p[0] <= r + JOIN_TOLERANCE
+                            }
+                            _ => false,
+                        },
+                    )
+                    .collect();
+                if !inside.is_empty() && inside.iter().all(|v| *v) {
+                    owners.push(group.id as usize);
+                } else if inside.iter().any(|v| *v) {
+                    partial = true;
+                }
+            }
+            if owners.len() == 1 && !partial {
+                self.groups[owners[0]].units.push(unit.id);
+            } else {
+                if partial || owners.len() > 1 {
+                    self.grouping_errors.push(format!(
+                        "加工单元 #{:08X} 跨越成品边界或归属不唯一",
+                        unit.id.0
+                    ));
+                }
+                loose.push(unit.id);
+            }
+        }
+        if !loose.is_empty() {
+            let bounds = loose
+                .iter()
+                .filter_map(|id| unit_x_bounds(display, cam, *id))
+                .collect::<Vec<_>>();
+            self.groups.push(MachiningGroup {
+                id: self.groups.len() as u32,
+                x_start: bounds.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min),
+                x_end: bounds
+                    .iter()
+                    .map(|(_, x)| *x)
+                    .fold(f64::NEG_INFINITY, f64::max),
+                left_section: None,
+                right_section: None,
+                units: loose,
+                zone_groups: Vec::new(),
+            });
+        }
+        for group in &mut self.groups {
+            group.zone_groups = TubeZone::ALL
                 .iter()
                 .copied()
                 .map(|zone| ZoneUnitGroup {
@@ -888,25 +1061,15 @@ impl CamAnalysis {
                     units: Vec::new(),
                 })
                 .collect();
-            for unit_id in &units {
+            for id in &group.units {
                 let zone = self
                     .zone_profiles
-                    .get(unit_id)
-                    .and_then(|profile| profile.owner_zone)
+                    .get(id)
+                    .and_then(|p| p.owner_zone)
                     .unwrap_or(TubeZone::TopFace);
-                zone_groups[zone.index()].units.push(*unit_id);
+                group.zone_groups[zone.index()].units.push(*id);
             }
-
-            groups.push(MachiningGroup {
-                id: groups.len() as u32,
-                x_start,
-                x_end,
-                section_unit,
-                units,
-                zone_groups,
-            });
         }
-        self.groups = groups;
     }
 
     fn rebuild_plan(&mut self, display: &DisplayData, cam: &CamModel) {
@@ -916,7 +1079,12 @@ impl CamAnalysis {
         }
         self.plan.groups.clear();
         let mut next_order = 1u32;
-        for group in &self.groups {
+        for group in self
+            .groups
+            .iter()
+            .filter(|g| g.left_section.is_none())
+            .chain(self.groups.iter().filter(|g| g.left_section.is_some()))
+        {
             let mut planned = Vec::new();
             if self.lazy_rotation {
                 for zone in ordered_zones(self.rotation_direction) {
@@ -931,7 +1099,7 @@ impl CamAnalysis {
                             .then_with(|| left.cmp(right))
                     });
                     for unit_id in units {
-                        if group.section_unit == Some(unit_id) {
+                        if self.machining_sections.iter().any(|s| s.unit_id == unit_id) {
                             continue;
                         }
                         planned.push(PlanUnit {
@@ -950,7 +1118,11 @@ impl CamAnalysis {
                 let mut units: Vec<(UnitId, TubeZone)> = Vec::new();
                 for zone_group in &group.zone_groups {
                     for unit_id in &zone_group.units {
-                        if group.section_unit != Some(*unit_id) {
+                        if !self
+                            .machining_sections
+                            .iter()
+                            .any(|s| s.unit_id == *unit_id)
+                        {
                             units.push((*unit_id, zone_group.zone));
                         }
                     }
@@ -985,13 +1157,24 @@ impl CamAnalysis {
                 }
             }
 
-            if let Some(section_unit) = group.section_unit {
+            let cuts = if let (Some(left), Some(right)) = (group.left_section, group.right_section)
+            {
+                vec![left, right]
+            } else {
+                group
+                    .units
+                    .iter()
+                    .copied()
+                    .filter(|id| self.machining_sections.iter().any(|s| s.unit_id == *id))
+                    .collect()
+            };
+            for section_unit in cuts {
                 let zone = self
                     .zone_profiles
                     .get(&section_unit)
                     .and_then(|profile| profile.owner_zone)
                     .unwrap_or(TubeZone::TopFace);
-                planned.push(PlanUnit {
+                let cut = PlanUnit {
                     unit_id: section_unit,
                     zone,
                     order: next_order,
@@ -999,7 +1182,12 @@ impl CamAnalysis {
                     direction: UnitDirection::Forward,
                     start_point: [0.0; 3],
                     end_point: [0.0; 3],
-                });
+                };
+                if group.left_section == Some(section_unit) {
+                    planned.insert(0, cut);
+                } else {
+                    planned.push(cut);
+                }
                 next_order += 1;
             }
 
@@ -1072,6 +1260,11 @@ impl CamAnalysis {
         from: usize,
         to: usize,
     ) -> bool {
+        let left_section = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.left_section);
         let Some(group) = self
             .plan
             .groups
@@ -1088,8 +1281,22 @@ impl CamAnalysis {
             return false;
         }
         let unit = group.units.remove(from);
-        let section_count = group.units.iter().filter(|unit| unit.machining_cut).count();
-        let insert = to.min(group.units.len().saturating_sub(section_count));
+        let first = usize::from(
+            left_section.is_some()
+                && group
+                    .units
+                    .first()
+                    .is_some_and(|u| Some(u.unit_id) == left_section),
+        );
+        let last = group
+            .units
+            .iter()
+            .enumerate()
+            .skip(first)
+            .find(|(_, u)| u.machining_cut)
+            .map(|(i, _)| i)
+            .unwrap_or(group.units.len());
+        let insert = to.clamp(first, last);
         group.units.insert(insert, unit);
 
         self.refresh_plan_entries(display, cam);
@@ -1097,12 +1304,20 @@ impl CamAnalysis {
     }
 
     fn refresh_plan_entries(&mut self, display: &DisplayData, cam: &CamModel) {
-        let first_section_id = self.groups.iter().find_map(|group| group.section_unit);
-        let last_section_id = self
+        let first_section_id = self
+            .plan
             .groups
             .iter()
-            .rev()
-            .find_map(|group| group.section_unit);
+            .flat_map(|g| &g.units)
+            .find(|u| u.machining_cut)
+            .map(|u| u.unit_id);
+        let last_section_id = self
+            .plan
+            .groups
+            .iter()
+            .flat_map(|g| &g.units)
+            .rfind(|u| u.machining_cut)
+            .map(|u| u.unit_id);
         let mut previous_end = None;
         let mut previous_direction = None;
         let mut previous_zone = None;
@@ -1157,6 +1372,43 @@ impl CamAnalysis {
             }
         }
     }
+}
+
+pub fn boundary_x_at(path: &[[f64; 3]], y: f64, z: f64) -> Option<f64> {
+    if path.len() < 2 {
+        return None;
+    }
+    let mut best = None;
+    for i in 0..path.len() {
+        let (a, b) = (path[i], path[(i + 1) % path.len()]);
+        let (dy, dz) = (b[1] - a[1], b[2] - a[2]);
+        let length = dy * dy + dz * dz;
+        if length <= 1.0e-18 {
+            continue;
+        }
+        let t = (((y - a[1]) * dy + (z - a[2]) * dz) / length).clamp(0.0, 1.0);
+        let distance = (y - a[1] - t * dy).hypot(z - a[2] - t * dz);
+        if best.is_none_or(|(d, _)| distance < d) {
+            best = Some((distance, a[0] + t * (b[0] - a[0])));
+        }
+    }
+    best.map(|(_, x)| x)
+}
+
+pub fn check_boundary_pair(left: &[[f64; 3]], right: &[[f64; 3]]) -> Result<(), String> {
+    if left.len() < 3 || right.len() < 3 {
+        return Err("断面采样不足".to_string());
+    }
+    for p in left.iter().chain(right) {
+        match (
+            boundary_x_at(left, p[1], p[2]),
+            boundary_x_at(right, p[1], p[2]),
+        ) {
+            (Some(l), Some(r)) if l.is_finite() && r.is_finite() && r - l > JOIN_TOLERANCE => {}
+            _ => return Err("左右断面顺序颠倒、相交或间距不足".to_string()),
+        }
+    }
+    Ok(())
 }
 
 pub fn detect_tube_candidates(display: &DisplayData, cam: &CamModel) -> Vec<TubeCandidate> {

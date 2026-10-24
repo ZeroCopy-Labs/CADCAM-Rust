@@ -5,10 +5,12 @@
 //! validated machine post-processor.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::cam::CamModel;
 use crate::cam_analysis::{
-    oriented_unit_path, oriented_unit_path_from, CamAnalysis, TubeSection, TubeZone,
+    check_boundary_pair, oriented_unit_path, oriented_unit_path_from, CamAnalysis, EndCutSide,
+    TubeSection, TubeZone,
 };
 use crate::display::DisplayData;
 
@@ -80,6 +82,8 @@ impl TransferConfig {
 pub struct RotaryConfig {
     pub a_offset_degrees: f64,
     pub machining_z_offset: f64,
+    pub wall_thickness: f64,
+    pub end_cut_correction: bool,
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub transfer: TransferConfig,
@@ -95,6 +99,8 @@ impl Default for RotaryConfig {
         Self {
             a_offset_degrees: 0.0,
             machining_z_offset: 0.0,
+            wall_thickness: 0.0,
+            end_cut_correction: false,
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             transfer: TransferConfig::default(),
@@ -179,14 +185,42 @@ pub fn build_trajectory(
     analysis: &CamAnalysis,
     config: RotaryConfig,
 ) -> MachineTrajectory {
+    if let Some(error) = analysis.grouping_errors.first() {
+        return MachineTrajectory {
+            error: Some(error.clone()),
+            ..Default::default()
+        };
+    }
+    if !config.wall_thickness.is_finite()
+        || config.wall_thickness < 0.0
+        || (config.end_cut_correction && config.wall_thickness <= 0.0)
+    {
+        return MachineTrajectory {
+            error: Some("壁厚必须为有限非负值，开启端面补偿时必须大于零".to_string()),
+            ..Default::default()
+        };
+    }
     if !valid_config(config) {
         return MachineTrajectory::default();
     }
     let Some(section) = &analysis.tube_section else {
+        if config.end_cut_correction {
+            return MachineTrajectory {
+                error: Some("壁厚端面补偿需要有效的方管截面和配对断面".to_string()),
+                ..Default::default()
+            };
+        }
         return build_without_tube_section(display, cam, analysis, config);
     };
     if !valid_section(section) {
         return MachineTrajectory::default();
+    }
+    if config.end_cut_correction && config.wall_thickness >= section.half_y().min(section.half_z())
+    {
+        return MachineTrajectory {
+            error: Some("壁厚达到半截面尺寸，内腔无效".to_string()),
+            ..Default::default()
+        };
     }
     let Some(bounds) = display.bounds else {
         return MachineTrajectory::default();
@@ -228,9 +262,25 @@ pub fn build_trajectory(
     let mut unit_count = 0usize;
     let mut previous_end = config.initial_position;
     let mut previous_surface: Option<TubeZone> = None;
+    let mut corrected_sections = BTreeMap::new();
 
     for group in &analysis.plan.groups {
         for unit in &group.units {
+            let side = analysis.end_cut_side(unit.unit_id);
+            let wall_cut = config.end_cut_correction && side != EndCutSide::Section;
+            if config.end_cut_correction
+                && unit.machining_cut
+                && side == EndCutSide::Section
+                && !analysis.trim_sections.contains(&unit.unit_id)
+            {
+                return MachineTrajectory {
+                    error: Some(format!(
+                        "断面单元 {} 尚未配对，请配对或显式标记为修边",
+                        unit.order
+                    )),
+                    ..Default::default()
+                };
+            }
             let Some(mut path) = oriented_unit_path_from(
                 display,
                 cam,
@@ -327,10 +377,12 @@ pub fn build_trajectory(
                 poses.push(pose);
                 previous_a = aligned;
             }
-            if config.machining_z_offset != 0.0
-                && poses
-                    .iter()
-                    .any(|pose| (pose.a - poses[0].a).abs() > 1.0e-9)
+            let mut cut_slopes = None;
+            if wall_cut
+                || (config.machining_z_offset != 0.0
+                    && poses
+                        .iter()
+                        .any(|pose| (pose.a - poses[0].a).abs() > 1.0e-9))
             {
                 let source = &path[..source_point_count];
                 let direction = if unit.machining_cut {
@@ -350,10 +402,60 @@ pub fn build_trajectory(
                         }
                     }
                 };
+                cut_slopes = Some([y_slope, z_slope]);
                 for pose in &mut poses {
                     let (sin, cos) = pose.a.to_radians().sin_cos();
                     // In workpiece coordinates the machine-Z offset is (dY, dZ) = h*(sin A, cos A).
                     pose.x += config.machining_z_offset * (y_slope * sin + z_slope * cos);
+                }
+            }
+            if wall_cut {
+                // Correct only geometric samples; extend the resulting cutting tangent for overcut.
+                for (source, pose) in path.iter().zip(&mut poses).take(source_point_count) {
+                    match crate::cam_wall::end_cut_allowance(
+                        section,
+                        config.wall_thickness,
+                        *source,
+                        [pose.x, pose.y, pose.z, pose.a],
+                        cut_slopes.unwrap(),
+                        side,
+                    ) {
+                        Ok(extra) => pose.x += extra,
+                        Err(error) => {
+                            return MachineTrajectory {
+                                error: Some(format!(
+                                    "加工单元 {} 的壁厚补偿失败：{error}",
+                                    unit.order
+                                )),
+                                ..Default::default()
+                            }
+                        }
+                    }
+                }
+                corrected_sections.insert(
+                    unit.unit_id,
+                    path.iter()
+                        .zip(&poses)
+                        .take(source_point_count)
+                        .map(|(p, m)| [m.x, p[1], p[2]])
+                        .collect::<Vec<_>>(),
+                );
+                if poses.len() > source_point_count {
+                    let start = poses[0];
+                    let next = poses[1];
+                    let end = poses[source_point_count - 1];
+                    let length = distance3(
+                        [start.x, path[0][1], path[0][2]],
+                        [next.x, path[1][1], path[1][2]],
+                    );
+                    if length > 1.0e-9 {
+                        poses[source_point_count] = MachinePose {
+                            x: end.x + (next.x - start.x) / length * config.overcut_distance,
+                            y: end.y + (next.y - start.y) / length * config.overcut_distance,
+                            z: end.z + (next.z - start.z) / length * config.overcut_distance,
+                            a: end.a + (next.a - start.a) / length * config.overcut_distance,
+                        };
+                    }
                 }
             }
             if poses.iter().any(|pose| !finite_pose(*pose)) {
@@ -461,6 +563,28 @@ pub fn build_trajectory(
             previous_end = moves.last().map(|movement| movement.pose);
             previous_surface = surface;
             unit_count += 1;
+        }
+    }
+
+    if config.end_cut_correction {
+        for group in &analysis.groups {
+            if let (Some(left), Some(right)) = (group.left_section, group.right_section) {
+                let (Some(l), Some(r)) = (
+                    corrected_sections.get(&left),
+                    corrected_sections.get(&right),
+                ) else {
+                    return MachineTrajectory {
+                        error: Some("成品段的端面轨迹不完整".to_string()),
+                        ..Default::default()
+                    };
+                };
+                if let Err(error) = check_boundary_pair(l, r) {
+                    return MachineTrajectory {
+                        error: Some(format!("成品组 {} 补偿后空间不足：{error}", group.id + 1)),
+                        ..Default::default()
+                    };
+                }
+            }
         }
     }
 

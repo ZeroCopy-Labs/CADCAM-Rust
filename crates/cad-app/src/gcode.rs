@@ -38,6 +38,8 @@ pub struct GCodeProfile {
     pub arc_tolerance: f64,
     pub a_offset_degrees: f64,
     pub machining_z_offset: f64,
+    pub wall_thickness: f64,
+    pub end_cut_correction: bool,
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub transfer: crate::cam_trajectory::TransferConfig,
@@ -84,6 +86,8 @@ impl Default for GCodeProfile {
             arc_tolerance: 0.1,
             a_offset_degrees: 0.0,
             machining_z_offset: 0.0,
+            wall_thickness: 0.0,
+            end_cut_correction: false,
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             transfer: crate::cam_trajectory::TransferConfig::default(),
@@ -103,6 +107,16 @@ impl Default for GCodeProfile {
 }
 
 impl GCodeProfile {
+    pub fn wall_validation_error(&self) -> Option<&'static str> {
+        if !self.wall_thickness.is_finite()
+            || self.wall_thickness < 0.0
+            || (self.end_cut_correction && self.wall_thickness <= 0.0)
+        {
+            Some("壁厚必须为有限非负值，开启端面补偿时必须大于零")
+        } else {
+            None
+        }
+    }
     pub fn a_validation_error(&self) -> Option<&'static str> {
         if !self.a_offset_degrees.is_finite() {
             return Some("A 轴偏移必须是有限数值");
@@ -117,6 +131,8 @@ impl GCodeProfile {
         crate::cam_trajectory::RotaryConfig {
             a_offset_degrees: self.a_offset_degrees,
             machining_z_offset: self.machining_z_offset,
+            wall_thickness: self.wall_thickness,
+            end_cut_correction: self.end_cut_correction,
             rotation_safety_clearance: self.rotation_safety_clearance,
             same_zone_clearance: self.same_zone_clearance,
             transfer: self.transfer,
@@ -144,6 +160,9 @@ impl GCodeProfile {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(error) = self.wall_validation_error() {
+            return Err(error.to_string());
+        }
         if let Some(error) = self.a_validation_error() {
             return Err(error.to_string());
         }
@@ -227,6 +246,9 @@ pub fn render_gcode(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> S
 
 pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfile) -> Vec<String> {
     let mut issues = Vec::new();
+    if let Some(error) = profile.wall_validation_error() {
+        issues.push(error.to_string());
+    }
     if let Some(error) = &trajectory.error {
         issues.push(error.clone());
     }
