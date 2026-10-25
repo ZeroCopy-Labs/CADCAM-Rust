@@ -389,11 +389,29 @@ fn submit_command(
     } else {
         cad_input::canonical(&upper).to_string()
     };
-    if matches!(upper.as_str(), "CANCEL" | "取消") {
+    let keep_drawing =
+        matches!(upper.as_str(), "CANCEL" | "取消") && state.cad_command.finish_on_cancel();
+    if matches!(upper.as_str(), "CANCEL" | "取消" | "DISCARD") && !keep_drawing {
+        let active = state.cad_command.is_active();
+        let had_input = !state.command_input.is_empty();
         state.cad_command.cancel();
         state.dynamic_input.reset_fields();
         state.command_input.clear();
-        push_message(state, "已取消命令，图纸未改动");
+        if !active && !had_input {
+            selection.selected.clear();
+            selection.cam_selected.clear();
+        }
+        selection.drag_start = None;
+        selection.drag_current = None;
+        selection.reorder_clicks = None;
+        push_message(
+            state,
+            if active || had_input {
+                "已取消未确认操作"
+            } else {
+                "已清除选择"
+            },
+        );
         return;
     }
     if mode != SpaceMode::Cad {
@@ -405,7 +423,9 @@ fn submit_command(
         return;
     }
     let was_active = state.cad_command.is_active();
-    let result = if was_active {
+    let result = if keep_drawing {
+        state.cad_command.input("", &selection.selected)
+    } else if was_active {
         state.cad_command.input(command, &selection.selected)
     } else {
         match upper.as_str() {
@@ -435,9 +455,10 @@ fn submit_command(
                 Ok(None)
             }
             "ERASE" | "E" => {
-                if selection.selected.is_empty() { Err("请先选择要删除的图元".into()) }
-                else { apply_cad_action(state, selection, cad_edit::EditAction::Apply(DrawingEdit::Delete)); Ok(None) }
+                if selection.selected.is_empty() { state.cad_command.begin_erase(); Ok(None) }
+                else { Ok(Some(cad_command::CommandCommit::Delete(selection.selected.clone()))) }
             }
+            "UCS" => { state.cad_command.begin_plane_select(); Ok(None) }
             "" => return,
             "PASTE"=>{
                 if let Some(data)=state.clipboard.clone(){state.cad_command.begin_paste(data.items,data.base);Ok(None)}
@@ -458,12 +479,19 @@ fn submit_command(
         }
     };
     if result.is_ok() {
+        if !was_active && !matches!(upper.as_str(), "UNDO" | "U" | "撤销" | "REDO" | "重做") {
+            state.cad_command.last_command = command.to_string();
+        }
         state.dynamic_input.reset_fields();
         state.command_input.clear();
     }
     match result {
         Ok(Some(commit)) => {
             let action = match commit {
+                cad_command::CommandCommit::Delete(ids) => {
+                    selection.selected = ids;
+                    cad_edit::EditAction::Apply(DrawingEdit::Delete)
+                }
                 cad_command::CommandCommit::Report(message) => {
                     state.cad_command.last_measurement = message.clone();
                     state.cad_command.cancel();
@@ -523,17 +551,25 @@ fn submit_command(
             if apply_cad_action(state, selection, action) {
                 state.cad_command.cancel();
             } else {
-                state.cad_command.error = "操作未提交，请调整参数或取消".into();
+                state.cad_command.error = if state.cad_command.continuous_drawing() {
+                    "操作未提交；可重试，或右键放弃整次绘图"
+                } else {
+                    "操作未提交，请调整参数或取消"
+                }
+                .into();
             }
         }
         Ok(None) => {
-            if !was_active && !matches!(upper.as_str(), "UNDO" | "U" | "撤销" | "REDO" | "重做")
-            {
-                state.cad_command.last_command = command.to_string();
-            }
             state.cad_command.error.clear();
             if !state.cad_command.is_active() && (was_active || upper.starts_with("UCS ")) {
-                push_message(state, "工作平面已设置，图元坐标保持不变");
+                push_message(
+                    state,
+                    if upper.starts_with("UCS ") {
+                        "工作平面已设置，图元坐标保持不变"
+                    } else {
+                        "命令已结束"
+                    },
+                );
             }
         }
         Err(error) => {
@@ -556,6 +592,7 @@ fn orbit_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     ui_state: Res<UiState>,
+    window: Single<&Window, With<PrimaryWindow>>,
     mut rig: ResMut<CameraRig>,
 ) {
     if ui_state.pointer_over_ui {
@@ -585,7 +622,23 @@ fn orbit_camera(
     // Middle mouse wheel: zoom the orthographic projection.
     let wheel = scroll.delta.y;
     if wheel != 0.0 {
-        rig.ortho_scale = (rig.ortho_scale * (-wheel * 0.12).exp()).clamp(1.0e-5, 1.0e7);
+        let old = rig.ortho_scale;
+        let new = (old * (-wheel * 0.12).exp()).clamp(1.0e-5, 1.0e7);
+        if let Some((cursor, rect)) = window
+            .cursor_position()
+            .zip(ui_state.canvas_rect)
+            .filter(|(p, r)| r.contains(egui::pos2(p.x, p.y)))
+        {
+            let forward = -rig.direction();
+            let right = forward.cross(Vec3::Y).normalize_or_zero();
+            let up = right.cross(forward).normalize_or_zero();
+            let offset = cursor - Vec2::new(rect.center().x, rect.center().y);
+            let delta = (right * offset.x - up * offset.y) * (old - new);
+            rig.target[0] += delta.x as f64;
+            rig.target[1] -= delta.z as f64;
+            rig.target[2] += delta.y as f64;
+        }
+        rig.ortho_scale = new;
     }
 }
 
@@ -964,7 +1017,7 @@ fn draw_scene(
     state.performance.record("绘制 CPU 提交", drawing_started);
 }
 
-/// Mouse selection: click picking, Shift+click add, and AutoCAD-style
+/// CAD selection: click to add, Shift+click remove, and AutoCAD-style
 /// left-to-right window / right-to-left crossing box selection.
 fn selection_input(
     mut contexts: EguiContexts,
@@ -1044,6 +1097,7 @@ fn selection_input(
     if space.mode == SpaceMode::Cad
         && !state.cad_command.is_active()
         && mouse.just_pressed(MouseButton::Left)
+        && !keys.any_pressed([KeyCode::ShiftLeft,KeyCode::ShiftRight,KeyCode::AltLeft,KeyCode::AltRight,KeyCode::ControlLeft,KeyCode::ControlRight])
     {
         if let Some((id, geometry, kind)) =
             pick_grip(&state, &selection, camera, camera_transform, cursor)
@@ -1102,7 +1156,9 @@ fn selection_input(
             state.command_input.clear();
             state.dynamic_input.reset_fields();
             state.dynamic_input.request_focus();
-            if !state.cad_command.is_active() {
+            if state.cad_command.ready() {
+                submit_command(&mut state, &mut selection, space.mode, "");
+            } else if !state.cad_command.is_active() {
                 push_message(&mut state, "工作平面已按三点设置，图元坐标保持不变");
             }
         }
@@ -2344,11 +2400,26 @@ fn drawing_ui(
     context.set_visuals(egui::Visuals::dark());
 
     let mut command_request = None;
+    if state.cad_workspace.context.is_some() {
+        if context.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            state.cad_workspace.context = None;
+        } else if context.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            || cad_input::confirm_space(context)
+        {
+            command_request = Some(
+                state
+                    .dynamic_input
+                    .submission(&state.cad_command, &state.command_input),
+            );
+            state.cad_workspace.context = None;
+        }
+    }
     if space.mode == SpaceMode::Cad
         && !state.gcode_settings_open
         && !state.file_ui.report_open
         && !state.performance.open
         && !state.trajectory_view.open
+        && state.cad_workspace.context.is_none()
     {
         let ViewerState {
             dynamic_input,
@@ -2361,8 +2432,21 @@ fn drawing_ui(
     if !state.gcode_settings_open && !state.file_ui.report_open {
         let wants_keyboard = context.egui_wants_keyboard_input();
         let cursor_focus = cad_input::owns_focus(context);
+        let bottom_focus = context.memory(|m| m.has_focus(egui::Id::new("cad_command_input")));
+        if space.mode == SpaceMode::Cad
+            && !state.performance.open
+            && !state.trajectory_view.open
+            && (!wants_keyboard || bottom_focus)
+            && cad_input::confirm_space(context)
+        {
+            command_request = Some(std::mem::take(&mut state.command_input));
+        }
         context.input_mut(|input| {
-            if (state.cad_command.is_active() || !state.command_input.is_empty() || cursor_focus)
+            if (state.cad_command.is_active()
+                || !state.command_input.is_empty()
+                || cursor_focus
+                || !selection.selected.is_empty()
+                || !selection.cam_selected.is_empty())
                 && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
             {
                 command_request = Some("CANCEL".to_string());
@@ -2505,7 +2589,8 @@ fn drawing_ui(
     if space.mode == SpaceMode::Cad
         && !state.gcode_settings_open
         && !state.file_ui.report_open
-        && !context.egui_wants_keyboard_input()
+        && (!context.egui_wants_keyboard_input()
+            || state.cad_command.selecting() && command_field && state.command_input.is_empty())
     {
         context.input_mut(|input| {
             if !state.cad_command.is_active()
@@ -2899,6 +2984,7 @@ fn drawing_ui(
             let old_mode = space.mode;
             space_switch_ui(ui, &mut space, &mut selection, &state.cam);
             if old_mode != space.mode {
+                state.cad_workspace.context = None;
                 state.cad_command.cancel();
                 state.dynamic_input.reset_fields();
                 state.command_input.clear();
@@ -4057,6 +4143,40 @@ fn drawing_ui(
         && !state.performance.open
         && !state.trajectory_view.open
     {
+        let can_undo = state.drawing.as_ref().is_some_and(|d| d.can_undo());
+        let can_redo = state.drawing.as_ref().is_some_and(|d| d.can_redo());
+        let action = {
+            let ViewerState {
+                cad_workspace,
+                cad_command,
+                ..
+            } = &mut *state;
+            cad_workspace.context_ui(context, canvas_rect, cad_command, can_undo, can_redo)
+        };
+        if let Some(action) = action {
+            let command = if action.is_empty() {
+                state
+                    .dynamic_input
+                    .submission(&state.cad_command, &state.command_input)
+            } else {
+                action
+            };
+            if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
+                submit_command(&mut state, &mut selection, space.mode, &command);
+            }
+            state.command_focus = state.cad_command.is_active();
+            if state.cad_command.needs_options() {
+                state.cad_workspace.reveal(cad_workspace::Pane::Tools);
+            }
+        }
+    }
+    if space.mode == SpaceMode::Cad
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !state.performance.open
+        && !state.trajectory_view.open
+        && state.cad_workspace.context.is_none()
+    {
         let submission = {
             let ViewerState {
                 dynamic_input,
@@ -4094,6 +4214,7 @@ fn drawing_ui(
         .unwrap_or(false);
     ui_state.pointer_over_ui = state.gcode_settings_open
         || state.file_ui.report_open
+        || state.cad_workspace.context.is_some()
         || over_panels
         || context.egui_is_using_pointer()
         || context.egui_wants_pointer_input();

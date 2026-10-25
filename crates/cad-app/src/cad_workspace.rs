@@ -18,6 +18,7 @@ pub struct Workspace {
     pub open: bool,
     pub pane: Pane,
     pub history: bool,
+    pub context: Option<egui::Pos2>,
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -25,6 +26,7 @@ impl Default for Workspace {
             open: true,
             pane: Pane::Properties,
             history: false,
+            context: None,
         }
     }
 }
@@ -32,6 +34,87 @@ impl Workspace {
     pub fn reveal(&mut self, pane: Pane) {
         self.open = true;
         self.pane = pane;
+    }
+    pub fn context_ui(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: egui::Rect,
+        command: &super::cad_command::CommandState,
+        can_undo: bool,
+        can_redo: bool,
+    ) -> Option<String> {
+        let mut opened = false;
+        if let Some(pos) = ctx
+            .input(|i| i.pointer.interact_pos())
+            .filter(|p| canvas.contains(*p))
+        {
+            if ctx.input(|i| i.pointer.secondary_clicked()) && !ctx.egui_wants_pointer_input() {
+                self.context = Some(pos);
+                opened = true;
+            }
+        }
+        let pos = self.context?;
+        let mut action = None;
+        let response = egui::Area::new(egui::Id::new("cad_context_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .constrain_to(canvas)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(175.);
+                    if ui
+                        .button(if command.is_active() {
+                            "确认 / 结束  Enter"
+                        } else {
+                            "重复上一命令  Enter / 空格"
+                        })
+                        .clicked()
+                    {
+                        action = Some(String::new());
+                    }
+                    if command.continuous_drawing() {
+                        if ui.button("撤回上一点  U").clicked() {
+                            action = Some("U".into());
+                        }
+                        if ui.button("闭合并完成  C").clicked() {
+                            action = Some("C".into());
+                        }
+                        if ui.button("放弃整次未提交绘图").clicked() {
+                            action = Some("DISCARD".into());
+                        }
+                    }
+                    if command.is_active() {
+                        if ui.button("取消当前操作  Esc").clicked() {
+                            action = Some("CANCEL".into());
+                        }
+                    } else {
+                        ui.separator();
+                        for (enabled, label, name) in [
+                            (can_undo, "撤销", "UNDO"),
+                            (can_redo, "重做", "REDO"),
+                            (true, "移动", "MOVE"),
+                            (true, "复制", "COPY"),
+                            (true, "删除", "ERASE"),
+                        ] {
+                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                action = Some(name.into());
+                            }
+                        }
+                    }
+                });
+            });
+        if action.is_some()
+            || !opened
+                && ctx.input(|i| {
+                    i.pointer.any_click()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|p| !response.response.rect.contains(p))
+                })
+        {
+            self.context = None;
+        }
+        action
     }
 }
 
@@ -191,8 +274,7 @@ fn available(command: &str, enabled: bool, selected: &BTreeSet<u32>) -> bool {
     enabled
         && (!matches!(
             command,
-            "ERASE"
-                | "OFFSET"
+            "OFFSET"
                 | "TRIM"
                 | "EXTEND"
                 | "FILLET"
@@ -204,11 +286,7 @@ fn available(command: &str, enabled: bool, selected: &BTreeSet<u32>) -> bool {
         ) || !selected.is_empty())
 }
 fn issue(command: &str, output: &mut Output) {
-    if command == "ERASE" {
-        output.edit = Some(EditAction::Apply(DrawingEdit::Delete));
-    } else {
-        output.command = Some(command.into());
-    }
+    output.command = Some(command.into());
 }
 fn command_grid(
     ui: &mut egui::Ui,

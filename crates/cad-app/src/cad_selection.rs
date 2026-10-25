@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum SelectMode {
-    #[default]
     Replace,
+    #[default]
     Add,
     Remove,
     Toggle,
@@ -92,7 +92,7 @@ impl SelectionFilter {
                 self.layer = None;
                 self.color = None;
             }
-            ui.small("过滤只限制新选择；Shift 追加、Alt 移除、Ctrl 切换。");
+            ui.small("默认追加选择；Shift/Alt 移除、Ctrl 切换。过滤只限制新选择。");
             ui.small("Tab 循环重叠候选，Shift+Tab 反向。");
         });
         invert
@@ -107,10 +107,8 @@ impl SelectionFilter {
     ) {
         let mode = if ctrl {
             SelectMode::Toggle
-        } else if alt {
+        } else if alt || shift {
             SelectMode::Remove
-        } else if shift {
-            SelectMode::Add
         } else {
             self.mode
         };

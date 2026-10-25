@@ -166,6 +166,16 @@ fn field_id(i: usize) -> egui::Id {
 pub fn owns_focus(ctx: &egui::Context) -> bool {
     ctx.memory(|m| m.has_focus(raw_id()) || (0..3).any(|i| m.has_focus(field_id(i))))
 }
+pub fn confirm_space(ctx: &egui::Context) -> bool {
+    if !ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        return false;
+    }
+    ctx.input_mut(|i| {
+        i.events
+            .retain(|event| !matches!(event,egui::Event::Text(text) if text==" "))
+    });
+    true
+}
 impl DynamicInput {
     pub fn reset_fields(&mut self) {
         self.locked = [false; 3];
@@ -248,6 +258,9 @@ impl DynamicInput {
         let owned = owns_focus(ctx);
         let other_text = ctx.egui_wants_keyboard_input() && !owned;
         let bottom = ctx.memory(|m| m.has_focus(egui::Id::new("cad_command_input")));
+        if self.at_cursor && (owned || on_canvas && !other_text) && confirm_space(ctx) {
+            self.enter = true;
+        }
         if on_canvas
             && ctx.input(|i| i.pointer.primary_pressed())
             && !ctx.egui_wants_pointer_input()
@@ -277,9 +290,11 @@ impl DynamicInput {
             if self.at_cursor && (owned || on_canvas && !other_text) {
                 let was_literal = self.literal;
                 if !command.is_active()
+                    || self.spec(command).is_none()
                     || typed.starts_with(['@', '#'])
                     || (pasted || !owned && typed.chars().count() > 1)
-                        && typed.contains([',', '，', '<'])
+                        && (typed.contains([',', '，', '<'])
+                            || typed.split_whitespace().count() > 1)
                     || matches!(typed.to_uppercase().as_str(), "U" | "C")
                     || !self.locked.iter().any(|v| *v) && typed.chars().any(char::is_alphabetic)
                 {

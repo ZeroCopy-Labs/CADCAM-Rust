@@ -10,6 +10,8 @@ use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
+    PlaneSelect,
+    EraseSelect,
     Utility {
         kind: super::cad_util::Kind,
         points: Vec<Point3>,
@@ -75,6 +77,7 @@ pub struct MoveCommit {
 }
 
 pub enum CommandCommit {
+    Delete(BTreeSet<u32>),
     Report(String),
     Annotation(Vec<Geometry>),
     Clipboard {
@@ -116,6 +119,48 @@ pub struct CommandState {
 }
 
 impl CommandState {
+    pub fn begin_erase(&mut self) {
+        self.cancel();
+        self.step = Some(Step::EraseSelect);
+    }
+    pub fn begin_plane_select(&mut self) {
+        self.cancel();
+        self.step = Some(Step::PlaneSelect);
+    }
+    pub fn continuous_drawing(&self) -> bool {
+        matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous())
+    }
+    pub fn finish_on_cancel(&self) -> bool {
+        matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous() && sketch.geometry().is_ok())
+    }
+    pub fn ready(&self) -> bool {
+        matches!(
+            &self.step,
+            Some(
+                Step::Confirm { .. }
+                    | Step::Draw {
+                        confirmed: true,
+                        ..
+                    }
+                    | Step::Paste {
+                        target: Some(_),
+                        ..
+                    }
+                    | Step::Grip {
+                        target: Some(_),
+                        dragging: false,
+                        ..
+                    }
+            )
+        ) || matches!(&self.step, Some(Step::Utility { kind, confirmed: true, .. }) if *kind != super::cad_util::Kind::Text)
+    }
+    fn finish_ready(&mut self, selected: &BTreeSet<u32>) -> Result<Option<CommandCommit>, String> {
+        if self.ready() {
+            self.input("", selected)
+        } else {
+            Ok(None)
+        }
+    }
     pub fn error_message(&self) -> &str {
         if self.ray_error.is_empty() {
             &self.error
@@ -228,7 +273,7 @@ impl CommandState {
         self.aids.clear();
     }
     pub fn selecting(&self) -> bool {
-        matches!(self.step, Some(Step::Select | Step::TransformSelect { .. }))
+        matches!(self.step, Some(Step::EraseSelect | Step::Select | Step::TransformSelect { .. }))
             || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
@@ -244,6 +289,7 @@ impl CommandState {
                         target: Some(_),
                         ..
                     } | Step::Curves(_)
+                        | Step::PlaneSelect
                         | Step::Grip {
                             target: Some(_),
                             ..
@@ -260,6 +306,12 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::PlaneSelect) => {
+                return "工作平面：输入 XY / YZ / ZX / 3P，Enter 默认为 XY；Esc 取消".into()
+            }
+            Some(Step::EraseSelect) => {
+                return "删除：选择对象，Enter/空格确认；Shift 移除，Esc 取消".into()
+            }
             Some(Step::Utility {
                 kind,
                 points,
@@ -314,7 +366,7 @@ impl CommandState {
                 target, dragging, ..
             }) => {
                 return if *dragging {
-                    "夹点：拖动预览，松开后等待确认；Esc 取消".into()
+                    "夹点：拖动预览，松开提交；Esc 取消".into()
                 } else if target.is_some() {
                     "夹点：Enter 提交；可输入坐标改目标；Esc 取消".into()
                 } else {
@@ -329,11 +381,11 @@ impl CommandState {
                     )
                 } else {
                     format!(
-                        "{}：已取 {} 点；{}；U 撤回一点，Esc 取消",
+                        "{}：已取 {} 点；{}；U 撤回一点",
                         sketch.kind.label(),
                         sketch.points.len(),
                         if sketch.kind.continuous() {
-                            "继续取点，Enter 结束，C 闭合"
+                            "继续取点，Enter/空格结束，C 闭合；Esc 保留已完成部分"
                         } else {
                             "指定下一点；圆的半径/椭圆短半轴可输入长度"
                         }
@@ -348,23 +400,27 @@ impl CommandState {
                     "{}：{}",
                     kind.label(),
                     if base.is_some() {
-                        "预览已固定，可修改左侧参数，Enter 提交"
+                        match kind {
+                            TransformKind::Rotate => "输入角度后确认即完成；可在右侧设置轴",
+                            TransformKind::Scale => "输入比例后确认即完成",
+                            _ => "在右侧工具页设置参数，Enter/空格提交",
+                        }
                     } else {
                         "指定基点 / 中心 / 镜像平面经过的点"
                     }
                 )
             }
             None => "就绪：选择绘图 / 变换工具；UCS XY / YZ / ZX / 3P 设置工作平面",
-            Some(Step::Select) => "移动/复制 1/4：选择图元，Enter 确认选择；Esc 取消",
+            Some(Step::Select) => "移动/复制 1/3：选择图元，Enter 确认选择；Shift 移除，Esc 取消",
             Some(Step::Base { .. }) => {
                 return format!(
-                    "{} 2/4：指定基点（画布点选或输入坐标）；Esc 取消",
+                    "{} 2/3：指定基点（画布点选或输入坐标）；Esc 取消",
                     if self.copying { "复制" } else { "移动" }
                 )
             }
             Some(Step::Target { .. }) => {
                 return format!(
-                    "{} 3/4：指定目标点；仅预览，不改图纸；Esc 取消",
+                    "{} 3/3：指定目标点并完成；Esc 取消未确认操作",
                     if self.copying { "复制" } else { "移动" }
                 )
             }
@@ -380,7 +436,6 @@ impl CommandState {
         }
         .to_string()
     }
-
     pub fn removed_preview_ids(&self) -> Option<&BTreeSet<EntityId>> {
         if let Some(Step::Curves(edit)) = &self.step {
             Some(&edit.remove)
@@ -633,6 +688,22 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if matches!(self.step, Some(Step::PlaneSelect)) {
+            let name = text.trim().to_uppercase();
+            let name = if name.is_empty() { "XY" } else { name.as_str() };
+            if !matches!(name, "XY" | "YZ" | "ZX" | "3P") {
+                return Err("工作平面选项为 XY / YZ / ZX / 3P".into());
+            }
+            self.step = None;
+            self.set_preset(name)?;
+            return Ok(None);
+        }
+        if matches!(self.step, Some(Step::EraseSelect)) {
+            if !text.trim().is_empty() || selected.is_empty() {
+                return Err("请选择要删除的对象后确认".into());
+            }
+            return Ok(Some(CommandCommit::Delete(selected.clone())));
+        }
         if let Some(Step::Utility {
             kind,
             points,
@@ -740,8 +811,13 @@ impl CommandState {
                 } else {
                     self.tools.scale = value;
                 }
-                self.tools.transforms(*kind, *base, self.plane, ids.len())?;
-                return Ok(None);
+                let (transforms, copies) =
+                    self.tools.transforms(*kind, *base, self.plane, ids.len())?;
+                return Ok(Some(CommandCommit::Transform {
+                    ids: ids.clone(),
+                    transforms,
+                    copies,
+                }));
             }
         }
         if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
@@ -753,15 +829,21 @@ impl CommandState {
                 return Ok(None);
             }
             if text.trim().is_empty() {
-                let geometry = sketch.geometry()?;
-                if *confirmed {
-                    return Ok(Some(CommandCommit::Create {
-                        geometry,
-                        normal: sketch.plane.normal(),
-                    }));
+                if sketch.points.len()
+                    < if sketch.kind == SketchKind::Spline {
+                        sketch.degree as usize + 1
+                    } else {
+                        sketch.kind.required()
+                    }
+                {
+                    self.cancel();
+                    return Ok(None);
                 }
-                *confirmed = true;
-                return Ok(None);
+                let geometry = sketch.geometry()?;
+                return Ok(Some(CommandCommit::Create {
+                    geometry,
+                    normal: sketch.plane.normal(),
+                }));
             }
             if matches!(upper.as_str(), "C" | "CLOSE" | "闭合") {
                 if !sketch.kind.continuous() {
@@ -769,12 +851,16 @@ impl CommandState {
                 }
                 let mut next = sketch.clone();
                 next.closed = true;
-                next.geometry()?;
+                let geometry = next.geometry()?;
                 *sketch = next;
                 *confirmed = true;
-                return Ok(None);
+                return Ok(Some(CommandCommit::Create {
+                    geometry,
+                    normal: sketch.plane.normal(),
+                }));
             }
-            if !text.contains([',', ' ', '<']) && !text.starts_with(['@', '#'])
+            if !text.contains([',', ' ', '<'])
+                && !text.starts_with(['@', '#'])
                 && ((sketch.kind == SketchKind::Circle && sketch.points.len() >= 1)
                     || (sketch.kind == SketchKind::Ellipse && sketch.points.len() >= 2))
             {
@@ -797,7 +883,7 @@ impl CommandState {
                     c.z + direction.z * radius,
                 ];
                 self.accept_point(p)?;
-                return Ok(None);
+                return self.finish_ready(selected);
             }
         }
         if matches!(self.step, Some(Step::Select)) {
@@ -832,12 +918,27 @@ impl CommandState {
             let point = self.hover.ok_or("请点选有效位置，或输入精确坐标")?;
             self.accept_point(point)?;
         } else {
-            let point = parse_point(text, self.point_plane(), self.reference())?;
+            let point = if !text.contains([',', '，', '<', ' ']) && !text.starts_with(['@', '#']) {
+                let distance = number(text)?;
+                let base = self.snap_reference().ok_or("请指定完整坐标")?;
+                let target = self.hover.ok_or("请先用鼠标指定方向，或输入完整坐标")?;
+                let delta = cad_core::model::Vector3::new(
+                    target[0] - base.x,
+                    target[1] - base.y,
+                    target[2] - base.z,
+                );
+                if delta.length() <= 1e-9 {
+                    return Err("请先用鼠标指定非零方向".into());
+                }
+                let delta = delta.normalize() * distance;
+                finite([base.x + delta.x, base.y + delta.y, base.z + delta.z])?
+            } else {
+                parse_point(text, self.point_plane(), self.reference())?
+            };
             self.accept_point(point)?;
         }
-        Ok(None)
+        self.finish_ready(selected)
     }
-
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
             Step::Utility {
@@ -962,7 +1063,7 @@ impl CommandState {
                 self.origin_input = array(self.plane.origin);
                 None
             }
-            Step::Select => return Err("请先确认选择".into()),
+            Step::Select | Step::EraseSelect | Step::PlaneSelect => return Err("请先确认选择或工作平面选项".into()),
         };
         self.hover = None;
         self.aids.clear();
