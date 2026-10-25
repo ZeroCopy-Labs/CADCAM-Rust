@@ -316,6 +316,9 @@ impl DynamicInput {
                     || command.curve_change_distance()
                         && matches!(typed.to_uppercase().as_str(), "D" | "N")
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
+                    || command.copy_mode().is_some()
+                        && !command.selecting()
+                        && matches!(typed.to_uppercase().as_str(), "M" | "S")
                     || !self.locked.iter().any(|v| *v) && typed.chars().any(char::is_alphabetic)
                 {
                     if !self.literal {

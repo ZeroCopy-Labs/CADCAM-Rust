@@ -63,13 +63,15 @@ impl Workspace {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(175.);
                     if ui
-                        .button(if command.curve_waiting_target() {
-                            "确认 / 结束连续修改  Enter"
-                        } else if command.is_active() {
-                            "确认 / 结束  Enter"
-                        } else {
-                            "重复上一命令  Enter / 空格"
-                        })
+                        .button(
+                            if command.curve_waiting_target() || command.copy_waiting_target() {
+                                "确认 / 结束连续修改  Enter"
+                            } else if command.is_active() {
+                                "确认 / 结束  Enter"
+                            } else {
+                                "重复上一命令  Enter / 空格"
+                            },
+                        )
                         .clicked()
                     {
                         action = Some(String::new());
@@ -85,10 +87,10 @@ impl Workspace {
                             action = Some("DISCARD".into());
                         }
                     }
-                    if command.continuous_curve() {
+                    if command.command_undo_active() {
                         if ui
                             .add_enabled(
-                                can_undo && command.curve_undo_id().is_some(),
+                                can_undo && command.command_undo_id().is_some(),
                                 egui::Button::new("撤回本命令上次修改  U"),
                             )
                             .clicked()
@@ -107,6 +109,14 @@ impl Workspace {
                         }
                         if ui.button("结束连续修改，保留已完成结果").clicked() {
                             action = Some("CANCEL".into());
+                        }
+                    }
+                    if command.copy_mode().is_some() && !command.selecting() {
+                        if ui.button("多次复制  M").clicked() {
+                            action = Some("M".into());
+                        }
+                        if ui.button("单次复制  S").clicked() {
+                            action = Some("S".into());
                         }
                     }
                     if command.transform_reference() {

@@ -110,6 +110,8 @@ pub struct CommandState {
     pub last_command: String,
     pub last_measurement: String,
     copying: bool,
+    copy_single: bool,
+    copy_operations: Vec<u64>,
     pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
     step: Option<Step>,
@@ -141,6 +143,23 @@ impl CommandState {
     pub fn continuous_curve(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.continuous())
     }
+    pub fn copy_mode(&self) -> Option<bool> {
+        (self.copying
+            && matches!(
+                self.step,
+                Some(Step::Select | Step::Base { .. } | Step::Target { .. } | Step::Confirm { .. })
+            ))
+        .then_some(!self.copy_single)
+    }
+    pub fn command_undo_active(&self) -> bool {
+        self.continuous_curve() || self.copy_mode().is_some()
+    }
+    pub fn repeat_edit(&self) -> bool {
+        self.continuous_curve() || self.copy_mode() == Some(true)
+    }
+    pub fn copy_waiting_target(&self) -> bool {
+        self.copying && matches!(self.step, Some(Step::Target { .. }))
+    }
     pub fn curve_waiting_target(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.waiting_target())
     }
@@ -153,9 +172,11 @@ impl CommandState {
     pub fn mirror_question(&self) -> bool {
         matches!(&self.step,Some(Step::TransformPick(s)) if s.mirror_question())
     }
-    pub fn curve_undo_id(&self) -> Option<u64> {
+    pub fn command_undo_id(&self) -> Option<u64> {
         if let Some(Step::CurvePick(s)) = &self.step {
             s.undo_id()
+        } else if self.copy_mode().is_some() {
+            self.copy_operations.last().copied()
         } else {
             None
         }
@@ -167,7 +188,7 @@ impl CommandState {
             None
         }
     }
-    pub fn record_curve_change(
+    pub fn record_command_change(
         &mut self,
         change: &cad_core::DrawingChange,
         doc: &cad_core::DrawingDocument,
@@ -176,17 +197,28 @@ impl CommandState {
             if s.continuous() {
                 s.committed(change, doc);
             }
+        } else if self.copy_mode().is_some() {
+            self.copy_operations.push(change.transaction_id);
         }
     }
-    pub fn undo_curve_change(&mut self, id: u64, doc: &cad_core::DrawingDocument) {
+    pub fn undo_command_change(&mut self, id: u64, doc: &cad_core::DrawingDocument) {
         if let Some(Step::CurvePick(s)) = &mut self.step {
             s.undone(id, doc);
+        } else if self.copy_mode().is_some() && self.copy_operations.last() == Some(&id) {
+            self.copy_operations.pop();
         }
-        self.resume_curve();
+        self.resume_edit();
     }
-    pub fn resume_curve(&mut self) {
+    pub fn resume_edit(&mut self) {
         if let Some(Step::CurvePick(s)) = &mut self.step {
             s.resume();
+        } else if self.copying {
+            if let Some(Step::Confirm { ids, base, .. }) = &self.step {
+                self.step = Some(Step::Target {
+                    ids: ids.clone(),
+                    base: *base,
+                });
+            }
         }
         self.hover = None;
         self.pointer_point = None;
@@ -540,6 +572,13 @@ impl CommandState {
     }
 
     pub fn prompt(&self) -> String {
+        if let Some(multiple) = self.copy_mode() {
+            if matches!(self.step, Some(Step::Base { .. } | Step::Target { .. })) {
+                return format!("复制（{}，已完成 {} 次）：{}；M 多次 / S 单次；U 撤回本命令上次复制；Esc 结束保留结果",
+                    if multiple {"多次"}else{"单次"}, self.copy_operations.len(),
+                    if matches!(self.step,Some(Step::Base { .. })) {"指定基点"}else{"指定目标点；空输入 Enter/空格结束"});
+            }
+        }
         match &self.step {
             Some(Step::TransformPick(s)) => return s.prompt(),
             Some(Step::CurvePick(s)) => return s.prompt(),
@@ -773,16 +812,12 @@ impl CommandState {
         });
     }
     pub fn begin_move(&mut self, ids: &BTreeSet<u32>) {
-        self.copying = false;
-        self.ray_error.clear();
+        self.cancel();
         self.step = Some(if ids.is_empty() {
             Step::Select
         } else {
             Step::Base { ids: ids.clone() }
         });
-        self.hover = None;
-        self.error.clear();
-        self.pointer_point = None;
     }
 
     pub fn begin_named(&mut self, name: &str, ids: &BTreeSet<u32>) -> bool {
@@ -862,6 +897,9 @@ impl CommandState {
         false
     }
     pub fn cancel(&mut self) {
+        self.copying = false;
+        self.copy_single = false;
+        self.copy_operations.clear();
         self.aids.clear();
         self.ray_error.clear();
         self.step = None;
@@ -963,6 +1001,23 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if self.copy_mode().is_some() && !self.selecting() {
+            match text.trim().to_uppercase().as_str() {
+                "M" | "MULTIPLE" | "多次" => {
+                    self.copy_single = false;
+                    return Ok(None);
+                }
+                "S" | "SINGLE" | "单次" => {
+                    self.copy_single = true;
+                    return Ok(None);
+                }
+                _ => {}
+            }
+            if text.trim().is_empty() && self.copy_waiting_target() {
+                self.cancel();
+                return Ok(None);
+            }
+        }
         if let Some(Step::TransformPick(s)) = &mut self.step {
             let point_expression = text.starts_with(['@', '#'])
                 || text.contains([',', '，', '<'])
@@ -1707,6 +1762,16 @@ impl CommandState {
         let mut command = None;
         ui.strong("命令参数与工作平面");
         self.aids.controls(ui);
+        if self.copy_mode().is_some() && !self.selecting() {
+            ui.horizontal(|ui| {
+                if ui.button("M 多次复制").clicked() {
+                    command = Some("M".into());
+                }
+                if ui.button("S 单次复制").clicked() {
+                    command = Some("S".into());
+                }
+            });
+        }
         if let Some(Step::TransformPick(s)) = &self.step {
             ui.add_enabled_ui(!s.mirror_question(), |ui| {
                 self.tools.advanced_transform_ui(ui, s.kind)
