@@ -35,6 +35,11 @@ fn replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::
 }
 
 pub(crate) fn write_dxf(path: &Path, bytes: &[u8], backup: bool) -> io::Result<()> {
+    write_file(path, bytes, backup)
+}
+
+/// Write a complete snapshot using a sibling temporary file and optional backup.
+pub fn write_file(path: &Path, bytes: &[u8], backup: bool) -> io::Result<()> {
     if backup && path.try_exists()? {
         let mut name = path
             .file_name()

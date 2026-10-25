@@ -29,6 +29,7 @@ mod cad_diagnostics;
 mod cad_edit;
 mod cad_file;
 mod cad_layers;
+mod cad_project;
 mod cad_selection;
 mod cad_tools;
 mod cad_view;
@@ -37,6 +38,7 @@ mod cam_analysis;
 mod cam_sync;
 mod cam_trajectory;
 mod cam_transfer;
+mod cam_view;
 mod cam_wall;
 mod display;
 mod gcode;
@@ -60,6 +62,8 @@ struct ViewerState {
     cad_layers: cad_layers::LayerControls,
     cad_command: cad_command::CommandState,
     cad_history: BTreeMap<u64, CadUndoState>,
+    project: cad_project::ProjectState,
+    excluded: BTreeSet<u32>,
     file_name: String,
     format: String,
     version: String,
@@ -77,6 +81,7 @@ struct ViewerState {
     manual_tube: cam_analysis::TubeSection,
     manual_pair: [Option<cam::UnitId>; 2],
     trajectory: Option<cam_trajectory::MachineTrajectory>,
+    trajectory_view: cam_view::TrajectoryView,
     gcode_profile: gcode::GCodeProfile,
     gcode_settings_message: String,
     gcode_settings_error: bool,
@@ -99,11 +104,15 @@ struct CadUndoState {
     layer_rules: BTreeMap<String, Option<gcode::CodeRule>>,
     selected: BTreeSet<u32>,
     cam_selected: BTreeSet<cam::UnitId>,
-    machining: Option<(
-        cam_analysis::CamAnalysis,
-        cam_analysis::TubeSection,
-        [Option<cam::UnitId>; 2],
-    )>,
+    machining: Option<CadMachiningState>,
+}
+
+struct CadMachiningState {
+    analysis: cam_analysis::CamAnalysis,
+    tube: cam_analysis::TubeSection,
+    pair: [Option<cam::UnitId>; 2],
+    cam: cam::CamModel,
+    excluded: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -688,7 +697,11 @@ fn draw_scene(
         } else if is_selected {
             Color::srgb(1.0, 0.82, 0.22)
         } else {
-            Color::srgb(path.color[0], path.color[1], path.color[2])
+            if state.excluded.contains(&path.entity_id) {
+                Color::srgb(0.35, 0.40, 0.46)
+            } else {
+                Color::srgb(path.color[0], path.color[1], path.color[2])
+            }
         };
         for pair in path.points.windows(2) {
             let [x0, y0, z0] = pair[0];
@@ -1496,6 +1509,7 @@ fn entity_info_ui(ui: &mut egui::Ui, entity: &display::DisplayEntity, scope: &st
 
 #[derive(Default)]
 struct CamAnalysisUiAction {
+    locate_unit: Option<cam::UnitId>,
     pair_sections: Option<(cam::UnitId, cam::UnitId)>,
     reset_pairs: bool,
     trim_section: Option<(cam::UnitId, bool)>,
@@ -1868,6 +1882,9 @@ fn cam_analysis_ui(
                                         cam_analysis::UnitDirection::Reverse => "反向",
                                     };
                                     ui.horizontal(|ui| {
+                                        if ui.small_button("定位").clicked() {
+                                            action.locate_unit = Some(unit.unit_id);
+                                        }
                                         if !unit.machining_cut {
                                             let can_up = unit_index > 0
                                                 && !plan_group.units[unit_index - 1].machining_cut;
@@ -2360,6 +2377,8 @@ fn drawing_ui(
     let mut new_drawing = false;
     let mut save_drawing = false;
     let mut save_as = false;
+    let mut save_project = false;
+    let mut project_as = false;
     let mut close_drawing = false;
     let mut recover_drawing = false;
     let mut open_dialog = false;
@@ -2377,6 +2396,11 @@ fn drawing_ui(
                 save_drawing = false;
             }
         });
+    }
+    if save_drawing && state.project.native_project {
+        save_project = true;
+        project_as = save_as;
+        save_drawing = false;
     }
     let mut cad_action = None;
     let mut select_all = false;
@@ -2412,7 +2436,23 @@ fn drawing_ui(
     let mut quick_export_gcode = false;
     let mut pending_path: Option<PathBuf> = None;
     let mut fit_clicked = false;
-    let current_name = if state.file_name.is_empty() {
+    let current_name = if state.project.native_project {
+        format!(
+            "{}{}",
+            state
+                .project
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "未保存项目".into()),
+            if cad_project::modified(&state) {
+                " *"
+            } else {
+                ""
+            }
+        )
+    } else if state.file_name.is_empty() {
         "未打开文件".to_string()
     } else {
         format!(
@@ -2445,7 +2485,7 @@ fn drawing_ui(
                     new_drawing = true;
                     ui.close();
                 }
-                if ui.button("打开文件  Ctrl+O").clicked() {
+                if ui.button("打开图纸或项目  Ctrl+O").clicked() {
                     open_dialog = true;
                     ui.close();
                 }
@@ -2453,17 +2493,40 @@ fn drawing_ui(
                 if ui
                     .add_enabled(
                         state.drawing.is_some() && !state.cad_command.is_active(),
-                        egui::Button::new("保存  Ctrl+S"),
+                        egui::Button::new("保存当前文件  Ctrl+S"),
                     )
                     .clicked()
                 {
-                    save_drawing = true;
+                    if state.project.native_project {
+                        save_project = true;
+                    } else {
+                        save_drawing = true;
+                    }
                     ui.close();
                 }
+                ui.add_enabled_ui(
+                    state.drawing.is_some() && !state.cad_command.is_active(),
+                    |ui| {
+                        if ui.button("保存 CAD/CAM 项目…").clicked() {
+                            save_project = true;
+                            ui.close();
+                        }
+                        if ui.button("项目另存为…").clicked() {
+                            save_project = true;
+                            project_as = true;
+                            ui.close();
+                        }
+                        if ui.button("保存 DXF 图纸（不含加工安排）").clicked() {
+                            save_drawing = true;
+                            save_as = false;
+                            ui.close();
+                        }
+                    },
+                );
                 if ui
                     .add_enabled(
                         state.drawing.is_some() && !state.cad_command.is_active(),
-                        egui::Button::new("另存为 DXF…  Ctrl+Shift+S"),
+                        egui::Button::new("DXF 另存为…"),
                     )
                     .clicked()
                 {
@@ -2651,6 +2714,10 @@ fn drawing_ui(
                 });
             });
             ui.menu_button("视图", |ui| {
+                if ui.button("机床轨迹查看…").clicked() {
+                    open_trajectory_view(&mut state, &selection.cam_selected);
+                    ui.close();
+                }
                 if ui.button("适应视图").clicked() {
                     fit_clicked = true;
                     ui.close();
@@ -2813,12 +2880,73 @@ fn drawing_ui(
     let command_rect = command_panel.response.rect;
 
     let mut cam_action = CamAnalysisUiAction::default();
+    let mut locate_target = None;
+    let mut scope_action = None;
+    let scope_ids: BTreeSet<_> = if space.mode == SpaceMode::Cad {
+        selection.selected.clone()
+    } else {
+        selection
+            .cam_selected
+            .iter()
+            .filter_map(|id| state.cam.unit(*id))
+            .flat_map(|u| u.members.iter().copied())
+            .collect()
+    };
     let feature_panel = egui::Panel::left("feature_info")
         .default_size(300.0)
         .resizable(true)
         .show(&mut root, |ui| {
             ui.add_space(6.0);
             ui.heading("特征");
+            if !state.project.native_project && cad_project::machining_modified(&state) {
+                ui.colored_label(egui::Color32::YELLOW, "加工安排/工艺尚未保存到项目");
+            }
+            if state.cad_command.is_active() {
+                ui.colored_label(
+                    egui::Color32::LIGHT_BLUE,
+                    "青色几何为未提交预览；加工仍使用正式图纸",
+                );
+            }
+            ui.add_enabled_ui(
+                !state.cad_command.is_active() && !scope_ids.is_empty(),
+                |ui| {
+                    if ui
+                        .button(if space.mode == SpaceMode::Cad {
+                            "定位对应加工单元 → CAM"
+                        } else {
+                            "定位源图元 → CAD"
+                        })
+                        .clicked()
+                    {
+                        locate_target = Some(if space.mode == SpaceMode::Cad {
+                            SpaceMode::Cam
+                        } else {
+                            SpaceMode::Cad
+                        });
+                    }
+                    let excluded = scope_ids
+                        .iter()
+                        .filter(|id| state.excluded.contains(id))
+                        .count();
+                    ui.small(format!(
+                        "所选 {} 个源图元：{} 个纳入加工，{} 个参考对象",
+                        scope_ids.len(),
+                        scope_ids.len() - excluded,
+                        excluded
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("排除所选参考对象").clicked() {
+                            scope_action = Some(true);
+                        }
+                        if ui.button("将所选纳入加工").clicked() {
+                            scope_action = Some(false);
+                        }
+                    });
+                },
+            );
+            if space.mode == SpaceMode::Cam && ui.button("查看切削与空移轨迹").clicked() {
+                open_trajectory_view(&mut state, &selection.cam_selected);
+            }
             ui.separator();
 
             match space.mode {
@@ -2981,12 +3109,13 @@ fn drawing_ui(
                     derived.observe_profile(gcode_profile);
                     let versions = state.derived.inputs;
                     ui.small(format!(
-                        "图纸 v{} · 几何 v{} · 属性 v{} · 配置 v{} · 安排 v{}",
+                        "图纸 v{} · 几何 v{} · 属性 v{} · 配置 v{} · 安排 v{} · 范围 v{}",
                         versions.document,
                         versions.geometry,
                         versions.properties,
                         versions.config,
-                        versions.plan
+                        versions.plan,
+                        versions.scope
                     ));
                     ui.small(if state.derived.trajectory_current() {
                         "轨迹已按当前版本计算；导出前仍会校验"
@@ -3211,6 +3340,68 @@ fn drawing_ui(
         state.derived.plan_changed();
         rebuild_state_trajectory(&mut state);
     }
+    if let Some(unit) = cam_action.locate_unit {
+        if let Some(unit) = state.cam.unit(unit) {
+            selection.cam_selected = [unit.id].into_iter().collect();
+            focus_entities(
+                context,
+                &state,
+                &mut camera,
+                &unit.members.iter().copied().collect(),
+            );
+        }
+        if let Some(order) = state
+            .analysis
+            .plan
+            .groups
+            .iter()
+            .flat_map(|g| &g.units)
+            .find(|u| u.unit_id == unit)
+            .map(|u| u.order)
+        {
+            let ViewerState {
+                trajectory_view,
+                trajectory,
+                ..
+            } = &mut *state;
+            trajectory_view.focus_order(order, trajectory.as_ref());
+        }
+    }
+    if let Some(exclude) = scope_action {
+        let before = state.excluded.clone();
+        for id in &scope_ids {
+            if exclude {
+                state.excluded.insert(*id);
+            } else {
+                state.excluded.remove(id);
+            }
+        }
+        if before != state.excluded {
+            refresh_machining_scope(&mut state);
+        }
+    }
+    if let Some(target) = locate_target {
+        if target == SpaceMode::Cam
+            && !scope_ids
+                .iter()
+                .any(|id| state.cam.unit_for_entity(*id).is_some())
+        {
+            push_message(&mut state, "所选参考对象未纳入加工，没有对应加工单元");
+        } else {
+            switch_space(&mut space, &mut selection, &state.cam, target);
+            let ids: BTreeSet<_> = if target == SpaceMode::Cad {
+                selection.selected.clone()
+            } else {
+                selection
+                    .cam_selected
+                    .iter()
+                    .filter_map(|id| state.cam.unit(*id))
+                    .flat_map(|u| u.members.iter().copied())
+                    .collect()
+            };
+            focus_entities(context, &state, &mut camera, &ids);
+        }
+    }
 
     if let (Some(start), Some(current)) = (selection.drag_start, selection.drag_current) {
         if (current - start).length() > 2.0 {
@@ -3282,6 +3473,7 @@ fn drawing_ui(
 
     if state.cad_command.is_active() {
         save_drawing = false;
+        save_project = false;
         export_dxf = false;
         export_gcode = false;
         quick_export_gcode = false;
@@ -3291,6 +3483,9 @@ fn drawing_ui(
     }
     if save_drawing {
         cad_file::save_drawing(&mut state, save_as);
+    }
+    if save_project {
+        cad_project::save(&mut state, project_as);
     }
     if close_drawing {
         cad_file::close_drawing(&mut state);
@@ -3370,6 +3565,34 @@ fn drawing_ui(
 
     if state.gcode_settings_open {
         gcode_settings_ui(context, &mut state);
+    }
+    if !state.gcode_settings_open && !state.file_ui.report_open {
+        let current = state
+            .derived
+            .trajectory_current()
+            .then_some(state.derived.inputs);
+        let allow_locate = !state.cad_command.is_active();
+        let ViewerState {
+            trajectory_view,
+            trajectory,
+            analysis,
+            ..
+        } = &mut *state;
+        if let Some(unit_id) = trajectory_view.ui(
+            context,
+            trajectory.as_ref(),
+            current,
+            analysis,
+            allow_locate,
+        ) {
+            if let Some(unit) = state.cam.unit(unit_id) {
+                let ids = unit.members.iter().copied().collect();
+                selection.cam_selected = [unit_id].into_iter().collect();
+                switch_space(&mut space, &mut selection, &state.cam, SpaceMode::Cad);
+                selection.selected = ids;
+                focus_entities(context, &state, &mut camera, &selection.selected);
+            }
+        }
     }
     cad_file::import_report_ui(context, &mut state);
 
@@ -4573,6 +4796,27 @@ fn apply_cad_action(
                 _ => true,
             };
             let curve_results = if let cad_edit::EditAction::Curves(edit) = &action {
+                let affected: BTreeSet<_> = edit
+                    .replacements
+                    .keys()
+                    .chain(edit.remove.iter())
+                    .map(|id| id.0)
+                    .collect();
+                let references = affected
+                    .iter()
+                    .filter(|id| state.excluded.contains(id))
+                    .count();
+                if references > 0
+                    && references < affected.len()
+                    && !edit.remove.is_empty()
+                    && !edit.replacements.is_empty()
+                {
+                    push_message(
+                        state,
+                        "曲线整理选择混合了加工与参考对象，请先统一加工范围再整理",
+                    );
+                    return false;
+                }
                 if edit.copies {
                     Some(BTreeSet::new())
                 } else {
@@ -4635,6 +4879,11 @@ fn apply_cad_action(
                     return true;
                 }
                 Ok(Some(change)) => {
+                    for (id, source) in &change.created_sources {
+                        if state.excluded.contains(&source.0) {
+                            state.excluded.insert(id.0);
+                        }
+                    }
                     if let Some((old, new)) = rename {
                         if old != new {
                             if let Some(rule) = state.gcode_profile.layer_rules.remove(&old) {
@@ -4755,12 +5004,12 @@ fn capture_cad_context(
         layer_rules: BTreeMap::new(),
         selected: selection.selected.clone(),
         cam_selected: selection.cam_selected.clone(),
-        machining: geometry_changed.then(|| {
-            (
-                state.analysis.clone(),
-                state.manual_tube.clone(),
-                state.manual_pair,
-            )
+        machining: geometry_changed.then(|| CadMachiningState {
+            analysis: state.analysis.clone(),
+            tube: state.manual_tube.clone(),
+            pair: state.manual_pair,
+            cam: state.cam.clone(),
+            excluded: state.excluded.clone(),
         }),
     }
 }
@@ -4768,11 +5017,7 @@ fn capture_cad_context(
 fn refresh_edited_drawing(
     state: &mut ViewerState,
     change: &DrawingChange,
-    restored: Option<(
-        cam_analysis::CamAnalysis,
-        cam_analysis::TubeSection,
-        [Option<cam::UnitId>; 2],
-    )>,
+    restored: Option<CadMachiningState>,
 ) {
     let drawing = state.drawing.as_ref().unwrap();
     let document = drawing.document();
@@ -4784,7 +5029,7 @@ fn refresh_edited_drawing(
     state.warning_count = document.import_report.warnings.len();
     if change.kind.changes_geometry() {
         state.display = display::build_display(document);
-        match display::build_machining(document) {
+        match display::build_machining(document, &state.excluded) {
             Ok(data) => {
                 state.machining = data;
                 state.machining_error = None;
@@ -4795,11 +5040,25 @@ fn refresh_edited_drawing(
             }
         }
         state.file_ui.coverage_acknowledged = false;
-        let next_cam = cam::build_cam_model(document);
-        if let Some((analysis, manual_tube, manual_pair)) = restored {
-            state.analysis = analysis;
-            state.manual_tube = manual_tube;
-            state.manual_pair = manual_pair;
+        let next_cam = cam::build_cam_model(document, &state.excluded);
+        if let Some(restored) = restored {
+            state.analysis = if restored.excluded == state.excluded {
+                restored.analysis
+            } else {
+                restored
+                    .analysis
+                    .reconcile(&restored.cam, &next_cam, &state.machining)
+            };
+            state.manual_tube = restored.tube;
+            state.manual_pair = restored.pair.map(|slot| {
+                slot.filter(|id| {
+                    state
+                        .analysis
+                        .machining_sections
+                        .iter()
+                        .any(|s| s.unit_id == *id)
+                })
+            });
         } else {
             state.analysis = state
                 .analysis
@@ -4824,6 +5083,78 @@ fn refresh_edited_drawing(
         state.derived.properties_ready();
     }
     rebuild_state_trajectory(state);
+}
+
+fn open_trajectory_view(state: &mut ViewerState, selected: &BTreeSet<cam::UnitId>) {
+    rebuild_state_trajectory(state);
+    if let Some(order) = state
+        .analysis
+        .plan
+        .groups
+        .iter()
+        .flat_map(|g| &g.units)
+        .find(|u| selected.contains(&u.unit_id))
+        .map(|u| u.order)
+    {
+        state
+            .trajectory_view
+            .focus_order(order, state.trajectory.as_ref());
+    }
+    state.trajectory_view.open = true;
+}
+
+fn refresh_machining_scope(state: &mut ViewerState) {
+    let Some(drawing) = &state.drawing else {
+        return;
+    };
+    state.derived.scope_changed();
+    match display::build_machining(drawing.document(), &state.excluded) {
+        Ok(data) => {
+            state.machining = data;
+            state.machining_error = None;
+        }
+        Err(error) => {
+            state.machining = Default::default();
+            state.machining_error = Some(error);
+        }
+    }
+    let cam = cam::build_cam_model(drawing.document(), &state.excluded);
+    state.analysis = state.analysis.reconcile(&state.cam, &cam, &state.machining);
+    state.cam = cam;
+    state.manual_pair = [None, None];
+    state.derived.geometry_ready();
+    rebuild_state_trajectory(state);
+    push_message(state, "加工范围已更新；参考对象保留在 CAD/DXF 中，灰色显示。范围设置随项目保存，不随 CAD 几何撤销");
+}
+
+fn focus_entities(
+    context: &egui::Context,
+    state: &ViewerState,
+    camera: &mut CameraRig,
+    ids: &BTreeSet<u32>,
+) {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for path in state
+        .display
+        .paths
+        .iter()
+        .filter(|p| ids.contains(&p.entity_id))
+    {
+        for p in &path.points {
+            for i in 0..3 {
+                min[i] = min[i].min(p[i]);
+                max[i] = max[i].max(p[i]);
+            }
+        }
+    }
+    if min[0].is_finite() {
+        camera.target = std::array::from_fn(|i| (min[i] + max[i]) * 0.5);
+        let span = (0..3).map(|i| max[i] - min[i]).fold(1.0, f64::max);
+        camera.ortho_scale =
+            (span * 1.8 / context.viewport_rect().height().max(100.0) as f64) as f32;
+        camera.distance = (span * 2.0).max(10.0) as f32;
+    }
 }
 
 fn export_dxf_file(state: &mut ViewerState) {
@@ -4943,7 +5274,9 @@ fn quick_export_gcode_file(state: &mut ViewerState) {
 /// Native file picker, starting in the last used directory.
 fn choose_drawing_file(state: &ViewerState) -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("打开 CAD 图纸")
+        .set_title("打开 CAD 图纸或 CAD/CAM 项目")
+        .add_filter("图纸与项目", &["cadcam", "dxf", "dwg", "bak"])
+        .add_filter("CAD/CAM 项目", &["cadcam"])
         .add_filter(
             "CAD 图纸与备份 (*.dxf, *.dwg, *.bak)",
             &["dxf", "dwg", "bak"],

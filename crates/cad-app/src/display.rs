@@ -4,7 +4,7 @@
 //! 3D line paths. It is not a geometry kernel and does not persist or modify
 //! the CAD model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::TAU;
 
 use cad_core::model::{
@@ -258,13 +258,19 @@ pub fn refresh_properties(data: &mut DisplayData, document: &DrawingDocument) {
 }
 
 /// CAM paths are sampled from analytic geometry, independently of viewport tessellation.
-pub fn build_machining(document: &DrawingDocument) -> Result<DisplayData, String> {
+pub fn build_machining(
+    document: &DrawingDocument,
+    excluded: &BTreeSet<u32>,
+) -> Result<DisplayData, String> {
     let mut data = build_display(document);
     data.paths.clear();
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let mut total = 0;
     for entity in &document.entities {
+        if excluded.contains(&entity.id.0) {
+            continue;
+        }
         let points =
             cad_core::curves::sample(&entity.geometry, cad_core::curves::Sampling::default())
                 .map_err(|e| format!("图元 #{} 加工采样失败：{e}", entity.id.0))?;

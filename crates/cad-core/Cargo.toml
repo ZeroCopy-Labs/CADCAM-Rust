@@ -7,3 +7,5 @@ description = "DXF/DWG import and the internal CAD document model (pure Rust, no
 
 [dependencies]
 acadrust = "0.6.5"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.23"

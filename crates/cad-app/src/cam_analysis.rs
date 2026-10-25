@@ -81,7 +81,7 @@ impl TubeZone {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SectionSource {
     Auto,
     Manual,
@@ -112,7 +112,7 @@ impl TubeCandidate {
 }
 
 /// The tube cross-section used as the reference for all CAM analysis.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TubeSection {
     pub center_y: f64,
     pub center_z: f64,
@@ -471,7 +471,7 @@ pub struct UnitZoneProfile {
     pub owner_zone: Option<TubeZone>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RotationDirection {
     #[default]
     CounterClockwise,
@@ -501,6 +501,27 @@ pub struct CamAnalysis {
     pub pending_arrangements: Vec<String>,
 }
 
+/// Formal machining choices only; paths, fitted candidates and trajectories are rebuilt.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MachiningSetup {
+    pub tube: Option<TubeSection>,
+    pub tube_cleared: bool,
+    pub lazy_rotation: bool,
+    pub rotation_direction: RotationDirection,
+    pub sections: BTreeMap<UnitId, bool>,
+    pub pairs: Vec<(UnitId, UnitId)>,
+    pub trims: BTreeSet<UnitId>,
+    pub orders: Vec<ManualOrder>,
+    pub pending: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ManualOrder {
+    pub left: Option<UnitId>,
+    pub right: Option<UnitId>,
+    pub units: Vec<UnitId>,
+}
+
 impl Default for CamAnalysis {
     fn default() -> Self {
         Self {
@@ -527,6 +548,87 @@ impl Default for CamAnalysis {
 }
 
 impl CamAnalysis {
+    pub fn setup(&self) -> MachiningSetup {
+        MachiningSetup {
+            tube: self.tube_section.clone(),
+            tube_cleared: self.tube_cleared,
+            lazy_rotation: self.lazy_rotation,
+            rotation_direction: self.rotation_direction,
+            sections: self.section_overrides.clone(),
+            pairs: self.section_pairs.clone(),
+            trims: self.trim_sections.clone(),
+            pending: self.pending_arrangements.clone(),
+            orders: self
+                .manual_orders
+                .iter()
+                .map(|((left, right), units)| ManualOrder {
+                    left: *left,
+                    right: *right,
+                    units: units.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore_setup(
+        setup: MachiningSetup,
+        display: &DisplayData,
+        cam: &CamModel,
+    ) -> Result<Self, String> {
+        if let Some(tube) = &setup.tube {
+            if ![
+                tube.center_y,
+                tube.center_z,
+                tube.size_y,
+                tube.size_z,
+                tube.radius,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+                || tube.size_y <= 0.0
+                || tube.size_z <= 0.0
+                || tube.radius < 0.0
+            {
+                return Err("项目方管截面参数无效".into());
+            }
+        }
+        let units: BTreeSet<_> = cam.units.iter().map(|u| u.id).collect();
+        let refs: Vec<_> = setup
+            .sections
+            .keys()
+            .copied()
+            .chain(setup.pairs.iter().flat_map(|(l, r)| [*l, *r]))
+            .chain(setup.trims.iter().copied())
+            .chain(
+                setup
+                    .orders
+                    .iter()
+                    .flat_map(|o| o.units.iter().copied().chain(o.left).chain(o.right)),
+            )
+            .collect();
+        if refs.iter().any(|id| !units.contains(id)) {
+            return Err("项目加工安排引用了不存在或已排除的单元，已停止打开".into());
+        }
+        let analysis = Self {
+            tube_section: setup.tube,
+            tube_cleared: setup.tube_cleared,
+            lazy_rotation: setup.lazy_rotation,
+            rotation_direction: setup.rotation_direction,
+            section_overrides: setup.sections,
+            section_pairs: setup.pairs,
+            trim_sections: setup.trims,
+            manual_orders: setup
+                .orders
+                .into_iter()
+                .map(|o| ((o.left, o.right), o.units))
+                .collect(),
+            pending_arrangements: setup.pending,
+            ..Default::default()
+        };
+        // Reconcile against the exact restored source identities, then regenerate all derived values.
+        Ok(analysis.reconcile(cam, cam, display))
+    }
+
     /// Rebuild derived geometry while retaining only exact source-member identities.
     pub fn reconcile(&self, old: &CamModel, cam: &CamModel, display: &DisplayData) -> Self {
         let old_units: BTreeMap<_, _> = old.units.iter().map(|u| (u.id, u)).collect();

@@ -4,12 +4,26 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use acadrust::{CadDocument, Color as NativeColor, DxfWriter, Handle};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::convert::convert_document;
 use crate::geometry_edit::{native_geometry, AffineTransform, NewEntity};
 use crate::model::{Color, DrawingDocument, EntityId, FileFormat, LayerId, LengthUnit};
 
 const HISTORY_LIMIT: usize = 100;
+
+/// Native contents plus stable identities, independent from the original file path.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ProjectDrawing {
+    pub dxf_base64: String,
+    pub ids: Vec<(u64, u32)>,
+    pub layers: BTreeMap<String, u32>,
+    pub entities: Vec<(u64, u32, String)>,
+    pub current_layers: Vec<(u32, String)>,
+    pub source: crate::model::SourceInfo,
+    pub unit: crate::model::LengthUnit,
+    pub report: crate::model::ImportReport,
+}
 
 /// One previewed structural edit; primary replacements retain their IDs.
 #[derive(Clone, Debug, Default)]
@@ -86,6 +100,8 @@ pub struct DrawingChange {
     /// Original operation, also returned when this transaction is undone/redone.
     pub kind: DrawingChangeKind,
     pub created: Vec<EntityId>,
+    /// Source identity for copied/split results; used by project-level object roles.
+    pub created_sources: BTreeMap<EntityId, EntityId>,
 }
 
 struct HistoryEntry {
@@ -121,6 +137,133 @@ pub struct EditableDrawing {
 }
 
 impl EditableDrawing {
+    pub fn project_snapshot(&self) -> Result<ProjectDrawing, String> {
+        let bytes = DxfWriter::new(&self.native)
+            .write_to_vec()
+            .map_err(|e| e.to_string())?;
+        Ok(ProjectDrawing {
+            dxf_base64: BASE64.encode(bytes),
+            ids: self.ids.iter().map(|(h, id)| (h.value(), id.0)).collect(),
+            layers: self
+                .layer_ids
+                .iter()
+                .map(|(key, id)| (key.clone(), id.0))
+                .collect(),
+            entities: self
+                .document
+                .entities
+                .iter()
+                .map(|e| (e.native_handle, e.id.0, e.geometry.kind().to_string()))
+                .collect(),
+            current_layers: self
+                .document
+                .layers
+                .iter()
+                .map(|l| (l.id.0, l.name.clone()))
+                .collect(),
+            source: self.document.source.clone(),
+            unit: self
+                .document
+                .source_units
+                .ok_or("项目图纸必须先明确源单位")?,
+            report: self.document.import_report.clone(),
+        })
+    }
+
+    pub fn from_project(snapshot: ProjectDrawing) -> Result<Self, String> {
+        let mut ids = BTreeMap::new();
+        let mut values = BTreeSet::new();
+        for (handle, id) in snapshot.ids {
+            if handle == 0
+                || id == u32::MAX
+                || !values.insert(id)
+                || ids.insert(Handle::from(handle), EntityId(id)).is_some()
+            {
+                return Err("项目图元身份表无效或重复".into());
+            }
+        }
+        let mut layer_ids: BTreeMap<_, _> = snapshot
+            .layers
+            .into_iter()
+            .map(|(key, id)| (key, LayerId(id)))
+            .collect();
+        if layer_ids.values().any(|id| id.0 == u32::MAX) {
+            return Err("项目图层身份表无效".into());
+        }
+        let outcome = acadrust::DxfReader::from_reader(std::io::Cursor::new(
+            BASE64
+                .decode(snapshot.dxf_base64)
+                .map_err(|e| e.to_string())?,
+        ))
+        .map_err(|e| e.to_string())?
+        .read_with_stats()
+        .map_err(|e| e.to_string())?;
+        if outcome.stats.skipped_source_records > 0
+            || outcome.stats.recovered_errors > 0
+            || (outcome.stats.record_stream_read && !outcome.stats.stream_completed)
+        {
+            return Err("项目内嵌图纸解析不完整，已停止打开".into());
+        }
+        let native = outcome.document;
+        let mut document = convert_document(
+            Path::new(&snapshot.source.file_name),
+            FileFormat::AsciiDxf,
+            &native,
+            &mut ids,
+            &mut layer_ids,
+        );
+        let actual: BTreeSet<_> = document
+            .entities
+            .iter()
+            .map(|e| (e.native_handle, e.id.0, e.geometry.kind().to_string()))
+            .collect();
+        let actual_layers: BTreeSet<_> = document
+            .layers
+            .iter()
+            .map(|l| (l.id.0, l.name.clone()))
+            .collect();
+        if actual != snapshot.entities.into_iter().collect()
+            || actual_layers != snapshot.current_layers.into_iter().collect()
+            || document.source_units != Some(snapshot.unit)
+            || actual.len() != document.entities.len()
+            || document
+                .layers
+                .iter()
+                .map(|l| l.id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != document.layers.len()
+        {
+            return Err("项目图纸的图元、图层身份或单位不匹配，已停止恢复加工安排".into());
+        }
+        document.source = snapshot.source;
+        // Retain source omissions even if a DXF snapshot cannot recreate a lost record.
+        let current_report = document.import_report;
+        document.import_report = snapshot.report;
+        for skipped in current_report.skipped {
+            if !document.import_report.skipped.contains(&skipped) {
+                if document.import_report.skipped.len() < crate::model::MAX_SKIPPED_SAMPLES {
+                    document.import_report.skipped.push(skipped);
+                } else {
+                    document.import_report.skipped_omitted += 1;
+                }
+            }
+        }
+        document.import_report.skipped_omitted = document
+            .import_report
+            .skipped_omitted
+            .max(current_report.skipped_omitted);
+        for warning in current_report.warnings {
+            if !document.import_report.warnings.contains(&warning) {
+                document.import_report.warnings.push(warning);
+            }
+        }
+        let mut drawing = Self::new(document, native, ids, layer_ids);
+        // Saving the project does not certify that the external DXF contains this snapshot.
+        drawing.mark_import_materialized();
+        Ok(drawing)
+    }
+
     /// An empty millimeter drawing; source records are created by the parser library.
     pub fn blank() -> Self {
         let mut native = CadDocument::new();
@@ -361,6 +504,7 @@ impl EditableDrawing {
                 BTreeSet::new()
             },
             Vec::new(),
+            BTreeMap::new(),
         )
     }
 
@@ -410,6 +554,7 @@ impl EditableDrawing {
             entities.len(),
             BTreeSet::new(),
             created,
+            BTreeMap::new(),
         )
     }
 
@@ -443,6 +588,7 @@ impl EditableDrawing {
             self.document.entity(*id).ok_or("选择中存在失效图元")?;
             let handle = *handles.get(id).ok_or("图元缺少源记录")?;
             sources.push((
+                *id,
                 handle,
                 self.native
                     .get_entity(handle)
@@ -453,9 +599,10 @@ impl EditableDrawing {
         let mut candidate = self.native.clone();
         let mut ids = self.ids.clone();
         let mut created = Vec::new();
+        let mut created_sources = BTreeMap::new();
         let mut next_id = Self::next_id(&ids)?;
         for transform in transforms {
-            for (handle, source) in &sources {
+            for (source_id, handle, source) in &sources {
                 let mut entity = source.clone();
                 Self::transform_native(&mut entity, *transform, scale);
                 if copies {
@@ -469,7 +616,9 @@ impl EditableDrawing {
                         }
                     }
                     let handle = candidate.add_entity(entity).map_err(|e| e.to_string())?;
-                    created.push(Self::fresh_id(&mut ids, handle, &mut next_id)?);
+                    let id = Self::fresh_id(&mut ids, handle, &mut next_id)?;
+                    created.push(id);
+                    created_sources.insert(id, *source_id);
                 } else {
                     *candidate.get_entity_mut(*handle).ok_or("源记录失效")? = entity;
                 }
@@ -482,6 +631,7 @@ impl EditableDrawing {
             selected.len() * transforms.len(),
             BTreeSet::new(),
             created,
+            created_sources,
         )
     }
 
@@ -534,6 +684,7 @@ impl EditableDrawing {
         let mut ids = self.ids.clone();
         let mut next = Self::next_id(&ids)?;
         let mut created = Vec::new();
+        let mut created_sources = BTreeMap::new();
         let handles: BTreeMap<_, _> = ids.iter().map(|(h, id)| (*id, *h)).collect();
         for id in &selected {
             let source = self
@@ -611,7 +762,9 @@ impl EditableDrawing {
                         }
                     }
                     let h = candidate.add_entity(native).map_err(|e| e.to_string())?;
-                    created.push(Self::fresh_id(&mut ids, h, &mut next)?);
+                    let new_id = Self::fresh_id(&mut ids, h, &mut next)?;
+                    created.push(new_id);
+                    created_sources.insert(new_id, *id);
                 }
             }
         }
@@ -622,6 +775,7 @@ impl EditableDrawing {
             selected.len(),
             removed,
             created,
+            created_sources,
         )
     }
 
@@ -660,6 +814,7 @@ impl EditableDrawing {
             affected,
             BTreeSet::new(),
             Vec::new(),
+            BTreeMap::new(),
         )
     }
 
@@ -831,6 +986,7 @@ impl EditableDrawing {
             1,
             BTreeSet::new(),
             Vec::new(),
+            BTreeMap::new(),
             layer_ids,
         )
     }
@@ -951,6 +1107,7 @@ impl EditableDrawing {
         affected: usize,
         removed: BTreeSet<EntityId>,
         created: Vec<EntityId>,
+        created_sources: BTreeMap<EntityId, EntityId>,
     ) -> Result<Option<DrawingChange>, String> {
         self.commit_with_layers(
             candidate,
@@ -959,6 +1116,7 @@ impl EditableDrawing {
             affected,
             removed,
             created,
+            created_sources,
             self.layer_ids.clone(),
         )
     }
@@ -971,6 +1129,7 @@ impl EditableDrawing {
         affected: usize,
         removed: BTreeSet<EntityId>,
         created: Vec<EntityId>,
+        created_sources: BTreeMap<EntityId, EntityId>,
         mut layer_ids: BTreeMap<String, LayerId>,
     ) -> Result<Option<DrawingChange>, String> {
         let document = self.convert_snapshot(&candidate, &mut ids, &mut layer_ids);
@@ -996,6 +1155,7 @@ impl EditableDrawing {
             affected,
             kind,
             created,
+            created_sources,
         };
         self.history.push_back(HistoryEntry {
             native: std::mem::replace(&mut self.native, candidate),

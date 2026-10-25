@@ -23,6 +23,18 @@ pub(super) struct FileState {
 
 pub(super) fn open_drawing(state: &mut ViewerState, raw_path: &str) {
     let path = PathBuf::from(super::normalize_path(raw_path));
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cadcam"))
+        || path.file_name().is_some_and(|n| {
+            n.to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".cadcam.bak")
+        })
+    {
+        super::cad_project::open(state, &path);
+        return;
+    }
     let backup = path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("bak"));
@@ -81,8 +93,9 @@ fn load_drawing(state: &mut ViewerState, path: &Path, recovered: bool) {
     }
 }
 
-fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
+pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     clear_recovery(state);
+    state.excluded.clear();
     state.file_ui.coverage_acknowledged = false;
     state.file_ui.report = drawing
         .as_ref()
@@ -108,7 +121,7 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
         state.layer_count = document.layers.len();
         state.warning_count = document.import_report.warnings.len();
         state.display = display::build_display(document);
-        match display::build_machining(document) {
+        match display::build_machining(document, &state.excluded) {
             Ok(data) => {
                 state.machining = data;
                 state.machining_error = None;
@@ -118,7 +131,7 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
                 state.machining_error = Some(error);
             }
         }
-        state.cam = cam::build_cam_model(document);
+        state.cam = cam::build_cam_model(document, &state.excluded);
     } else {
         state.file_name.clear();
         state.format.clear();
@@ -159,10 +172,12 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     state.cad_diagnostics = Default::default();
     state.cad_layers = Default::default();
     state.cad_command = Default::default();
+    state.trajectory_view = Default::default();
     state.command_input.clear();
     state.cad_history.clear();
     state.load_version += 1;
     state.fit_dirty = true;
+    super::cad_project::reset(state);
 }
 
 pub(super) fn new_drawing(state: &mut ViewerState) {
@@ -178,7 +193,19 @@ pub(super) fn close_drawing(state: &mut ViewerState) {
     }
 }
 
-fn confirm_replace(state: &mut ViewerState) -> bool {
+pub(super) fn confirm_replace(state: &mut ViewerState) -> bool {
+    if state.project.native_project || super::cad_project::machining_modified(state) {
+        if !super::cad_project::modified(state) {
+            return true;
+        }
+        return match rfd::MessageDialog::new().set_title("保存当前 CAD/CAM 项目？")
+            .set_description("图纸、加工安排或工艺配置有未保存修改。是：保存项目后继续；否：放弃；取消：保留当前工作。DXF 保存不包含加工安排。")
+            .set_buttons(rfd::MessageButtons::YesNoCancel).show() {
+                rfd::MessageDialogResult::Yes => super::cad_project::save(state, false),
+                rfd::MessageDialogResult::No => true,
+                _ => false,
+            };
+    }
     if !state
         .drawing
         .as_ref()
@@ -283,6 +310,12 @@ fn clear_recovery(state: &mut ViewerState) {
 
 pub(super) fn maintain_recovery(time: Res<Time>, mut state: ResMut<ViewerState>) {
     state.file_ui.recovery_elapsed += time.delta_secs();
+    if state.project.native_project && !super::cad_project::modified(&state) {
+        if state.file_ui.recovery_path.is_some() {
+            clear_recovery(&mut state);
+        }
+        return;
+    }
     let Some(drawing) = state.drawing.as_ref() else {
         return;
     };

@@ -29,7 +29,9 @@ pub mod snap;
 pub use convert::{aci_color_rgb, read_document, read_editable_document};
 pub use edit::{
     CurveEdit, DrawingChange, DrawingChangeKind, DrawingEdit, EditableDrawing, LayerEdit,
+    ProjectDrawing,
 };
+pub use file_io::write_file;
 pub use import::ImportError;
 pub use model::{
     DrawingDocument, Entity, EntityId, FileFormat, Geometry, ImportReport, Layer, LayerId,

@@ -9,15 +9,16 @@ pub struct Inputs {
     pub properties: u64,
     pub config: u64,
     pub plan: u64,
+    pub scope: u64,
 }
 
 #[derive(Default)]
 pub struct DerivedState {
     pub inputs: Inputs,
     pub display: Option<(u64, u64)>,
-    pub machining: Option<(u64, u64)>,
-    pub topology: Option<u64>,
-    pub analysis: Option<u64>,
+    pub machining: Option<(u64, u64, u64)>,
+    pub topology: Option<(u64, u64)>,
+    pub analysis: Option<(u64, u64)>,
     pub trajectory: Option<Inputs>,
     profile: Option<GCodeProfile>,
 }
@@ -34,15 +35,19 @@ impl DerivedState {
     }
 
     pub fn geometry_ready(&mut self) {
-        self.topology = Some(self.inputs.geometry);
-        self.analysis = Some(self.inputs.geometry);
+        self.topology = Some((self.inputs.geometry, self.inputs.scope));
+        self.analysis = Some((self.inputs.geometry, self.inputs.scope));
         self.properties_ready();
     }
 
     pub fn properties_ready(&mut self) {
         let version = (self.inputs.geometry, self.inputs.properties);
         self.display = Some(version);
-        self.machining = Some(version);
+        self.machining = Some((
+            self.inputs.geometry,
+            self.inputs.properties,
+            self.inputs.scope,
+        ));
     }
 
     pub fn observe_profile(&mut self, profile: &GCodeProfile) {
@@ -58,12 +63,25 @@ impl DerivedState {
         self.trajectory = None;
     }
 
+    pub fn scope_changed(&mut self) {
+        self.inputs.scope += 1;
+        self.plan_changed();
+        self.machining = None;
+        self.topology = None;
+        self.analysis = None;
+    }
+
     pub fn sources_current(&self) -> bool {
         let version = Some((self.inputs.geometry, self.inputs.properties));
         self.display == version
-            && self.machining == version
-            && self.topology == Some(self.inputs.geometry)
-            && self.analysis == Some(self.inputs.geometry)
+            && self.machining
+                == Some((
+                    self.inputs.geometry,
+                    self.inputs.properties,
+                    self.inputs.scope,
+                ))
+            && self.topology == Some((self.inputs.geometry, self.inputs.scope))
+            && self.analysis == Some((self.inputs.geometry, self.inputs.scope))
     }
 
     pub fn trajectory_current(&self) -> bool {

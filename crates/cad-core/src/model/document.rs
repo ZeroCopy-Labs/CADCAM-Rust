@@ -12,7 +12,7 @@ use super::entity::{Entity, LayerColor};
 use super::ids::{EntityId, LayerId};
 
 /// The on-disk CAD format a document was read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileFormat {
     /// Text-based DXF.
     AsciiDxf,
@@ -40,7 +40,7 @@ impl fmt::Display for FileFormat {
 }
 
 /// Drawing length unit, based on the DXF `$INSUNITS` value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LengthUnit {
     /// Inches.
     Inches,
@@ -171,7 +171,7 @@ pub struct Layer {
 }
 
 /// Source information of an imported drawing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceInfo {
     /// File name (without the directory).
     pub file_name: String,
@@ -184,7 +184,7 @@ pub struct SourceInfo {
 }
 
 /// Why an imported entity was not represented in the internal model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SkipReason {
     /// Intentionally ignored (for example an entity outside model space).
     Ignored,
@@ -205,7 +205,7 @@ impl fmt::Display for SkipReason {
 }
 
 /// A sample of an entity that was not converted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SkippedEntity {
     /// Original DXF/DWG type name, e.g. `"TEXT"` or `"ACAD_PROXY_ENTITY"`.
     pub source_type: String,
@@ -223,21 +223,21 @@ pub struct SkippedEntity {
 pub const MAX_SKIPPED_SAMPLES: usize = 256;
 
 /// One original INSERT cell in an expanded instance path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InsertSource {
     pub handle: u64,
     pub row: u16,
     pub column: u16,
 }
 /// Mapping retained for the current import report, not a persistent block relationship.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BlockMapping {
     pub handle: u64,
     pub path: Vec<InsertSource>,
     pub source_handle: u64,
     pub segment: usize,
 }
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BlockExpansionReport {
     pub original_entities: usize,
     pub original_model_space: usize,
@@ -250,7 +250,7 @@ pub struct BlockExpansionReport {
 }
 
 /// Summary of what the import converter did.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImportReport {
     pub blocks: BlockExpansionReport,
     pub parser_review_required: bool,

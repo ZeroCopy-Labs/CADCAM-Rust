@@ -3,7 +3,7 @@
 //! This module only groups topology. It does not modify the CAD document and
 //! does not generate machining plans or toolpaths yet.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use cad_core::model::{DrawingDocument, Geometry, Plane, Point3, PolylineSegment};
 
@@ -11,7 +11,9 @@ use cad_core::model::{DrawingDocument, Geometry, Plane, Point3, PolylineSegment}
 pub const JOIN_TOLERANCE: f64 = 1.0e-3;
 
 /// Stable identity of a machining unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct UnitId(pub u64);
 
 /// One group of topologically continuous entities.
@@ -47,13 +49,16 @@ impl CamModel {
 /// Open entities connect when an endpoint lies within [`JOIN_TOLERANCE`].
 /// Full circles, closed polylines, full ellipses and closed splines are always
 /// standalone units because they have no endpoints to join.
-pub fn build_cam_model(document: &DrawingDocument) -> CamModel {
+pub fn build_cam_model(document: &DrawingDocument, excluded: &BTreeSet<u32>) -> CamModel {
     let mut endpoints = EndpointIndex::new(JOIN_TOLERANCE);
     let mut union_find = UnionFind::default();
     let mut open_records: Vec<OpenRecord> = Vec::new();
     let mut closed_entities: Vec<u32> = Vec::new();
 
     for entity in &document.entities {
+        if excluded.contains(&entity.id.0) {
+            continue;
+        }
         let entity_id = entity.id.0;
         match entity_topology(&entity.geometry) {
             Some(Topology::Closed) => closed_entities.push(entity_id),
