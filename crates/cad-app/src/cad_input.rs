@@ -350,8 +350,10 @@ impl DynamicInput {
                         && (typed.contains([',', '，', '<'])
                             || typed.split_whitespace().count() > 1)
                     || matches!(typed.to_uppercase().as_str(), "U" | "C")
-                    || command.curve_change_distance()
-                        && matches!(typed.to_uppercase().as_str(), "D" | "N")
+                    || command
+                        .curve_parameter_option()
+                        .is_some_and(|(key, _)| typed.eq_ignore_ascii_case(key))
+                    || command.curve_reselect() && typed.eq_ignore_ascii_case("N")
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
                     || !command.circle_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")

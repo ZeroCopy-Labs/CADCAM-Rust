@@ -381,7 +381,8 @@ fn submit_command(
 ) {
     let repeated = if raw.trim().is_empty()
         && (state.cad_command.rectangle_corner() && !state.cad_command.takes_point()
-            || state.cad_command.arc_sweep_input())
+            || state.cad_command.arc_sweep_input()
+            || state.cad_command.curve_parameter_input())
     {
         state.command_input.trim().to_string()
     } else if raw.trim().is_empty() && !state.cad_command.is_active() {

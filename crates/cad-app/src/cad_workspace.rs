@@ -131,13 +131,13 @@ impl Workspace {
                         {
                             action = Some("U".into());
                         }
-                        if command.curve_change_distance() && ui.button("更改偏移距离  D").clicked()
-                        {
-                            action = Some("D".into());
+                        if let Some((key, label)) = command.curve_parameter_option() {
+                            if ui.button(format!("{label}  {key}")).clicked() {
+                                action = Some(key.into());
+                            }
                         }
-                        if command.continuous_curve()
-                            && command.takes_point()
-                            && ui.button("丢弃当前预览，重新选对象  N").clicked()
+                        if command.curve_reselect()
+                            && ui.button("丢弃当前预览，重选对象 / 边对  N").clicked()
                         {
                             action = Some("N".into());
                         }

@@ -243,8 +243,18 @@ impl CommandState {
     pub fn curve_waiting_target(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.waiting_target())
     }
-    pub fn curve_change_distance(&self) -> bool {
-        matches!(&self.step,Some(Step::CurvePick(s)) if s.can_change_distance())
+    pub fn curve_parameter_option(&self) -> Option<(&'static str, &'static str)> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            s.parameter_option()
+        } else {
+            None
+        }
+    }
+    pub fn curve_reselect(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.can_reselect())
+    }
+    pub fn curve_parameter_input(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.parameter_input())
     }
     pub fn transform_reference(&self) -> bool {
         matches!(&self.step,Some(Step::TransformPick(s)) if s.can_reference())
@@ -1449,7 +1459,7 @@ impl CommandState {
                 }
                 return result;
             }
-            if s.can_change_distance()
+            if s.parameter_option().is_some()
                 && matches!(
                     text.trim().to_uppercase().as_str(),
                     "D" | "DISTANCE" | "N" | "NEXT"
@@ -2219,6 +2229,14 @@ impl CommandState {
         let mut command = None;
         ui.strong("命令参数与工作平面");
         self.aids.controls(ui);
+        if let Some((key, label)) = self.curve_parameter_option() {
+            if ui.button(format!("{key} {label}")).clicked() {
+                command = Some(key.into());
+            }
+        }
+        if self.curve_reselect() && ui.button("N 重选当前对象 / 边对").clicked() {
+            command = Some("N".into());
+        }
         if self.rectangle_corner() && ui.button("D 矩形长度 / 宽度").clicked() {
             command = Some("D".into());
         }

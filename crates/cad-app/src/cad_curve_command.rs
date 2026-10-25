@@ -69,17 +69,36 @@ impl Session {
     pub fn continuous(&self) -> bool {
         matches!(
             self.tool,
-            CurveTool::Trim | CurveTool::Extend | CurveTool::Offset
+            CurveTool::Trim
+                | CurveTool::Extend
+                | CurveTool::Offset
+                | CurveTool::Fillet
+                | CurveTool::Chamfer
         )
     }
     pub fn waiting_target(&self) -> bool {
-        self.continuous() && self.phase == Phase::Object
+        self.continuous()
+            && matches!(
+                self.phase,
+                Phase::Object | Phase::FirstLine | Phase::SecondLine
+            )
     }
     pub fn finished(&self) -> bool {
         self.phase == Phase::Finished
     }
-    pub fn can_change_distance(&self) -> bool {
-        self.tool == CurveTool::Offset
+    pub fn parameter_option(&self) -> Option<(&'static str, &'static str)> {
+        match self.tool {
+            CurveTool::Offset => Some(("D", "更改偏移距离")),
+            CurveTool::Fillet => Some(("R", "更改圆角半径")),
+            CurveTool::Chamfer => Some(("D", "更改倒角两边退让距离")),
+            _ => None,
+        }
+    }
+    pub fn can_reselect(&self) -> bool {
+        matches!(self.phase, Phase::Side | Phase::SecondLine)
+    }
+    pub fn parameter_input(&self) -> bool {
+        self.phase == Phase::Parameter
     }
     pub fn undo_id(&self) -> Option<u64> {
         self.operations.last().map(|op| op.transaction_id)
@@ -91,7 +110,11 @@ impl Session {
         self.source = None;
         self.preview = None;
         self.affected.clear();
-        self.phase = Phase::Object;
+        self.phase = if matches!(self.tool, CurveTool::Fillet | CurveTool::Chamfer) {
+            Phase::FirstLine
+        } else {
+            Phase::Object
+        };
     }
     pub fn committed(&mut self, change: &DrawingChange, doc: &DrawingDocument) {
         let added: Vec<_> = change
@@ -198,17 +221,18 @@ impl Session {
         );
         if self.continuous() {
             prompt.push_str(&format!(
-                "；已完成 {} 次，U 撤回本命令上一次；Enter 在等待目标时结束，Esc 保留已完成结果{}",
-                self.operations.len(),
-                if self.can_change_distance() {
-                    "；D 更改距离"
-                } else {
-                    ""
-                }
+                "；已完成 {} 次，U 撤回本命令上一次；Enter 在等待目标时结束，Esc 保留已完成结果",
+                self.operations.len()
             ));
         }
-        if self.side() {
-            prompt.push_str("；N 丢弃当前预览并重新选择对象");
+        if let Some((key, label)) = self.parameter_option() {
+            prompt.push_str(&format!(
+                "；{key} {label}（当前 {:.4} mm）",
+                self.options.length
+            ));
+        }
+        if self.can_reselect() {
+            prompt.push_str("；N 丢弃当前未提交预览并重新选择对象/边对");
         }
         prompt
     }
@@ -217,13 +241,14 @@ impl Session {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CurveEdit>, String> {
-        if self.side() && matches!(text.trim().to_uppercase().as_str(), "N" | "NEXT") {
+        let upper = text.trim().to_uppercase();
+        if self.can_reselect() && matches!(upper.as_str(), "N" | "NEXT") {
             self.resume();
             return Ok(None);
         }
-        if self.can_change_distance()
-            && matches!(text.trim().to_uppercase().as_str(), "D" | "DISTANCE")
-        {
+        if self.parameter_option().is_some_and(|(key, _)| {
+            upper == key || key == "D" && upper == "DISTANCE" || key == "R" && upper == "RADIUS"
+        }) {
             self.source = None;
             self.preview = None;
             self.affected.clear();
@@ -267,11 +292,6 @@ impl Session {
                     return Err("预览固定后请确认提交或 Esc 取消".into());
                 }
                 return Ok(self.preview.clone());
-            }
-            Phase::Object | Phase::SecondLine
-                if text.trim().is_empty() && self.preview.is_some() =>
-            {
-                return Ok(self.preview.clone())
             }
             _ => return Err("请按提示在画布点选对象或处理侧".into()),
         }
