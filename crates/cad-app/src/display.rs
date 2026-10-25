@@ -213,6 +213,50 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
     }
 }
 
+/// Refresh rule keys and viewport attributes without re-sampling any geometry.
+pub fn refresh_properties(data: &mut DisplayData, document: &DrawingDocument) {
+    let sources: BTreeMap<_, _> = document.entities.iter().map(|e| (e.id.0, e)).collect();
+    let mut attributes = BTreeMap::new();
+    for entity in &mut data.entities {
+        let Some(source) = sources.get(&entity.id) else {
+            continue;
+        };
+        let layer = document.layer(source.layer_id);
+        entity.visible = source.visible && layer.is_none_or(|l| l.visible);
+        entity.locked = layer.is_some_and(|l| l.locked);
+        entity.layer = layer.map(|l| l.name.clone()).unwrap_or_else(|| "0".into());
+        entity.color = resolve_color(source, document);
+        entity.layer_color = layer
+            .map(|l| color_to_rgb(l.color))
+            .unwrap_or([0.86, 0.89, 0.94]);
+        entity.color_key = match source.color {
+            Color::ByLayer | Color::None => "BYLAYER".into(),
+            Color::ByBlock => "BYBLOCK".into(),
+            Color::Aci(i) => format!("ACI:{i}"),
+            Color::Rgb { r, g, b } => format!("#{r:02X}{g:02X}{b:02X}"),
+        };
+        attributes.insert(entity.id, (entity.visible, entity.color));
+    }
+    for path in &mut data.paths {
+        if let Some((visible, color)) = attributes.get(&path.entity_id) {
+            path.visible = *visible;
+            path.color = *color;
+        }
+    }
+    data.layers = document
+        .layers
+        .iter()
+        .map(|layer| DisplayLayer {
+            name: layer.name.clone(),
+            color: color_to_rgb(layer.color),
+            color_index: match layer.color {
+                Color::Aci(i) => Some(i),
+                _ => None,
+            },
+        })
+        .collect();
+}
+
 /// CAM paths are sampled from analytic geometry, independently of viewport tessellation.
 pub fn build_machining(document: &DrawingDocument) -> Result<DisplayData, String> {
     let mut data = build_display(document);

@@ -482,6 +482,7 @@ pub enum RotationDirection {
 pub struct CamAnalysis {
     pub tube_candidates: Vec<TubeCandidate>,
     pub tube_section: Option<TubeSection>,
+    tube_cleared: bool,
     pub machining_candidates: Vec<MachiningSectionCandidate>,
     pub machining_sections: Vec<MachiningSection>,
     pub intervals: Vec<MachiningInterval>,
@@ -494,6 +495,10 @@ pub struct CamAnalysis {
     pub section_pairs: Vec<(UnitId, UnitId)>,
     pub trim_sections: BTreeSet<UnitId>,
     pub grouping_errors: Vec<String>,
+    /// Explicit choices, separate from automatically detected sections/entries.
+    pub section_overrides: BTreeMap<UnitId, bool>,
+    pub manual_orders: BTreeMap<(Option<UnitId>, Option<UnitId>), Vec<UnitId>>,
+    pub pending_arrangements: Vec<String>,
 }
 
 impl Default for CamAnalysis {
@@ -501,6 +506,7 @@ impl Default for CamAnalysis {
         Self {
             tube_candidates: Vec::new(),
             tube_section: None,
+            tube_cleared: false,
             machining_candidates: Vec::new(),
             machining_sections: Vec::new(),
             intervals: Vec::new(),
@@ -513,11 +519,171 @@ impl Default for CamAnalysis {
             section_pairs: Vec::new(),
             trim_sections: BTreeSet::new(),
             grouping_errors: Vec::new(),
+            section_overrides: BTreeMap::new(),
+            manual_orders: BTreeMap::new(),
+            pending_arrangements: Vec::new(),
         }
     }
 }
 
 impl CamAnalysis {
+    /// Rebuild derived geometry while retaining only exact source-member identities.
+    pub fn reconcile(&self, old: &CamModel, cam: &CamModel, display: &DisplayData) -> Self {
+        let old_units: BTreeMap<_, _> = old.units.iter().map(|u| (u.id, u)).collect();
+        let new_units: BTreeMap<_, _> = cam.units.iter().map(|u| (u.id, u)).collect();
+        let valid = |id| match (old_units.get(&id), new_units.get(&id)) {
+            (Some(a), Some(b)) => a.members == b.members && a.closed == b.closed,
+            _ => false,
+        };
+        let mut next = Self {
+            tube_candidates: detect_tube_candidates(display, cam),
+            tube_section: self.tube_section.clone(),
+            tube_cleared: self.tube_cleared,
+            lazy_rotation: self.lazy_rotation,
+            rotation_direction: self.rotation_direction,
+            machine_start: self.machine_start,
+            pending_arrangements: self.pending_arrangements.clone(),
+            ..Default::default()
+        };
+        for section in &self.machining_sections {
+            if !valid(section.unit_id) {
+                next.pending_arrangements.push(format!(
+                    "断面 #{:08X} 的成员或闭合状态已改变，请重新指定断面及配对",
+                    section.unit_id.0
+                ));
+            }
+        }
+        for (id, enabled) in &self.section_overrides {
+            if valid(*id) {
+                next.section_overrides.insert(*id, *enabled);
+            } else {
+                next.pending_arrangements
+                    .push(format!("单元 #{:08X} 的断面指定已失效", id.0));
+            }
+        }
+        for (l, r) in &self.section_pairs {
+            if valid(*l) && valid(*r) {
+                next.section_pairs.push((*l, *r));
+            } else {
+                next.pending_arrangements
+                    .push(format!("端面配对 #{:08X} / #{:08X} 已失效", l.0, r.0));
+            }
+        }
+        for id in &self.trim_sections {
+            if valid(*id) {
+                next.trim_sections.insert(*id);
+            } else {
+                next.pending_arrangements
+                    .push(format!("修边断面 #{:08X} 已失效", id.0));
+            }
+        }
+        // Numeric group IDs change after edits; boundaries are the stable group key.
+        for (key, order) in &self.manual_orders {
+            if key.0.is_some_and(|id| !valid(id)) || key.1.is_some_and(|id| !valid(id)) {
+                next.pending_arrangements
+                    .push("手动排序所属的端面组已失效，请重新安排".into());
+                continue;
+            }
+            let retained: Vec<_> = order.iter().copied().filter(|id| valid(*id)).collect();
+            for id in order.iter().filter(|id| !valid(**id)) {
+                next.pending_arrangements.push(format!(
+                    "手动排序单元 #{:08X} 已拆分、连接或删除，保留其他有效单元的相对顺序",
+                    id.0
+                ));
+            }
+            next.manual_orders.insert(*key, retained);
+        }
+        match self.tube_section.as_ref().map(|s| s.source) {
+            Some(SectionSource::Manual) => next.rebuild_after_tube(display, cam),
+            None if self.tube_cleared => next.rebuild_without_tube_section(display, cam),
+            _ => {
+                next.tube_section = None;
+                next.try_auto_tube_section(display, cam);
+                if next.tube_section.is_none() {
+                    next.rebuild_without_tube_section(display, cam);
+                }
+            }
+        }
+        for (id, enabled) in &next.section_overrides {
+            if *enabled && !next.machining_sections.iter().any(|s| s.unit_id == *id) {
+                next.pending_arrangements.push(format!(
+                    "单元 #{:08X} 的人工断面指定不再满足当前截面/路径条件",
+                    id.0
+                ));
+            }
+        }
+        for (l, r) in &self.section_pairs {
+            if valid(*l) && valid(*r) && !next.section_pairs.contains(&(*l, *r)) {
+                next.pending_arrangements.push(format!(
+                    "端面配对 #{:08X} / #{:08X} 不再满足断面条件",
+                    l.0, r.0
+                ));
+            }
+        }
+        for (key, order) in &mut next.manual_orders {
+            let group = next
+                .groups
+                .iter()
+                .find(|g| (g.left_section, g.right_section) == *key);
+            let before = order.len();
+            order.retain(|id| {
+                group.is_some_and(|g| g.units.contains(id))
+                    && !next.machining_sections.iter().any(|s| s.unit_id == *id)
+            });
+            if order.len() != before {
+                next.pending_arrangements
+                    .push("部分手动顺序的单元已离开原端面组，需重新确认安排".into());
+            }
+        }
+        next.pending_arrangements.sort();
+        next.pending_arrangements.dedup();
+        next
+    }
+
+    fn remember_order(&mut self, group_id: u32) {
+        if let (Some(group), Some(plan)) = (
+            self.groups.iter().find(|g| g.id == group_id),
+            self.plan.groups.iter().find(|g| g.group_id == group_id),
+        ) {
+            self.manual_orders.insert(
+                (group.left_section, group.right_section),
+                plan.units
+                    .iter()
+                    .filter(|u| !u.machining_cut)
+                    .map(|u| u.unit_id)
+                    .collect(),
+            );
+        }
+    }
+
+    fn apply_manual_orders(&mut self) {
+        for plan in &mut self.plan.groups {
+            let Some(group) = self.groups.iter().find(|g| g.id == plan.group_id) else {
+                continue;
+            };
+            let Some(order) = self
+                .manual_orders
+                .get(&(group.left_section, group.right_section))
+            else {
+                continue;
+            };
+            // New units retain their generated slots; old units retain relative order.
+            let ranks: BTreeMap<_, _> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            let slots: Vec<_> = plan
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| !u.machining_cut && ranks.contains_key(&u.unit_id))
+                .map(|(i, _)| i)
+                .collect();
+            let mut units: Vec<_> = slots.iter().map(|i| plan.units[*i].clone()).collect();
+            units.sort_by_key(|u| ranks[&u.unit_id]);
+            for (slot, unit) in slots.into_iter().zip(units) {
+                plan.units[slot] = unit;
+            }
+        }
+    }
+
     pub fn end_cut_side(&self, unit: UnitId) -> EndCutSide {
         for group in &self.groups {
             if group.left_section.is_some() && group.right_section.is_some() {
@@ -549,6 +715,8 @@ impl CamAnalysis {
         let l = ordered_unit_points(display, cam, left).ok_or("左断面路径不完整")?;
         let r = ordered_unit_points(display, cam, right).ok_or("右断面路径不完整")?;
         check_boundary_pair(&l, &r)?;
+        self.section_overrides.insert(left, true);
+        self.section_overrides.insert(right, true);
         self.section_pairs
             .retain(|(a, b)| ![left, right].contains(a) && ![left, right].contains(b));
         self.section_pairs.push((left, right));
@@ -575,6 +743,7 @@ impl CamAnalysis {
         cam: &CamModel,
     ) {
         if trim {
+            self.section_overrides.insert(unit, true);
             self.trim_sections.insert(unit);
         } else {
             self.trim_sections.remove(&unit);
@@ -606,6 +775,7 @@ impl CamAnalysis {
             return;
         };
         self.tube_section = Some(candidate.to_section(SectionSource::Auto));
+        self.tube_cleared = false;
         self.rebuild_after_tube(display, cam);
     }
 
@@ -617,6 +787,7 @@ impl CamAnalysis {
     ) {
         section.source = SectionSource::Manual;
         self.tube_section = Some(section);
+        self.tube_cleared = false;
         self.rebuild_after_tube(display, cam);
     }
 
@@ -629,6 +800,7 @@ impl CamAnalysis {
         let Some(candidate) = self.machining_candidates.get(index).cloned() else {
             return;
         };
+        self.section_overrides.insert(candidate.unit_id, true);
         if self
             .machining_sections
             .iter()
@@ -683,6 +855,7 @@ impl CamAnalysis {
             .get(&unit_id)
             .map(|profile| profile.touched_zones)
             .unwrap_or([false; 16]);
+        self.section_overrides.insert(unit_id, true);
         self.machining_sections.push(MachiningSection {
             unit_id,
             boundary_units: vec![unit_id],
@@ -710,6 +883,7 @@ impl CamAnalysis {
         cam: &CamModel,
     ) -> bool {
         let before = self.machining_sections.len();
+        self.section_overrides.insert(unit_id, false);
         self.machining_sections
             .retain(|section| section.unit_id != unit_id);
         if self.machining_sections.len() == before {
@@ -723,6 +897,7 @@ impl CamAnalysis {
 
     pub fn clear_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
         self.tube_section = None;
+        self.tube_cleared = true;
         self.rebuild_without_tube_section(display, cam);
     }
 
@@ -768,18 +943,6 @@ impl CamAnalysis {
                 end_point: [0.0; 3],
             });
         }
-        let mut previous_end: Option<[f64; 3]> = None;
-        for unit in &mut planned {
-            if let Some((direction, start, end)) =
-                choose_unit_direction(display, cam, unit.unit_id, previous_end)
-            {
-                unit.direction = direction;
-                unit.start_point = start;
-                unit.end_point = end;
-                previous_end = Some(end);
-            }
-        }
-
         let x_start = unit_ids
             .iter()
             .filter_map(|unit_id| unit_x_bounds(display, cam, *unit_id))
@@ -814,6 +977,8 @@ impl CamAnalysis {
             x_end,
             units: planned,
         });
+        self.apply_manual_orders();
+        self.refresh_plan_entries(display, cam);
     }
 
     fn try_auto_tube_section(&mut self, display: &DisplayData, cam: &CamModel) {
@@ -866,6 +1031,31 @@ impl CamAnalysis {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         self.zone_profiles = classify_units(display, cam, &section);
+        self.machining_sections
+            .retain(|s| self.section_overrides.get(&s.unit_id) != Some(&false));
+        for (id, enabled) in &self.section_overrides {
+            if !enabled || self.machining_sections.iter().any(|s| s.unit_id == *id) {
+                continue;
+            }
+            if cam.unit(*id).is_some_and(|u| u.closed) {
+                if let Some((x_min, x_max)) = unit_x_bounds(display, cam, *id) {
+                    self.machining_sections.push(MachiningSection {
+                        unit_id: *id,
+                        boundary_units: vec![*id],
+                        x_min,
+                        x_max,
+                        winding: 1,
+                        zone_mask: self
+                            .zone_profiles
+                            .get(id)
+                            .map(|p| p.touched_zones)
+                            .unwrap_or([false; 16]),
+                    });
+                }
+            }
+        }
+        self.machining_sections
+            .sort_by(|a, b| a.x_min.total_cmp(&b.x_min));
         self.rebuild_groups(display, cam);
         self.rebuild_intervals();
         self.rebuild_plan(display, cam);
@@ -1200,6 +1390,7 @@ impl CamAnalysis {
                 });
             }
         }
+        self.apply_manual_orders();
         self.refresh_plan_entries(display, cam);
     }
 
@@ -1246,7 +1437,7 @@ impl CamAnalysis {
             return false;
         }
         group.units.swap(index, target);
-
+        self.remember_order(group_id);
         self.refresh_plan_entries(display, cam);
         true
     }
@@ -1298,7 +1489,7 @@ impl CamAnalysis {
             .unwrap_or(group.units.len());
         let insert = to.clamp(first, last);
         group.units.insert(insert, unit);
-
+        self.remember_order(group_id);
         self.refresh_plan_entries(display, cam);
         true
     }

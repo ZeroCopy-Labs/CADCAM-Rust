@@ -146,6 +146,11 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     state.manual_pair = [None, None];
     state.trajectory = None;
     state.drawing = drawing;
+    state.derived = Default::default();
+    if let Some(drawing) = &state.drawing {
+        state.derived.document_changed(drawing.revision(), true);
+        state.derived.geometry_ready();
+    }
     if state.drawing.is_some() {
         super::rebuild_state_trajectory(state);
     }

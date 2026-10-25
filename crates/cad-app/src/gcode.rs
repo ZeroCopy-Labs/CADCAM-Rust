@@ -13,7 +13,7 @@ use crate::cam_trajectory::{
     ArcPlane, MachineMove, MachineMoveKind, MachinePose, MachineTrajectory, UnitRuleKeys,
 };
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeRule {
     pub header: String,
@@ -21,7 +21,7 @@ pub struct CodeRule {
     pub comment: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GCodeProfile {
     pub name: String,

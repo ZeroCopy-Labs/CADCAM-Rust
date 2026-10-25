@@ -14,7 +14,7 @@ use crate::cam_analysis::{
 };
 use crate::display::DisplayData;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConfig {
     pub enabled: bool,

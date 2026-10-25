@@ -34,6 +34,7 @@ mod cad_tools;
 mod cad_view;
 mod cam;
 mod cam_analysis;
+mod cam_sync;
 mod cam_trajectory;
 mod cam_transfer;
 mod cam_wall;
@@ -69,6 +70,7 @@ struct ViewerState {
     display: display::DisplayData,
     machining: display::DisplayData,
     machining_error: Option<String>,
+    derived: cam_sync::DerivedState,
     view: cad_view::ViewFrame,
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
@@ -1411,6 +1413,7 @@ fn apply_reorder_click(
         }
     }
     reorder.clicked.push(unit_id);
+    state.derived.plan_changed();
     rebuild_state_trajectory(state);
     true
 }
@@ -2970,6 +2973,38 @@ fn drawing_ui(
                         });
                 }
                 SpaceMode::Cam => {
+                    let ViewerState {
+                        derived,
+                        gcode_profile,
+                        ..
+                    } = &mut *state;
+                    derived.observe_profile(gcode_profile);
+                    let versions = state.derived.inputs;
+                    ui.small(format!(
+                        "图纸 v{} · 几何 v{} · 属性 v{} · 配置 v{} · 安排 v{}",
+                        versions.document,
+                        versions.geometry,
+                        versions.properties,
+                        versions.config,
+                        versions.plan
+                    ));
+                    ui.small(if state.derived.trajectory_current() {
+                        "轨迹已按当前版本计算；导出前仍会校验"
+                    } else {
+                        "轨迹待重算；导出前会使用当前版本重算"
+                    });
+                    if !state.analysis.pending_arrangements.is_empty() {
+                        ui.colored_label(egui::Color32::YELLOW, "加工安排有失效项，导出已暂停：");
+                        for issue in &state.analysis.pending_arrangements {
+                            ui.label(issue);
+                        }
+                        if ui.button("已核对并处理失效安排，使用当前安排").clicked()
+                        {
+                            state.analysis.pending_arrangements.clear();
+                            state.derived.plan_changed();
+                            rebuild_state_trajectory(&mut state);
+                        }
+                    }
                     ui.small("加工采样：弦差 0.01 mm · 曲线内转角 3°；独立于显示折线。");
                     if state
                         .drawing
@@ -3173,6 +3208,7 @@ fn drawing_ui(
         push_message(&mut state, format!("断面配对失败：{error}"));
     }
     if cam_input_changed {
+        state.derived.plan_changed();
         rebuild_state_trajectory(&mut state);
     }
 
@@ -3765,6 +3801,11 @@ fn gcode_settings_ui(context: &egui::Context, state: &mut ViewerState) {
     }
     if !window_open {
         rebuild_state_trajectory(state);
+    } else {
+        state.derived.observe_profile(&state.gcode_profile);
+        if !state.derived.trajectory_current() {
+            state.trajectory = None;
+        }
     }
 }
 
@@ -4435,9 +4476,27 @@ fn sync_machine_start(state: &mut ViewerState) {
 }
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
-    if let Some(error) = &state.machining_error {
+    state.derived.observe_profile(&state.gcode_profile);
+    state.derived.trajectory = None;
+    let error = if state.drawing.is_none() {
+        Some("请先打开或创建图纸".to_string())
+    } else if !state.derived.sources_current()
+        || state
+            .drawing
+            .as_ref()
+            .is_some_and(|d| d.revision() != state.derived.inputs.document)
+    {
+        Some("CAD/CAM 派生数据过期，请重新应用图纸修改后再导出".to_string())
+    } else if !state.analysis.pending_arrangements.is_empty() {
+        Some("加工安排有失效项，请在 CAM 面板核对并处理后再导出".to_string())
+    } else if let Some(error) = &state.machining_error {
+        Some(error.clone())
+    } else {
+        state.gcode_profile.validation_error().map(str::to_string)
+    };
+    if let Some(error) = error {
         state.trajectory = Some(cam_trajectory::MachineTrajectory {
-            error: Some(error.clone()),
+            error: Some(error),
             ..Default::default()
         });
         return;
@@ -4457,6 +4516,7 @@ fn rebuild_state_trajectory(state: &mut ViewerState) {
         analysis,
         gcode_profile.rotary_config(),
     ));
+    state.derived.trajectory = Some(state.derived.inputs);
 }
 
 fn apply_cad_action(
@@ -4606,7 +4666,7 @@ fn apply_cad_action(
                     if change.kind.changes_geometry() {
                         push_message(
                             state,
-                            "已根据当前几何重建 CAM；手动断面、配对和排序需重新确认",
+                            "已更新 CAM：保留有效加工安排，起点/方向按新几何重算；失效项见 CAM 面板",
                         );
                     }
                 }
@@ -4716,36 +4776,52 @@ fn refresh_edited_drawing(
 ) {
     let drawing = state.drawing.as_ref().unwrap();
     let document = drawing.document();
-    state.display = display::build_display(document);
-    match display::build_machining(document) {
-        Ok(data) => {
-            state.machining = data;
-            state.machining_error = None;
-        }
-        Err(error) => {
-            state.machining = Default::default();
-            state.machining_error = Some(error);
-        }
-    }
+    state
+        .derived
+        .document_changed(drawing.revision(), change.kind.changes_geometry());
     state.entity_count = document.entity_count();
     state.layer_count = document.layers.len();
     state.warning_count = document.import_report.warnings.len();
     if change.kind.changes_geometry() {
+        state.display = display::build_display(document);
+        match display::build_machining(document) {
+            Ok(data) => {
+                state.machining = data;
+                state.machining_error = None;
+            }
+            Err(error) => {
+                state.machining = Default::default();
+                state.machining_error = Some(error);
+            }
+        }
         state.file_ui.coverage_acknowledged = false;
-        state.cam = cam::build_cam_model(document);
+        let next_cam = cam::build_cam_model(document);
         if let Some((analysis, manual_tube, manual_pair)) = restored {
             state.analysis = analysis;
             state.manual_tube = manual_tube;
             state.manual_pair = manual_pair;
         } else {
-            let lazy = state.analysis.lazy_rotation;
-            let direction = state.analysis.rotation_direction;
-            state.analysis = cam_analysis::CamAnalysis::build(&state.machining, &state.cam);
-            state
+            state.analysis = state
                 .analysis
-                .set_plan_options(lazy, direction, &state.machining, &state.cam);
-            state.manual_pair = [None, None];
+                .reconcile(&state.cam, &next_cam, &state.machining);
+            for slot in &mut state.manual_pair {
+                if slot.is_some_and(|id| {
+                    !state
+                        .analysis
+                        .machining_sections
+                        .iter()
+                        .any(|s| s.unit_id == id)
+                }) {
+                    *slot = None;
+                }
+            }
         }
+        state.cam = next_cam;
+        state.derived.geometry_ready();
+    } else {
+        display::refresh_properties(&mut state.display, document);
+        display::refresh_properties(&mut state.machining, document);
+        state.derived.properties_ready();
     }
     rebuild_state_trajectory(state);
 }
