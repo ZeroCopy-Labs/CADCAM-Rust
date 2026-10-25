@@ -6,9 +6,14 @@ use bevy_egui::egui;
 use cad_core::model::{Color, DrawingDocument, EntityId, LayerId};
 use cad_core::DrawingEdit;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum EditAction {
     Apply(DrawingEdit),
+    Create(Vec<cad_core::geometry_edit::NewEntity>),
+    Transform {
+        transforms: Vec<cad_core::geometry_edit::AffineTransform>,
+        copies: bool,
+    },
     Undo,
     Redo,
 }

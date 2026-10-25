@@ -331,7 +331,7 @@ fn format_vector(vector: cad_core::model::Vector3) -> String {
 }
 
 /// Dispatch one internal geometry value to its display tessellator.
-fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 3]>> {
+pub(crate) fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 3]>> {
     match geometry {
         Geometry::Line(line) => vec![vec![to_array(line.start), to_array(line.end)]],
         Geometry::Polyline(polyline) => polyline_paths(polyline),

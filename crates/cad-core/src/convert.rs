@@ -140,6 +140,7 @@ pub(crate) fn convert_document(
         .unwrap_or(1.0);
 
     let mut entities = Vec::new();
+    let mut next_id = ids.values().map(|id| id.0).max().map_or(0, |id| id + 1);
     for native_entity in model_space {
         let key = layer_key(entity_layer_name(native_entity));
         let layer_id = *layer_ids
@@ -157,8 +158,11 @@ pub(crate) fn convert_document(
                 );
                 continue;
             }
-            let next_id = EntityId(ids.len() as u32);
-            let id = *ids.entry(native_entity.common().handle).or_insert(next_id);
+            let id = *ids.entry(native_entity.common().handle).or_insert_with(|| {
+                let id = EntityId(next_id);
+                next_id += 1;
+                id
+            });
             report.record_converted(geometry.kind());
             entities.push(Entity {
                 id,

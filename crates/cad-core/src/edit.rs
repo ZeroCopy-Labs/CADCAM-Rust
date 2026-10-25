@@ -6,19 +6,45 @@ use std::path::Path;
 use acadrust::{CadDocument, Color as NativeColor, DxfWriter, Handle};
 
 use crate::convert::convert_document;
+use crate::geometry_edit::{native_geometry, AffineTransform, NewEntity};
 use crate::model::{Color, DrawingDocument, EntityId, FileFormat, LayerId, LengthUnit};
 
 const HISTORY_LIMIT: usize = 100;
 
 /// One committed batch, shared by apply, undo and redo notifications.
 #[derive(Clone, Copy, Debug)]
+pub enum DrawingChangeKind {
+    Color,
+    Layer,
+    Move,
+    Delete,
+    Create,
+    Transform,
+}
+impl DrawingChangeKind {
+    pub fn changes_geometry(self) -> bool {
+        !matches!(self, Self::Color | Self::Layer)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Color => "修改颜色",
+            Self::Layer => "修改所属图层",
+            Self::Move => "三维移动",
+            Self::Delete => "删除",
+            Self::Create => "创建",
+            Self::Transform => "批量变换/复制",
+        }
+    }
+}
+#[derive(Clone, Debug)]
 pub struct DrawingChange {
     /// Unique within this loaded drawing, including branches after undo.
     pub transaction_id: u64,
     /// Number of source entities affected by this batch.
     pub affected: usize,
     /// Original operation, also returned when this transaction is undone/redone.
-    pub edit: DrawingEdit,
+    pub kind: DrawingChangeKind,
+    pub created: Vec<EntityId>,
 }
 
 struct HistoryEntry {
@@ -268,16 +294,237 @@ impl EditableDrawing {
                 DrawingEdit::Delete => unreachable!(),
             }
         }
+        let kind = match edit {
+            DrawingEdit::SetColor(_) => DrawingChangeKind::Color,
+            DrawingEdit::SetLayer(_) => DrawingChangeKind::Layer,
+            DrawingEdit::Translate(_) => DrawingChangeKind::Move,
+            DrawingEdit::Delete => DrawingChangeKind::Delete,
+        };
+        self.commit(
+            candidate,
+            self.ids.clone(),
+            kind,
+            handles.len(),
+            if matches!(edit, DrawingEdit::Delete) {
+                selected.clone()
+            } else {
+                BTreeSet::new()
+            },
+            Vec::new(),
+        )
+    }
+
+    pub fn create(&mut self, entities: &[NewEntity]) -> Result<Option<DrawingChange>, String> {
+        if entities.is_empty() {
+            return Ok(None);
+        }
+        if entities.len() > 50_000 {
+            return Err("单次创建不能超过 50000 个图元".into());
+        }
+        let scale = self.unit_scale()?;
+        let mut candidate = self.native.clone();
         let mut ids = self.ids.clone();
+        let mut created = Vec::new();
+        let mut next_id = Self::next_id(&ids)?;
+        for item in entities {
+            let layer = self
+                .document
+                .layer(item.layer)
+                .ok_or("创建目标图层不存在")?;
+            let mut entity = native_geometry(&item.geometry, scale)?;
+            if let (acadrust::EntityType::Spline(spline), Some(n)) = (&mut entity, item.normal) {
+                spline.normal = acadrust::types::Vector3::new(n.x, n.y, n.z);
+            }
+            entity.common_mut().layer = layer.name.clone();
+            entity.common_mut().color = match item.color {
+                Color::ByLayer => NativeColor::ByLayer,
+                Color::ByBlock => NativeColor::ByBlock,
+                Color::None => NativeColor::None,
+                Color::Aci(i) => NativeColor::Index(i),
+                Color::Rgb { r, g, b } => NativeColor::Rgb { r, g, b },
+            };
+            if let acadrust::EntityType::Polyline3D(p) = &mut entity {
+                for vertex in &mut p.vertices {
+                    vertex.handle = candidate.allocate_handle();
+                }
+            }
+            let handle = candidate.add_entity(entity).map_err(|e| e.to_string())?;
+            let id = Self::fresh_id(&mut ids, handle, &mut next_id)?;
+            created.push(id);
+        }
+        self.commit(
+            candidate,
+            ids,
+            DrawingChangeKind::Create,
+            entities.len(),
+            BTreeSet::new(),
+            created,
+        )
+    }
+
+    pub fn transform(
+        &mut self,
+        selected: &BTreeSet<EntityId>,
+        transforms: &[AffineTransform],
+        copies: bool,
+    ) -> Result<Option<DrawingChange>, String> {
+        if selected.is_empty() || transforms.is_empty() {
+            return Ok(None);
+        }
+        if !copies && transforms.len() != 1 {
+            return Err("原位变换只接受一个变换".into());
+        }
+        if selected
+            .len()
+            .checked_mul(transforms.len())
+            .is_none_or(|n| n > 50_000)
+        {
+            return Err("单次变换最多影响 50000 个图元".into());
+        }
+        if !copies && transforms[0].identity() {
+            return Ok(None);
+        }
+        let scale = self.unit_scale()?;
+        let handles: BTreeMap<_, _> = self.ids.iter().map(|(h, id)| (*id, *h)).collect();
+        let mut sources = Vec::new();
+        for id in selected {
+            self.document.entity(*id).ok_or("选择中存在失效图元")?;
+            let handle = *handles.get(id).ok_or("图元缺少源记录")?;
+            sources.push((
+                handle,
+                self.native
+                    .get_entity(handle)
+                    .ok_or("源记录已失效")?
+                    .clone(),
+            ));
+        }
+        let mut candidate = self.native.clone();
+        let mut ids = self.ids.clone();
+        let mut created = Vec::new();
+        let mut next_id = Self::next_id(&ids)?;
+        for transform in transforms {
+            for (handle, source) in &sources {
+                let mut entity = source.clone();
+                Self::transform_native(&mut entity, *transform, scale);
+                if copies {
+                    let common = entity.common_mut();
+                    common.handle = Handle::NULL;
+                    common.owner_handle = Handle::NULL;
+                    common.raw_record = None;
+                    if let acadrust::EntityType::Polyline3D(p) = &mut entity {
+                        for vertex in &mut p.vertices {
+                            vertex.handle = candidate.allocate_handle();
+                        }
+                    }
+                    let handle = candidate.add_entity(entity).map_err(|e| e.to_string())?;
+                    created.push(Self::fresh_id(&mut ids, handle, &mut next_id)?);
+                } else {
+                    *candidate.get_entity_mut(*handle).ok_or("源记录失效")? = entity;
+                }
+            }
+        }
+        self.commit(
+            candidate,
+            ids,
+            DrawingChangeKind::Transform,
+            selected.len() * transforms.len(),
+            BTreeSet::new(),
+            created,
+        )
+    }
+
+    fn unit_scale(&self) -> Result<f64, String> {
+        Ok(self
+            .document
+            .source_units
+            .ok_or("请先明确图纸单位")?
+            .millimeters_per_unit())
+    }
+    fn next_id(ids: &BTreeMap<Handle, EntityId>) -> Result<u32, String> {
+        ids.values()
+            .map(|id| id.0)
+            .max()
+            .map_or(Some(0), |id| id.checked_add(1))
+            .ok_or_else(|| "图元 ID 已用尽".into())
+    }
+    fn fresh_id(
+        ids: &mut BTreeMap<Handle, EntityId>,
+        handle: Handle,
+        next: &mut u32,
+    ) -> Result<EntityId, String> {
+        let id = EntityId(*next);
+        *next = next.checked_add(1).ok_or("图元 ID 已用尽")?;
+        ids.insert(handle, id);
+        Ok(id)
+    }
+    fn transform_native(entity: &mut acadrust::EntityType, transform: AffineTransform, scale: f64) {
+        use acadrust::types::{Matrix4, Transform, Vector3};
+        // A transformed clone must not restore the source's verbatim DXF bytes.
+        entity.common_mut().raw_record = None;
+        let mut matrix = Matrix4::identity();
+        for i in 0..3 {
+            for j in 0..3 {
+                matrix.m[i][j] = transform.linear[i][j];
+            }
+        }
+        let origin = Vector3::new(
+            transform.origin[0] / scale,
+            transform.origin[1] / scale,
+            transform.origin[2] / scale,
+        );
+        let end = Vector3::new(
+            (transform.origin[0] + transform.offset[0]) / scale,
+            (transform.origin[1] + transform.offset[1]) / scale,
+            (transform.origin[2] + transform.offset[2]) / scale,
+        );
+        for stage in [
+            Transform::from_translation(-origin),
+            Transform::from_matrix(matrix),
+            Transform::from_translation(end),
+        ] {
+            if let acadrust::EntityType::Polyline2D(p) = entity {
+                let elevation = p
+                    .vertices
+                    .first()
+                    .map(|v| v.location.z)
+                    .filter(|z| *z != 0.0)
+                    .unwrap_or(p.elevation);
+                for v in &mut p.vertices {
+                    v.location.z = elevation;
+                }
+            }
+            entity.apply_transform(&stage);
+            if let acadrust::EntityType::Polyline2D(p) = entity {
+                if let Some(v) = p.vertices.first() {
+                    p.elevation = v.location.z;
+                }
+                for v in &mut p.vertices {
+                    v.location.z = 0.0;
+                }
+            }
+        }
+    }
+
+    fn commit(
+        &mut self,
+        candidate: CadDocument,
+        mut ids: BTreeMap<Handle, EntityId>,
+        kind: DrawingChangeKind,
+        affected: usize,
+        removed: BTreeSet<EntityId>,
+        created: Vec<EntityId>,
+    ) -> Result<Option<DrawingChange>, String> {
         let mut layer_ids = self.layer_ids.clone();
         let document = self.convert_snapshot(&candidate, &mut ids, &mut layer_ids);
-        let converted: BTreeSet<_> = document.entities.iter().map(|entity| entity.id).collect();
-        for entity in &self.document.entities {
-            if !(converted.contains(&entity.id)
-                || matches!(edit, DrawingEdit::Delete) && selected.contains(&entity.id))
-            {
-                return Err("编辑后存在无法转换的图元，已取消整批修改".to_string());
-            }
+        let converted: BTreeSet<_> = document.entities.iter().map(|e| e.id).collect();
+        if self
+            .document
+            .entities
+            .iter()
+            .any(|e| !removed.contains(&e.id) && !converted.contains(&e.id))
+            || created.iter().any(|id| !converted.contains(id))
+        {
+            return Err("编辑后存在无法转换的图元，已取消整批修改".into());
         }
         if document.entities == self.document.entities {
             return Ok(None);
@@ -285,13 +532,14 @@ impl EditableDrawing {
         self.serial += 1;
         let change = DrawingChange {
             transaction_id: self.serial,
-            affected: handles.len(),
-            edit,
+            affected,
+            kind,
+            created,
         };
         self.history.push_back(HistoryEntry {
             native: std::mem::replace(&mut self.native, candidate),
             revision: self.revision,
-            change,
+            change: change.clone(),
         });
         if self.history.len() > HISTORY_LIMIT {
             self.history.pop_front();
@@ -306,11 +554,11 @@ impl EditableDrawing {
 
     pub fn undo(&mut self) -> Option<DrawingChange> {
         let entry = self.history.pop_back()?;
-        let change = entry.change;
+        let change = entry.change.clone();
         self.redo.push(HistoryEntry {
             native: std::mem::replace(&mut self.native, entry.native),
             revision: std::mem::replace(&mut self.revision, entry.revision),
-            change,
+            change: change.clone(),
         });
         self.refresh_document();
         Some(change)
@@ -318,11 +566,11 @@ impl EditableDrawing {
 
     pub fn redo(&mut self) -> Option<DrawingChange> {
         let entry = self.redo.pop()?;
-        let change = entry.change;
+        let change = entry.change.clone();
         self.history.push_back(HistoryEntry {
             native: std::mem::replace(&mut self.native, entry.native),
             revision: std::mem::replace(&mut self.revision, entry.revision),
-            change,
+            change: change.clone(),
         });
         self.refresh_document();
         Some(change)

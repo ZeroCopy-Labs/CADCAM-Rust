@@ -3,3 +3,7 @@
 resolver = "2"
 members = ["crates/cad-core", "crates/cad-app"]
 default-members = ["crates/cad-app"]
+
+# Keep the GNU executable loadable as embedded dependency debug data grows.
+[profile.dev.package.cad-app]
+strip = "debuginfo"

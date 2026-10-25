@@ -27,6 +27,7 @@ mod cad_command;
 mod cad_edit;
 mod cad_file;
 mod cad_selection;
+mod cad_tools;
 mod cad_view;
 mod cam;
 mod cam_analysis;
@@ -360,20 +361,47 @@ fn submit_command(
                 .cad_command
                 .set_preset(upper[4..].trim())
                 .map(|_| None),
-            _ => Err("可用命令：MOVE / M、UCS XY / YZ / ZX / 3P、UNDO、REDO".into()),
+            _ if state.cad_command.begin_named(&upper, &selection.selected) => Ok(None),
+            _ => Err("可用命令见左侧工具或绘图/编辑菜单：LINE、PLINE、RECTANGLE、CIRCLE、ARC、ELLIPSE、SPLINE、COPY、ROTATE、SCALE、MIRROR、ARRAYRECT、ARRAYPOLAR".into()),
         }
     };
     match result {
         Ok(Some(commit)) => {
-            selection.selected = commit.ids;
-            if apply_cad_action(
-                state,
-                selection,
-                cad_edit::EditAction::Apply(DrawingEdit::Translate(commit.offset)),
-            ) {
+            let action = match commit {
+                cad_command::CommandCommit::Move(commit) => {
+                    selection.selected = commit.ids;
+                    cad_edit::EditAction::Apply(DrawingEdit::Translate(commit.offset))
+                }
+                cad_command::CommandCommit::Create { geometry, normal } => {
+                    let Some(layer) = state.cad_command.tools.layer else {
+                        push_message(state, "请先选择新图元所属图层");
+                        return;
+                    };
+                    cad_edit::EditAction::Create(
+                        geometry
+                            .into_iter()
+                            .map(|geometry| cad_core::geometry_edit::NewEntity {
+                                geometry,
+                                layer,
+                                color: state.cad_command.tools.color,
+                                normal: Some(normal),
+                            })
+                            .collect(),
+                    )
+                }
+                cad_command::CommandCommit::Transform {
+                    ids,
+                    transforms,
+                    copies,
+                } => {
+                    selection.selected = ids;
+                    cad_edit::EditAction::Transform { transforms, copies }
+                }
+            };
+            if apply_cad_action(state, selection, action) {
                 state.cad_command.cancel();
             } else {
-                state.cad_command.error = "移动未提交，请修改目标坐标或取消".into();
+                state.cad_command.error = "操作未提交，请调整参数或取消".into();
             }
         }
         Ok(None) => {
@@ -390,7 +418,8 @@ fn submit_command(
     }
     if state.cad_command.is_active() {
         state.command_open = true;
-        push_message(state, state.cad_command.prompt());
+        let prompt = state.cad_command.prompt();
+        push_message(state, prompt);
     }
 }
 
@@ -656,6 +685,35 @@ fn draw_scene(
         }
     }
 
+    if space.mode == SpaceMode::Cad {
+        for path in state.cad_command.drawing_preview() {
+            for pair in path.windows(2) {
+                let a = state.view.point(pair[0]);
+                let b = state.view.point(pair[1]);
+                if a.is_finite() && b.is_finite() {
+                    selected_gizmos.line(a, b, Color::srgb(0.15, 1.0, 1.0));
+                }
+            }
+        }
+        if let Some((ids, transforms)) = state.cad_command.transform_preview() {
+            for path in state
+                .display
+                .paths
+                .iter()
+                .filter(|p| ids.contains(&p.entity_id))
+            {
+                for transform in &transforms {
+                    for pair in path.points.windows(2) {
+                        let a = state.view.point(transform.point(pair[0]));
+                        let b = state.view.point(transform.point(pair[1]));
+                        if a.is_finite() && b.is_finite() {
+                            selected_gizmos.line(a, b, Color::srgb(0.15, 1.0, 1.0));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Keep the axes at the CAD world origin, never at the drawing center.
     let extent = state
         .display
@@ -2332,8 +2390,52 @@ fn drawing_ui(
                     ui.close();
                 }
             });
+            ui.add_enabled_ui(
+                space.mode == SpaceMode::Cad
+                    && state.drawing.is_some()
+                    && !state.cad_command.is_active(),
+                |ui| {
+                    ui.menu_button("绘图", |ui| {
+                        for kind in [
+                            cad_core::geometry_edit::SketchKind::Line,
+                            cad_core::geometry_edit::SketchKind::Polyline,
+                            cad_core::geometry_edit::SketchKind::Rectangle,
+                            cad_core::geometry_edit::SketchKind::Circle,
+                            cad_core::geometry_edit::SketchKind::Arc,
+                            cad_core::geometry_edit::SketchKind::Ellipse,
+                            cad_core::geometry_edit::SketchKind::Spline,
+                        ] {
+                            if ui.button(kind.label()).clicked() {
+                                command_request = Some(kind.command().into());
+                                ui.close();
+                            }
+                        }
+                    });
+                },
+            );
             ui.add_enabled_ui(space.mode == SpaceMode::Cad, |ui| {
                 ui.menu_button("编辑", |ui| {
+                    ui.add_enabled_ui(
+                        state.drawing.is_some() && !state.cad_command.is_active(),
+                        |ui| {
+                            if ui.button("复制（基点/目标点）").clicked() {
+                                command_request = Some("COPY".into());
+                                ui.close();
+                            }
+                            for kind in [
+                                cad_tools::TransformKind::Rotate,
+                                cad_tools::TransformKind::Scale,
+                                cad_tools::TransformKind::Mirror,
+                                cad_tools::TransformKind::RectArray,
+                                cad_tools::TransformKind::PolarArray,
+                            ] {
+                                if ui.button(kind.label()).clicked() {
+                                    command_request = Some(kind.command().into());
+                                    ui.close();
+                                }
+                            }
+                        },
+                    );
                     if ui
                         .add_enabled(
                             state.drawing.is_some() && !state.cad_command.is_active(),
@@ -2588,9 +2690,18 @@ fn drawing_ui(
                                     }
                                 }
                             });
-                            if state.drawing.is_some() {
-                                if let Some(command) = state.cad_command.controls_ui(ui) {
-                                    command_request = Some(command);
+                            {
+                                let ViewerState {
+                                    drawing,
+                                    cad_command,
+                                    ..
+                                } = &mut *state;
+                                if let Some(drawing) = drawing.as_ref() {
+                                    if let Some(command) =
+                                        cad_command.controls_ui(ui, drawing.document())
+                                    {
+                                        command_request = Some(command);
+                                    }
                                 }
                             }
                             let editing_enabled = !state.cad_command.is_active();
@@ -4108,28 +4219,37 @@ fn apply_cad_action(
         return false;
     }
     match action {
-        cad_edit::EditAction::Apply(edit) => {
-            let before = capture_cad_context(state, selection, edit.changes_geometry());
-            match state
-                .drawing
-                .as_mut()
-                .unwrap()
-                .apply(&cad_edit::entity_ids(&selection.selected), edit)
-            {
+        action @ (cad_edit::EditAction::Apply(_)
+        | cad_edit::EditAction::Create(_)
+        | cad_edit::EditAction::Transform { .. }) => {
+            let geometry_changed = match &action {
+                cad_edit::EditAction::Apply(edit) => edit.changes_geometry(),
+                _ => true,
+            };
+            let before = capture_cad_context(state, selection, geometry_changed);
+            let ids = cad_edit::entity_ids(&selection.selected);
+            let drawing = state.drawing.as_mut().unwrap();
+            let result = match action {
+                cad_edit::EditAction::Apply(edit) => drawing.apply(&ids, edit),
+                cad_edit::EditAction::Create(entities) => drawing.create(&entities),
+                cad_edit::EditAction::Transform { transforms, copies } => {
+                    drawing.transform(&ids, &transforms, copies)
+                }
+                _ => unreachable!(),
+            };
+            match result {
                 Ok(None) => {
                     push_message(state, "没有需要修改的图元");
                     return true;
                 }
                 Ok(Some(change)) => {
                     state.cad_history.insert(change.transaction_id, before);
-                    refresh_edited_drawing(state, change, None);
+                    refresh_edited_drawing(state, &change, None);
                     selection.cam_selected.clear();
-                    let operation = match change.edit {
-                        DrawingEdit::SetColor(_) => "修改颜色",
-                        DrawingEdit::SetLayer(_) => "修改所属图层",
-                        DrawingEdit::Translate(_) => "三维移动",
-                        DrawingEdit::Delete => "删除",
-                    };
+                    if !change.created.is_empty() {
+                        selection.selected = change.created.iter().map(|id| id.0).collect();
+                    }
+                    let operation = change.kind.label();
                     push_message(
                         state,
                         format!(
@@ -4137,7 +4257,7 @@ fn apply_cad_action(
                             change.affected
                         ),
                     );
-                    if change.edit.changes_geometry() {
+                    if change.kind.changes_geometry() {
                         push_message(
                             state,
                             "已根据当前几何重建 CAM；手动断面、配对和排序需重新确认",
@@ -4158,14 +4278,14 @@ fn apply_cad_action(
                 return false;
             };
             // Swap the context for this transaction so undo and redo stay symmetric.
-            let current = capture_cad_context(state, selection, change.edit.changes_geometry());
+            let current = capture_cad_context(state, selection, change.kind.changes_geometry());
             let restored = state
                 .cad_history
                 .insert(change.transaction_id, current)
                 .expect("every committed CAD transaction has an application context");
             selection.selected = restored.selected;
             selection.cam_selected = restored.cam_selected;
-            refresh_edited_drawing(state, change, restored.machining);
+            refresh_edited_drawing(state, &change, restored.machining);
             push_message(
                 state,
                 if redo {
@@ -4218,7 +4338,7 @@ fn capture_cad_context(
 
 fn refresh_edited_drawing(
     state: &mut ViewerState,
-    change: DrawingChange,
+    change: &DrawingChange,
     restored: Option<(
         cam_analysis::CamAnalysis,
         cam_analysis::TubeSection,
@@ -4231,7 +4351,7 @@ fn refresh_edited_drawing(
     state.entity_count = document.entity_count();
     state.layer_count = document.layers.len();
     state.warning_count = document.import_report.warnings.len();
-    if change.edit.changes_geometry() {
+    if change.kind.changes_geometry() {
         state.cam = cam::build_cam_model(document);
         if let Some((analysis, manual_tube, manual_pair)) = restored {
             state.analysis = analysis;

@@ -2,11 +2,25 @@
 
 use std::collections::BTreeSet;
 
+use super::cad_tools::{ToolOptions, TransformKind};
 use bevy::prelude::*;
 use bevy_egui::egui;
-use cad_core::model::{Point3, WorkPlane};
+use cad_core::geometry_edit::{AffineTransform, Sketch, SketchKind};
+use cad_core::model::{Geometry, Point3, WorkPlane};
 
 enum Step {
+    Draw {
+        sketch: Sketch,
+        confirmed: bool,
+    },
+    TransformSelect {
+        kind: TransformKind,
+    },
+    Transform {
+        kind: TransformKind,
+        ids: BTreeSet<u32>,
+        base: Option<[f64; 3]>,
+    },
     Select,
     Base {
         ids: BTreeSet<u32>,
@@ -35,8 +49,22 @@ pub struct MoveCommit {
     pub offset: [f64; 3],
 }
 
+pub enum CommandCommit {
+    Move(MoveCommit),
+    Create {
+        geometry: Vec<Geometry>,
+        normal: cad_core::model::Vector3,
+    },
+    Transform {
+        ids: BTreeSet<u32>,
+        transforms: Vec<AffineTransform>,
+        copies: bool,
+    },
+}
 #[derive(Default)]
 pub struct CommandState {
+    pub tools: ToolOptions,
+    copying: bool,
     pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
     step: Option<Step>,
@@ -58,28 +86,88 @@ impl CommandState {
         self.step.is_some()
     }
     pub fn selecting(&self) -> bool {
-        matches!(self.step, Some(Step::Select))
+        matches!(self.step, Some(Step::Select | Step::TransformSelect { .. }))
     }
     pub fn takes_point(&self) -> bool {
-        self.is_active() && !self.selecting() && !matches!(self.step, Some(Step::Confirm { .. }))
+        self.is_active()
+            && !self.selecting()
+            && !matches!(
+                self.step,
+                Some(
+                    Step::Confirm { .. }
+                        | Step::Draw {
+                            confirmed: true,
+                            ..
+                        }
+                        | Step::Transform { base: Some(_), .. }
+                )
+            )
     }
 
-    pub fn prompt(&self) -> &'static str {
+    pub fn prompt(&self) -> String {
         match &self.step {
-            None => "就绪：MOVE / M 移动；UCS XY / YZ / ZX / 3P 设置工作平面",
-            Some(Step::Select) => "移动 1/4：选择图元，Enter 确认选择；Esc 取消",
-            Some(Step::Base { .. }) => "移动 2/4：指定基点（画布点选或输入坐标）；Esc 取消",
-            Some(Step::Target { .. }) => "移动 3/4：指定目标点；仅预览，不改图纸；Esc 取消",
+            Some(Step::Draw { sketch, confirmed }) => {
+                return if *confirmed {
+                    format!(
+                        "{}：Enter 提交；输入坐标修改最后一点；Esc 取消",
+                        sketch.kind.label()
+                    )
+                } else {
+                    format!(
+                        "{}：已取 {} 点；{}；U 撤回一点，Esc 取消",
+                        sketch.kind.label(),
+                        sketch.points.len(),
+                        if sketch.kind.continuous() {
+                            "继续取点，Enter 结束，C 闭合"
+                        } else {
+                            "指定下一点；圆的半径/椭圆短半轴可输入长度"
+                        }
+                    )
+                }
+            }
+            Some(Step::TransformSelect { kind }) => {
+                return format!("{}：选择图元后 Enter；Esc 取消", kind.label())
+            }
+            Some(Step::Transform { kind, base, .. }) => {
+                return format!(
+                    "{}：{}",
+                    kind.label(),
+                    if base.is_some() {
+                        "预览已固定，可修改左侧参数，Enter 提交"
+                    } else {
+                        "指定基点 / 中心 / 镜像平面经过的点"
+                    }
+                )
+            }
+            None => "就绪：选择绘图 / 变换工具；UCS XY / YZ / ZX / 3P 设置工作平面",
+            Some(Step::Select) => "移动/复制 1/4：选择图元，Enter 确认选择；Esc 取消",
+            Some(Step::Base { .. }) => {
+                return format!(
+                    "{} 2/4：指定基点（画布点选或输入坐标）；Esc 取消",
+                    if self.copying { "复制" } else { "移动" }
+                )
+            }
+            Some(Step::Target { .. }) => {
+                return format!(
+                    "{} 3/4：指定目标点；仅预览，不改图纸；Esc 取消",
+                    if self.copying { "复制" } else { "移动" }
+                )
+            }
             Some(Step::Confirm { .. }) => {
-                "移动 4/4：Enter / 确认移动提交；可重新输入目标坐标；Esc 取消"
+                return format!(
+                    "{} 4/4：Enter / 确认提交；可重新输入目标坐标；Esc 取消",
+                    if self.copying { "复制" } else { "移动" }
+                )
             }
             Some(Step::PlaneOrigin) => "三点平面 1/3：指定原点；Esc 取消",
             Some(Step::PlaneAxis { .. }) => "三点平面 2/3：指定 +U 方向上的点；Esc 取消",
             Some(Step::PlaneThird { .. }) => "三点平面 3/3：指定 +V 一侧的点；三点不能共线",
         }
+        .to_string()
     }
 
     pub fn begin_move(&mut self, ids: &BTreeSet<u32>) {
+        self.copying = false;
         self.ray_error.clear();
         self.step = Some(if ids.is_empty() {
             Step::Select
@@ -90,6 +178,60 @@ impl CommandState {
         self.error.clear();
     }
 
+    pub fn begin_named(&mut self, name: &str, ids: &BTreeSet<u32>) -> bool {
+        if matches!(name, "COPY" | "CO" | "复制") {
+            self.begin_move(ids);
+            self.copying = true;
+            return true;
+        }
+        for kind in [
+            SketchKind::Line,
+            SketchKind::Polyline,
+            SketchKind::Rectangle,
+            SketchKind::Circle,
+            SketchKind::Arc,
+            SketchKind::Ellipse,
+            SketchKind::Spline,
+        ] {
+            if name == kind.command()
+                || matches!(
+                    (name, kind),
+                    ("L", SketchKind::Line)
+                        | ("PL", SketchKind::Polyline)
+                        | ("RECT", SketchKind::Rectangle)
+                )
+            {
+                self.cancel();
+                self.step = Some(Step::Draw {
+                    sketch: Sketch::new(kind, self.plane, self.tools.degree),
+                    confirmed: false,
+                });
+                return true;
+            }
+        }
+        for kind in [
+            TransformKind::Rotate,
+            TransformKind::Scale,
+            TransformKind::Mirror,
+            TransformKind::RectArray,
+            TransformKind::PolarArray,
+        ] {
+            if name == kind.command() {
+                self.cancel();
+                self.step = Some(if ids.is_empty() {
+                    Step::TransformSelect { kind }
+                } else {
+                    Step::Transform {
+                        kind,
+                        ids: ids.clone(),
+                        base: None,
+                    }
+                });
+                return true;
+            }
+        }
+        false
+    }
     pub fn cancel(&mut self) {
         self.aids.clear();
         self.ray_error.clear();
@@ -121,6 +263,15 @@ impl CommandState {
 
     fn reference(&self) -> [f64; 3] {
         match &self.step {
+            Some(Step::Draw { sketch, .. }) => sketch
+                .points
+                .last()
+                .copied()
+                .map(array)
+                .unwrap_or(array(self.plane.origin)),
+            Some(Step::Transform {
+                base: Some(base), ..
+            }) => *base,
             Some(Step::Target { base, .. } | Step::Confirm { base, .. }) => *base,
             Some(Step::PlaneAxis { origin } | Step::PlaneThird { origin, .. }) => *origin,
             _ => array(self.plane.origin),
@@ -128,7 +279,10 @@ impl CommandState {
     }
 
     fn snap_reference(&self) -> Option<Point3> {
-        match self.step {
+        match &self.step {
+            Some(Step::Draw { sketch, .. }) if !sketch.points.is_empty() => {
+                Some(*sketch.points.last().unwrap())
+            }
             Some(
                 Step::Target { .. }
                 | Step::Confirm { .. }
@@ -149,7 +303,102 @@ impl CommandState {
         &mut self,
         text: &str,
         selected: &BTreeSet<u32>,
-    ) -> Result<Option<MoveCommit>, String> {
+    ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::TransformSelect { kind }) = self.step {
+            if !text.trim().is_empty() || selected.is_empty() {
+                return Err("请先选择图元，再按 Enter".into());
+            }
+            self.step = Some(Step::Transform {
+                kind,
+                ids: selected.clone(),
+                base: None,
+            });
+            return Ok(None);
+        }
+        if let Some(Step::Transform {
+            kind,
+            ids,
+            base: Some(base),
+        }) = &self.step
+        {
+            if text.trim().is_empty() {
+                let (transforms, copies) =
+                    self.tools.transforms(*kind, *base, self.plane, ids.len())?;
+                return Ok(Some(CommandCommit::Transform {
+                    ids: ids.clone(),
+                    transforms,
+                    copies,
+                }));
+            }
+            if matches!(kind, TransformKind::Rotate | TransformKind::Scale)
+                && !text.contains([',', ' '])
+            {
+                let value = number(text)?;
+                if *kind == TransformKind::Rotate {
+                    self.tools.angle = value;
+                } else {
+                    self.tools.scale = value;
+                }
+                self.tools.transforms(*kind, *base, self.plane, ids.len())?;
+                return Ok(None);
+            }
+        }
+        if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
+            let upper = text.trim().to_uppercase();
+            if matches!(upper.as_str(), "U" | "UNDO") {
+                sketch.points.pop().ok_or("没有可撤回的点")?;
+                sketch.closed = false;
+                *confirmed = false;
+                return Ok(None);
+            }
+            if text.trim().is_empty() {
+                let geometry = sketch.geometry()?;
+                if *confirmed {
+                    return Ok(Some(CommandCommit::Create {
+                        geometry,
+                        normal: sketch.plane.normal(),
+                    }));
+                }
+                *confirmed = true;
+                return Ok(None);
+            }
+            if matches!(upper.as_str(), "C" | "CLOSE" | "闭合") {
+                if !sketch.kind.continuous() {
+                    return Err("该工具不支持闭合选项".into());
+                }
+                let mut next = sketch.clone();
+                next.closed = true;
+                next.geometry()?;
+                *sketch = next;
+                *confirmed = true;
+                return Ok(None);
+            }
+            if !text.contains([',', ' '])
+                && ((sketch.kind == SketchKind::Circle && sketch.points.len() >= 1)
+                    || (sketch.kind == SketchKind::Ellipse && sketch.points.len() >= 2))
+            {
+                let radius = number(text)?;
+                if radius <= 1e-9 {
+                    return Err("半径/半轴长度必须大于零".into());
+                }
+                let c = sketch.points[0];
+                let direction = if sketch.kind == SketchKind::Circle {
+                    sketch.plane.x_axis
+                } else {
+                    let a = sketch.points[1];
+                    sketch.plane.normal().cross(
+                        cad_core::model::Vector3::new(a.x - c.x, a.y - c.y, a.z - c.z).normalize(),
+                    )
+                };
+                let p = [
+                    c.x + direction.x * radius,
+                    c.y + direction.y * radius,
+                    c.z + direction.z * radius,
+                ];
+                self.accept_point(p)?;
+                return Ok(None);
+            }
+        }
         if matches!(self.step, Some(Step::Select)) {
             if !text.trim().is_empty() {
                 return Err("请先在画布选择图元，再按 Enter 确认".into());
@@ -165,9 +414,18 @@ impl CommandState {
         }
         if text.trim().is_empty() {
             if let Some(Step::Confirm { ids, base, target }) = &self.step {
-                return Ok(Some(MoveCommit {
+                let commit = MoveCommit {
                     ids: ids.clone(),
                     offset: std::array::from_fn(|i| target[i] - base[i]),
+                };
+                return Ok(Some(if self.copying {
+                    CommandCommit::Transform {
+                        ids: commit.ids,
+                        transforms: vec![AffineTransform::translation(commit.offset)?],
+                        copies: true,
+                    }
+                } else {
+                    CommandCommit::Move(commit)
                 }));
             }
             let point = self.hover.ok_or("请点选有效位置，或输入精确坐标")?;
@@ -181,6 +439,31 @@ impl CommandState {
 
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::Draw { sketch, confirmed } => {
+                let mut next = sketch.clone();
+                if *confirmed {
+                    next.points.pop();
+                }
+                next.push(as_point(point))?;
+                let done = *confirmed
+                    || !next.kind.continuous() && next.points.len() >= next.kind.required();
+                if done {
+                    next.geometry()?;
+                }
+                Some(Step::Draw {
+                    sketch: next,
+                    confirmed: done,
+                })
+            }
+            Step::Transform { kind, ids, .. } => {
+                self.tools.transforms(*kind, point, self.plane, ids.len())?;
+                Some(Step::Transform {
+                    kind: *kind,
+                    ids: ids.clone(),
+                    base: Some(point),
+                })
+            }
+            Step::TransformSelect { .. } => return Err("请先确认选择".into()),
             Step::Base { ids } => Some(Step::Target {
                 ids: ids.clone(),
                 base: point,
@@ -285,11 +568,52 @@ impl CommandState {
         })
     }
 
+    pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        let Some(Step::Draw { sketch, confirmed }) = &self.step else {
+            return Vec::new();
+        };
+        let mut sketch = sketch.clone();
+        if !confirmed {
+            if let Some(p) = self.hover {
+                let _ = sketch.push(as_point(p));
+            }
+        }
+        match sketch.geometry() {
+            Ok(geometry) => geometry
+                .iter()
+                .flat_map(super::display::tessellate_geometry)
+                .collect(),
+            Err(_) => vec![sketch.points.iter().copied().map(array).collect()],
+        }
+    }
+    pub fn transform_preview(&self) -> Option<(BTreeSet<u32>, Vec<AffineTransform>)> {
+        let Some(Step::Transform { kind, ids, base }) = &self.step else {
+            return None;
+        };
+        let (transforms, _) = self
+            .tools
+            .transforms(*kind, base.or(self.hover)?, self.plane, ids.len())
+            .ok()?;
+        Some((ids.clone(), transforms))
+    }
     /// Return a command-bar submission, keeping all buttons on the same execution path.
-    pub fn controls_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    pub fn controls_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &cad_core::DrawingDocument,
+    ) -> Option<String> {
         let mut command = None;
-        ui.strong("精确移动与工作平面");
+        ui.strong("绘图、变换与工作平面");
         self.aids.controls(ui);
+        ui.add_enabled_ui(!self.is_active(), |ui| self.tools.style_ui(ui, document));
+        if let Some(Step::Transform { kind, ids, base }) = &self.step {
+            self.tools.transform_ui(ui, *kind);
+            if let Some(base) = base {
+                if let Err(error) = self.tools.transforms(*kind, *base, self.plane, ids.len()) {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+            }
+        }
         ui.label(self.prompt());
         if self.is_active() {
             if !self.error_message().is_empty() {
@@ -311,13 +635,40 @@ impl CommandState {
                 ui.label(format!("预览 Δ：{x:.4}, {y:.4}, {z:.4} mm"));
             }
             ui.horizontal(|ui| {
-                if matches!(self.step, Some(Step::Select)) && ui.button("确认选择").clicked() {
+                if self.selecting() && ui.button("确认选择").clicked() {
                     command = Some(String::new());
                 }
-                if matches!(self.step, Some(Step::Confirm { .. }))
-                    && ui.button("确认移动").clicked()
+                if matches!(
+                    self.step,
+                    Some(
+                        Step::Confirm { .. }
+                            | Step::Draw {
+                                confirmed: true,
+                                ..
+                            }
+                            | Step::Transform { base: Some(_), .. }
+                    )
+                ) && ui.button("确认 / 提交").clicked()
                 {
                     command = Some(String::new());
+                }
+                if matches!(
+                    self.step,
+                    Some(Step::Draw {
+                        confirmed: false,
+                        ..
+                    })
+                ) {
+                    let continuous = matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous());
+                    if continuous && ui.button("结束取点").clicked() {
+                        command = Some(String::new());
+                    }
+                    if ui.button("撤回一点").clicked() {
+                        command = Some("U".into());
+                    }
+                    if continuous && ui.button("闭合").clicked() {
+                        command = Some("C".into());
+                    }
                 }
                 if ui.button("取消  Esc").clicked() {
                     command = Some("CANCEL".into());
@@ -325,6 +676,41 @@ impl CommandState {
             });
             ui.small("x,y,z：WCS；u,v：平面；@：相对；@长度<角度：平面极坐标");
         } else {
+            egui::CollapsingHeader::new("绘图与变换工具")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for kind in [
+                            SketchKind::Line,
+                            SketchKind::Polyline,
+                            SketchKind::Rectangle,
+                            SketchKind::Circle,
+                            SketchKind::Arc,
+                            SketchKind::Ellipse,
+                            SketchKind::Spline,
+                        ] {
+                            if ui.button(kind.label()).clicked() {
+                                command = Some(kind.command().into());
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("复制").clicked() {
+                            command = Some("COPY".into());
+                        }
+                        for kind in [
+                            TransformKind::Rotate,
+                            TransformKind::Scale,
+                            TransformKind::Mirror,
+                            TransformKind::RectArray,
+                            TransformKind::PolarArray,
+                        ] {
+                            if ui.button(kind.label()).clicked() {
+                                command = Some(kind.command().into());
+                            }
+                        }
+                    });
+                });
             if ui.button("基点 → 目标点移动  Ctrl+M").clicked() {
                 command = Some("MOVE".into());
             }
