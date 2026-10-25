@@ -152,12 +152,7 @@ impl ToolOptions {
                     ui.add(egui::DragValue::new(&mut self.scale).speed(0.05));
                 });
             }
-            TransformKind::Mirror => {
-                ui.checkbox(
-                    &mut self.mirror_plane,
-                    "关于工作平面镜像（关闭时关于平面内 U 轴）",
-                );
-            }
+            TransformKind::Mirror => {}
             TransformKind::RectArray => {
                 ui.horizontal(|ui| {
                     ui.label("行 / 列（含原件）");
@@ -186,6 +181,16 @@ impl ToolOptions {
                 ui.small("整圆不重复终点；部分角度包含首末项，副本随轴旋转。");
             }
         }
+        self.advanced_transform_ui(ui, kind);
+    }
+    pub fn advanced_transform_ui(&mut self, ui: &mut egui::Ui, kind: TransformKind) {
+        if kind == TransformKind::Mirror {
+            ui.checkbox(
+                &mut self.mirror_plane,
+                "关于工作平面镜像（关闭时在画布指定两点轴线）",
+            );
+            ui.small("完成镜像轴/平面后选择是否替换源对象，默认保留。");
+        }
         if matches!(
             kind,
             TransformKind::Rotate | TransformKind::Mirror | TransformKind::PolarArray
@@ -202,7 +207,10 @@ impl ToolOptions {
                 ui.small("旋转/环阵轴为工作平面法向；镜像基点用于确定平面或轴线的位置。");
             }
         }
-        if !matches!(kind, TransformKind::RectArray | TransformKind::PolarArray) {
+        if !matches!(
+            kind,
+            TransformKind::RectArray | TransformKind::PolarArray | TransformKind::Mirror
+        ) {
             ui.checkbox(&mut self.copies, "保留原件并创建副本");
         }
     }

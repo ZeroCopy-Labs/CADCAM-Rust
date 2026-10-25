@@ -10,6 +10,7 @@ use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
+    TransformPick(super::cad_transform_command::Session),
     CurvePick(super::cad_curve_command::Session),
     PlaneSelect,
     EraseSelect,
@@ -146,6 +147,12 @@ impl CommandState {
     pub fn curve_change_distance(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.can_change_distance())
     }
+    pub fn transform_reference(&self) -> bool {
+        matches!(&self.step,Some(Step::TransformPick(s)) if s.can_reference())
+    }
+    pub fn mirror_question(&self) -> bool {
+        matches!(&self.step,Some(Step::TransformPick(s)) if s.mirror_question())
+    }
     pub fn curve_undo_id(&self) -> Option<u64> {
         if let Some(Step::CurvePick(s)) = &self.step {
             s.undo_id()
@@ -224,7 +231,12 @@ impl CommandState {
         matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous() && sketch.geometry().is_ok())
     }
     pub fn ready(&self) -> bool {
-        if let Some(Step::CurvePick(s))=&self.step {return s.confirmed();}
+        if let Some(Step::TransformPick(s)) = &self.step {
+            return s.ready();
+        }
+        if let Some(Step::CurvePick(s)) = &self.step {
+            return s.confirmed();
+        }
         matches!(
             &self.step,
             Some(
@@ -263,11 +275,23 @@ impl CommandState {
         self.step.is_some()
     }
     pub fn needs_options(&self) -> bool {
-        matches!(self.step, Some(Step::Transform { .. } | Step::Curves(_) | Step::CurvePick(_)))
-            || matches!(self.step, Some(Step::Utility { kind, .. }) if !kind.measuring())
+        matches!(
+            self.step,
+            Some(
+                Step::Transform { .. }
+                    | Step::TransformPick(_)
+                    | Step::Curves(_)
+                    | Step::CurvePick(_)
+            )
+        ) || matches!(self.step, Some(Step::Utility { kind, .. }) if !kind.measuring())
     }
     pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
         use super::cad_input::{Kind, Spec};
+        if let Some(Step::TransformPick(s)) = &self.step {
+            if let Some(spec) = s.spec(self.hover.map(as_point), &self.tools, self.plane) {
+                return Some(spec);
+            }
+        }
         if let Some(Step::CurvePick(s)) = &self.step {
             if !s.side() {
                 return s.parameter_spec(self.point_plane());
@@ -346,6 +370,10 @@ impl CommandState {
         })
     }
     pub fn preview_scalar(&mut self, text: &str) {
+        if let Some(Step::TransformPick(s)) = &mut self.step {
+            s.preview_value(text, &mut self.tools);
+            return;
+        }
         let Some(Step::Transform {
             kind,
             ids,
@@ -466,6 +494,9 @@ impl CommandState {
         self.aids.clear();
     }
     pub fn selecting(&self) -> bool {
+        if let Some(Step::TransformPick(s)) = &self.step {
+            return s.selecting();
+        }
         if let Some(Step::CurvePick(s)) = &self.step {
             return s.selecting();
         }
@@ -475,6 +506,9 @@ impl CommandState {
         ) || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
+        if let Some(Step::TransformPick(s)) = &self.step {
+            return s.takes_point();
+        }
         if let Some(Step::CurvePick(s)) = &self.step {
             return s.side();
         }
@@ -507,6 +541,7 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::TransformPick(s)) => return s.prompt(),
             Some(Step::CurvePick(s)) => return s.prompt(),
             Some(Step::PlaneSelect) => {
                 return "工作平面：输入 XY / YZ / ZX / 3P，Enter 默认为 XY；Esc 取消".into()
@@ -693,6 +728,9 @@ impl CommandState {
         }
     }
     fn point_plane(&self) -> WorkPlane {
+        if let Some(Step::TransformPick(s)) = &self.step {
+            return s.point_plane(&self.tools, self.plane);
+        }
         if let Some(Step::CurvePick(s)) = &self.step {
             if s.side() {
                 return s.side_plane().unwrap_or(self.plane);
@@ -800,6 +838,15 @@ impl CommandState {
         ] {
             if name == kind.command() {
                 self.cancel();
+                if matches!(
+                    kind,
+                    TransformKind::Rotate | TransformKind::Scale | TransformKind::Mirror
+                ) {
+                    self.step = Some(Step::TransformPick(
+                        super::cad_transform_command::Session::new(kind, ids),
+                    ));
+                    return true;
+                }
                 self.step = Some(if ids.is_empty() {
                     Step::TransformSelect { kind }
                 } else {
@@ -846,6 +893,7 @@ impl CommandState {
 
     fn reference(&self) -> [f64; 3] {
         match &self.step {
+            Some(Step::TransformPick(s)) => array(s.reference_point().unwrap_or(self.plane.origin)),
             Some(Step::CurvePick(s)) if s.side() => s
                 .side_plane()
                 .map(|p| array(p.origin))
@@ -884,6 +932,7 @@ impl CommandState {
 
     fn snap_reference(&self) -> Option<Point3> {
         match &self.step {
+            Some(Step::TransformPick(s)) => s.reference_point(),
             Some(Step::Utility { points, .. }) => points.last().copied(),
             Some(Step::ArraySpacing { base, .. } | Step::Paste { base, .. }) => {
                 Some(as_point(*base))
@@ -914,6 +963,49 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::TransformPick(s)) = &mut self.step {
+            let point_expression = text.starts_with(['@', '#'])
+                || text.contains([',', '，', '<'])
+                || text.split_whitespace().count() > 1;
+            if s.takes_point() && point_expression {
+                s.preview_value("", &mut self.tools);
+            }
+            if !(s.takes_point()
+                && (point_expression
+                    || s.point_only(&self.tools)
+                        && !text.trim().is_empty()
+                        && number(text).is_ok()))
+            {
+                if text.trim().is_empty() && s.point_only(&self.tools) {
+                    let point = self.hover.ok_or("请在画布指定点或输入坐标")?;
+                    s.accept_point(as_point(point), &mut self.tools, self.plane)?;
+                    let ready = s.ready();
+                    self.hover = None;
+                    self.pointer_point = None;
+                    self.aids.clear();
+                    return if ready {
+                        self.finish_ready(selected)
+                    } else {
+                        Ok(None)
+                    };
+                }
+                return s
+                    .input(
+                        text,
+                        selected,
+                        &mut self.tools,
+                        self.plane,
+                        self.hover.map(as_point),
+                    )
+                    .map(|c| {
+                        c.map(|c| CommandCommit::Transform {
+                            ids: c.ids,
+                            transforms: vec![c.transform],
+                            copies: c.copies,
+                        })
+                    });
+            }
+        }
         if let Some(Step::CurvePick(s)) = &mut self.step {
             if !s.side() {
                 let result = s
@@ -1208,6 +1300,17 @@ impl CommandState {
     }
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::TransformPick(_) => {
+                if let Some(Step::TransformPick(s)) = &mut self.step {
+                    s.accept_point(as_point(point), &mut self.tools, self.plane)?;
+                }
+                self.hover = None;
+                self.pointer_point = None;
+                self.aids.clear();
+                self.error.clear();
+                self.ray_error.clear();
+                return Ok(());
+            }
             Step::CurvePick(_) => {
                 if let Some(Step::CurvePick(s)) = &mut self.step {
                     s.preview_side(as_point(point), true)?;
@@ -1366,6 +1469,9 @@ impl CommandState {
     ) -> bool {
         if !self.takes_point() {
             return false;
+        }
+        if let Some(Step::TransformPick(s)) = &mut self.step {
+            s.preview_value(draft, &mut self.tools);
         }
         let reference = self.snap_reference();
         let plane = self.point_plane();
@@ -1568,6 +1674,10 @@ impl CommandState {
         Vec::new()
     }
     pub fn transform_preview(&self) -> Option<(BTreeSet<u32>, Vec<AffineTransform>)> {
+        if let Some(Step::TransformPick(s)) = &self.step {
+            let c = s.preview(&self.tools, self.plane, self.hover.map(as_point))?;
+            return Some((c.ids, vec![c.transform]));
+        }
         if let Some(Step::ArraySpacing { ids, base }) = &self.step {
             let point = self.hover?;
             let a = self.plane.to_local(as_point(*base));
@@ -1597,6 +1707,24 @@ impl CommandState {
         let mut command = None;
         ui.strong("命令参数与工作平面");
         self.aids.controls(ui);
+        if let Some(Step::TransformPick(s)) = &self.step {
+            ui.add_enabled_ui(!s.mirror_question(), |ui| {
+                self.tools.advanced_transform_ui(ui, s.kind)
+            });
+            if s.can_reference() && ui.button("R 参照方向 / 长度").clicked() {
+                command = Some("R".into());
+            }
+            if s.mirror_question() {
+                ui.horizontal(|ui| {
+                    if ui.button("N 保留源对象").clicked() {
+                        command = Some("N".into());
+                    }
+                    if ui.button("Y 替换源对象").clicked() {
+                        command = Some("Y".into());
+                    }
+                });
+            }
+        }
         ui.add_enabled_ui(!self.is_active(), |ui| self.tools.style_ui(ui, document));
         if let Some(Step::Transform { kind, ids, base }) = &self.step {
             self.tools.transform_ui(ui, *kind);
@@ -1793,6 +1921,10 @@ impl CommandState {
             }
         }
         let anchored = match &self.step {
+            Some(Step::TransformPick(s)) if s.takes_point() => s
+                .reference_point()
+                .zip(self.hover.map(as_point))
+                .map(|(a, b)| (array(a), array(b))),
             Some(Step::Target { base, .. }) => self.hover.map(|target| (*base, target)),
             Some(Step::Confirm { base, target, .. }) => Some((*base, *target)),
             Some(Step::PlaneAxis { origin }) => self.hover.map(|target| (*origin, target)),
@@ -1866,6 +1998,9 @@ fn array(p: Point3) -> [f64; 3] {
 
 fn parse_point(text: &str, plane: WorkPlane, reference: [f64; 3]) -> Result<[f64; 3], String> {
     let text = text.trim();
+    if text == "@" {
+        return finite(reference);
+    }
     let relative = text.starts_with('@');
     let text = text.strip_prefix('@').or_else(|| text.strip_prefix('#')).unwrap_or(text);
     if let Some((distance, angle)) = text.split_once('<') {

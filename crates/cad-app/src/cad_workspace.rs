@@ -109,6 +109,22 @@ impl Workspace {
                             action = Some("CANCEL".into());
                         }
                     }
+                    if command.transform_reference() {
+                        if ui.button("参照方向 / 长度  R").clicked() {
+                            action = Some("R".into());
+                        }
+                        if ui.button("切换保留原件复制  C").clicked() {
+                            action = Some("C".into());
+                        }
+                    }
+                    if command.mirror_question() {
+                        if ui.button("保留源对象  N").clicked() {
+                            action = Some("N".into());
+                        }
+                        if ui.button("替换源对象  Y").clicked() {
+                            action = Some("Y".into());
+                        }
+                    }
                     if command.is_active() {
                         if ui.button("取消当前操作  Esc").clicked() {
                             action = Some("CANCEL".into());

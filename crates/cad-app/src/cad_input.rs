@@ -14,6 +14,10 @@ pub enum Kind {
     Distance,
     ArrayRect,
     Count,
+    ReferenceAngle,
+    ReferenceLength,
+    TargetAngle,
+    TargetLength,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -42,6 +46,10 @@ impl Spec {
             Kind::Distance => &["距离 mm"],
             Kind::ArrayRect => &["列数", "行数"],
             Kind::Count => &["数量"],
+            Kind::ReferenceAngle => &["原角度 °"],
+            Kind::ReferenceLength => &["原长度 mm"],
+            Kind::TargetAngle => &["新方向 °"],
+            Kind::TargetLength => &["新长度 mm"],
         }
     }
     fn values(self) -> [f64; 3] {
@@ -307,6 +315,7 @@ impl DynamicInput {
                     || matches!(typed.to_uppercase().as_str(), "U" | "C")
                     || command.curve_change_distance()
                         && matches!(typed.to_uppercase().as_str(), "D" | "N")
+                    || command.transform_reference() && typed.eq_ignore_ascii_case("R")
                     || !self.locked.iter().any(|v| *v) && typed.chars().any(char::is_alphabetic)
                 {
                     if !self.literal {
@@ -471,6 +480,28 @@ impl DynamicInput {
                     + spec.plane.y_axis * (values[0] * angle.sin());
                 [base[0] + delta.x, base[1] + delta.y, base[2] + delta.z]
             }
+            Kind::Angle | Kind::TargetAngle => {
+                let d = Point3::new(point[0], point[1], point[2]);
+                let local = spec.plane.to_local(d);
+                let a = spec.plane.to_local(Point3::new(base[0], base[1], base[2]));
+                let length = (local[0] - a[0]).hypot(local[1] - a[1]);
+                let angle = values[0].to_radians();
+                let delta = spec.plane.x_axis * (length * angle.cos())
+                    + spec.plane.y_axis * (length * angle.sin());
+                [base[0] + delta.x, base[1] + delta.y, base[2] + delta.z]
+            }
+            Kind::TargetLength => {
+                if values[0] <= 0. {
+                    return Err("新长度须大于零".into());
+                }
+                let d = [point[0] - base[0], point[1] - base[1], point[2] - base[2]];
+                let length = d.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if length <= 1e-9 {
+                    point
+                } else {
+                    std::array::from_fn(|i| base[i] + d[i] * values[0] / length)
+                }
+            }
             _ => point,
         };
         if result.iter().all(|v| v.is_finite()) {
@@ -575,6 +606,12 @@ impl DynamicInput {
                             Kind::Distance => "输入距离后确认，随后在画布点选",
                             Kind::ArrayRect => "列/行数量 · Tab 切换 · 确认提交",
                             Kind::Count => "阵列数量 · 确认提交；分布角度在工具页设置",
+                            Kind::ReferenceAngle | Kind::ReferenceLength => {
+                                "输入原值，或点选两个参照点"
+                            }
+                            Kind::TargetAngle | Kind::TargetLength => {
+                                "新值相对于参照计算；确认提交"
+                            }
                         });
                         let mut fields = self.fields(spec, text);
                         let target = self.field;

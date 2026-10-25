@@ -39,6 +39,7 @@ mod cad_project;
 mod cad_selection;
 mod cad_text;
 mod cad_tools;
+mod cad_transform_command;
 mod cad_util;
 mod cad_view;
 mod cad_workspace;
@@ -4341,7 +4342,7 @@ fn drawing_ui(
             let submission = dynamic_input.ui(context, canvas_rect, cad_command, command_input);
             cad_command.refresh_input_preview(dynamic_input, command_input);
             dynamic_input.sync(cad_command, command_input);
-            if dynamic_input.at_cursor {
+            if dynamic_input.at_cursor || cad_command.transform_reference() {
                 cad_command.preview_scalar(command_input);
             }
             submission
