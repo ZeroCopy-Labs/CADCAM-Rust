@@ -20,7 +20,8 @@ pub struct SelectionFilter {
 }
 impl SelectionFilter {
     pub fn matches(&self, e: &DisplayEntity) -> bool {
-        self.kind.as_ref().is_none_or(|kind| kind == e.kind)
+        e.visible
+            && self.kind.as_ref().is_none_or(|kind| kind == e.kind)
             && self.layer.as_ref().is_none_or(|layer| layer == &e.layer)
             && self
                 .color

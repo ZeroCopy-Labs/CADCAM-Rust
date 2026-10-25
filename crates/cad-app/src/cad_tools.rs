@@ -74,27 +74,26 @@ impl Default for ToolOptions {
 }
 impl ToolOptions {
     pub fn style_ui(&mut self, ui: &mut egui::Ui, document: &DrawingDocument) {
-        if self.layer.and_then(|id| document.layer(id)).is_none() {
-            self.layer = document
-                .layers
-                .iter()
-                .find(|l| l.name == "0")
-                .or(document.layers.first())
-                .map(|l| l.id);
-        }
+        self.layer = document.current_layer;
         egui::CollapsingHeader::new("新图元属性").show(ui, |ui| {
-            egui::ComboBox::from_id_salt("drawing_layer")
-                .selected_text(
-                    self.layer
-                        .and_then(|id| document.layer(id))
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("选择图层"),
-                )
-                .show_ui(ui, |ui| {
-                    for layer in &document.layers {
-                        ui.selectable_value(&mut self.layer, Some(layer.id), &layer.name);
-                    }
-                });
+            ui.label(format!(
+                "当前图层：{}",
+                self.layer
+                    .and_then(|id| document.layer(id))
+                    .map(|l| l.name.as_str())
+                    .unwrap_or("无")
+            ));
+            ui.small("在图层管理中切换当前图层。");
+            if self
+                .layer
+                .and_then(|id| document.layer(id))
+                .is_some_and(|l| l.locked || !l.visible)
+            {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    "当前层已锁定或隐藏，绘图前请切换或解锁并显示。",
+                );
+            }
             egui::ComboBox::from_id_salt("drawing_color")
                 .selected_text(match self.color {
                     Color::ByLayer => "随层",

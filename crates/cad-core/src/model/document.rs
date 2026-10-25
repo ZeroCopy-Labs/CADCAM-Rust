@@ -165,6 +165,9 @@ pub struct Layer {
     pub name: String,
     /// Layer display color.
     pub color: LayerColor,
+    /// Off or frozen layers remain in CAM and DXF, but are not displayed.
+    pub visible: bool,
+    pub locked: bool,
 }
 
 /// Source information of an imported drawing.
@@ -284,6 +287,8 @@ pub struct DrawingDocument {
     pub source_units: Option<LengthUnit>,
     /// Current layers; stable IDs need not match their array positions.
     pub layers: Vec<Layer>,
+    /// Native current layer, used for new geometry.
+    pub current_layer: Option<LayerId>,
     /// Model-space entities only, in conversion order.
     pub entities: Vec<Entity>,
     /// File/source metadata.

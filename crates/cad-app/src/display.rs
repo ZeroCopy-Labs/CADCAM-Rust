@@ -26,6 +26,7 @@ pub struct Bounds {
 #[derive(Clone, Debug)]
 pub struct DisplayPath {
     pub entity_id: u32,
+    pub visible: bool,
     pub color: [f32; 3],
     pub points: Vec<[f64; 3]>,
 }
@@ -43,6 +44,8 @@ pub struct DisplayLayer {
 pub struct DisplayEntity {
     pub id: u32,
     pub kind: &'static str,
+    pub visible: bool,
+    pub locked: bool,
     pub layer: String,
     pub color: [f32; 3],
     pub layer_color: [f32; 3],
@@ -109,6 +112,7 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
             has_points = true;
             entity_paths.push(DisplayPath {
                 entity_id: entity.id.0,
+                visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
                 color,
                 points,
             });
@@ -163,6 +167,8 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
         };
         entities.push(DisplayEntity {
             id: entity.id.0,
+            visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
+            locked: document.layer(entity.layer_id).is_some_and(|l| l.locked),
             kind: entity.geometry.kind(),
             layer: layer_name,
             color,
@@ -218,7 +224,7 @@ fn resolve_color(entity: &Entity, document: &DrawingDocument) -> [f32; 3] {
 }
 
 /// Convert the model's color representation to normalized RGB.
-fn color_to_rgb(color: Color) -> [f32; 3] {
+pub(crate) fn color_to_rgb(color: Color) -> [f32; 3] {
     match color {
         Color::Rgb { r, g, b } => [
             f32::from(r) / 255.0,

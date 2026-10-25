@@ -110,15 +110,27 @@ pub(crate) fn convert_document(
     let mut layers = Vec::new();
     let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
     for native_layer in native.layers.iter() {
-        let next_id = LayerId(layer_identities.len() as u32);
+        let next_id = LayerId(
+            layer_identities
+                .values()
+                .map(|id| id.0)
+                .max()
+                .map_or(0, |id| id + 1),
+        );
         let id = *layer_identities
-            .entry(layer_key(&native_layer.name))
+            .entry(if native_layer.handle.is_valid() {
+                format!("handle:{}", native_layer.handle.value())
+            } else {
+                format!("name:{}", layer_key(&native_layer.name))
+            })
             .or_insert(next_id);
         layer_ids.insert(layer_key(&native_layer.name), id);
         layers.push(Layer {
             id,
             name: native_layer.name.clone(),
             color: convert_color(native_layer.color),
+            visible: !native_layer.flags.off && !native_layer.flags.frozen,
+            locked: native_layer.flags.locked,
         });
     }
 
@@ -181,6 +193,11 @@ pub(crate) fn convert_document(
     DrawingDocument {
         units: source_units.map(|_| LengthUnit::Millimeters),
         source_units,
+        current_layer: layer_ids
+            .get(&layer_key(&native.header.current_layer_name))
+            .copied()
+            .or_else(|| layer_ids.get("0").copied())
+            .or_else(|| layers.first().map(|l| l.id)),
         layers,
         entities,
         source: SourceInfo {
@@ -671,12 +688,22 @@ fn ensure_layer(
         return *id;
     }
 
-    let next_id = LayerId(layer_identities.len() as u32);
-    let id = *layer_identities.entry(key.clone()).or_insert(next_id);
+    let next_id = LayerId(
+        layer_identities
+            .values()
+            .map(|id| id.0)
+            .max()
+            .map_or(0, |id| id + 1),
+    );
+    let id = *layer_identities
+        .entry(format!("name:{key}"))
+        .or_insert(next_id);
     layers.push(Layer {
         id,
         name: name.to_string(),
         color: Color::None,
+        visible: true,
+        locked: false,
     });
     layer_ids.insert(key, id);
     report.warn(format!(

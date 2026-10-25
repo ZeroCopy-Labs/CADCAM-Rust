@@ -11,6 +11,35 @@ use crate::model::{Color, DrawingDocument, EntityId, FileFormat, LayerId, Length
 
 const HISTORY_LIMIT: usize = 100;
 
+#[derive(Clone, Debug)]
+pub enum LayerEdit {
+    Create {
+        name: String,
+        color: Color,
+    },
+    Rename {
+        id: LayerId,
+        name: String,
+    },
+    Delete {
+        id: LayerId,
+        migrate: Option<LayerId>,
+    },
+    Color {
+        id: LayerId,
+        color: Color,
+    },
+    Visible {
+        id: LayerId,
+        visible: bool,
+    },
+    Locked {
+        id: LayerId,
+        locked: bool,
+    },
+    Current(LayerId),
+}
+
 /// One committed batch, shared by apply, undo and redo notifications.
 #[derive(Clone, Copy, Debug)]
 pub enum DrawingChangeKind {
@@ -20,10 +49,12 @@ pub enum DrawingChangeKind {
     Delete,
     Create,
     Transform,
+    Geometry,
+    Layers,
 }
 impl DrawingChangeKind {
     pub fn changes_geometry(self) -> bool {
-        !matches!(self, Self::Color | Self::Layer)
+        !matches!(self, Self::Color | Self::Layer | Self::Layers)
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -33,6 +64,8 @@ impl DrawingChangeKind {
             Self::Delete => "删除",
             Self::Create => "创建",
             Self::Transform => "批量变换/复制",
+            Self::Geometry => "修改几何属性",
+            Self::Layers => "修改图层",
         }
     }
 }
@@ -189,14 +222,18 @@ impl EditableDrawing {
         if selected.is_empty() {
             return Ok(None);
         }
+        self.ensure_editable(selected)?;
         let layer = match edit {
-            DrawingEdit::SetLayer(id) => Some(
-                self.document
-                    .layer(id)
-                    .ok_or("目标图层不存在")?
-                    .name
-                    .clone(),
-            ),
+            DrawingEdit::SetLayer(id) => {
+                self.ensure_layer_editable(id)?;
+                Some(
+                    self.document
+                        .layer(id)
+                        .ok_or("目标图层不存在")?
+                        .name
+                        .clone(),
+                )
+            }
             _ => None,
         };
         if let DrawingEdit::Translate(offset) = edit {
@@ -327,6 +364,7 @@ impl EditableDrawing {
         let mut created = Vec::new();
         let mut next_id = Self::next_id(&ids)?;
         for item in entities {
+            self.ensure_layer_editable(item.layer)?;
             let layer = self
                 .document
                 .layer(item.layer)
@@ -371,6 +409,7 @@ impl EditableDrawing {
         if selected.is_empty() || transforms.is_empty() {
             return Ok(None);
         }
+        self.ensure_editable(selected)?;
         if !copies && transforms.len() != 1 {
             return Err("原位变换只接受一个变换".into());
         }
@@ -431,6 +470,268 @@ impl EditableDrawing {
             BTreeSet::new(),
             created,
         )
+    }
+
+    fn ensure_layer_editable(&self, id: LayerId) -> Result<(), String> {
+        let layer = self.document.layer(id).ok_or("图层不存在")?;
+        if layer.locked || !layer.visible {
+            return Err(format!("图层“{}”已锁定或隐藏，请先解锁并显示", layer.name));
+        }
+        Ok(())
+    }
+
+    fn ensure_editable(&self, ids: &BTreeSet<EntityId>) -> Result<(), String> {
+        for id in ids {
+            let entity = self.document.entity(*id).ok_or("选择中存在失效图元")?;
+            self.ensure_layer_editable(entity.layer_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_geometry(
+        &mut self,
+        updates: &BTreeMap<EntityId, crate::model::Geometry>,
+    ) -> Result<Option<DrawingChange>, String> {
+        if updates.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_editable(&updates.keys().copied().collect())?;
+        let scale = self.unit_scale()?;
+        let handles: BTreeMap<_, _> = self.ids.iter().map(|(h, id)| (*id, *h)).collect();
+        let mut candidate = self.native.clone();
+        let mut affected = 0;
+        for (id, geometry) in updates {
+            if self
+                .document
+                .entity(*id)
+                .is_some_and(|e| e.geometry == *geometry)
+            {
+                continue;
+            }
+            affected += 1;
+            let handle = *handles.get(id).ok_or("缺少源图元记录")?;
+            let native = candidate.get_entity_mut(handle).ok_or("源记录失效")?;
+            crate::properties::update_native(native, geometry, scale)?;
+        }
+        if affected == 0 {
+            return Ok(None);
+        }
+        self.commit(
+            candidate,
+            self.ids.clone(),
+            DrawingChangeKind::Geometry,
+            affected,
+            BTreeSet::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn edit_layer(&mut self, edit: LayerEdit) -> Result<Option<DrawingChange>, String> {
+        use acadrust::tables::Layer;
+        let mut candidate = self.native.clone();
+        let mut layer_ids = self.layer_ids.clone();
+        let layer_name = |id| {
+            self.document
+                .layer(id)
+                .map(|l| l.name.clone())
+                .ok_or("图层不存在")
+        };
+        let color = |c| match c {
+            Color::Aci(i) if i > 0 => Ok(NativeColor::Index(i)),
+            Color::Rgb { r, g, b } => Ok(NativeColor::Rgb { r, g, b }),
+            _ => Err("图层颜色须为 ACI 索引色或 RGB"),
+        };
+        match edit {
+            LayerEdit::Create { name, color: c } => {
+                Self::validate_layer_name(&name)?;
+                if self
+                    .document
+                    .layers
+                    .iter()
+                    .any(|l| l.name.eq_ignore_ascii_case(&name))
+                {
+                    return Err("图层名称已存在（包括隐式导入层）".into());
+                }
+                let mut layer = Layer::with_color(name, color(c)?);
+                layer.handle = candidate.allocate_handle();
+                let next = layer_ids
+                    .values()
+                    .map(|id| id.0)
+                    .max()
+                    .map_or(0, |id| id + 1);
+                layer_ids.insert(format!("handle:{}", layer.handle.value()), LayerId(next));
+                candidate.layers.add(layer)?;
+            }
+            LayerEdit::Rename { id, name } => {
+                Self::validate_layer_name(&name)?;
+                let old = layer_name(id)?;
+                if old == name {
+                    return Ok(None);
+                }
+                let handle = candidate.rename_layer(&old, &name)?;
+                layer_ids.insert(format!("handle:{}", handle.value()), id);
+                Self::rename_vertex_layers(&mut candidate, &old, &name);
+            }
+            LayerEdit::Delete { id, migrate } => {
+                let old = layer_name(id)?;
+                if old.eq_ignore_ascii_case("0")
+                    || old.eq_ignore_ascii_case("Defpoints")
+                    || old.contains('|')
+                {
+                    return Err("不能删除默认、Defpoints 或外部参照图层".into());
+                }
+                let source_handle = candidate.layers.get(&old).map(|l| l.handle);
+                let used=candidate.entities().any(|e|e.common().layer.eq_ignore_ascii_case(&old)
+                    || matches!(e,acadrust::EntityType::Viewport(v) if source_handle.is_some_and(|h|v.frozen_layers.contains(&h))));
+                if used && migrate.is_none() {
+                    return Err("图层被图元或视口引用，必须明确选择迁移目标".into());
+                }
+                let target = match migrate {
+                    Some(target) if target != id => {
+                        self.ensure_layer_editable(target)?;
+                        Some(layer_name(target)?)
+                    }
+                    Some(_) => return Err("迁移目标不能是被删除图层".into()),
+                    None => None,
+                };
+                if self.document.layer(id).is_some_and(|l| l.locked) {
+                    return Err("请先解锁待删除图层".into());
+                }
+                // Reuse the native rename routine to migrate name references and XData.
+                if let Some(target) = target {
+                    let target_layer = candidate
+                        .layers
+                        .remove(&target)
+                        .ok_or("迁移目标缺少原生图层记录")?;
+                    let migrated: Vec<_> = candidate
+                        .entities()
+                        .filter(|e| e.common().layer.eq_ignore_ascii_case(&old))
+                        .map(|e| e.common().handle)
+                        .collect();
+                    candidate.rename_layer(&old, &target)?;
+                    Self::rename_vertex_layers(&mut candidate, &old, &target);
+                    let source_handle = candidate.layers.remove(&target).unwrap().handle;
+                    for handle in migrated {
+                        candidate
+                            .get_entity_mut(handle)
+                            .unwrap()
+                            .common_mut()
+                            .layer_handle = None;
+                    }
+                    let viewports: Vec<_> = candidate
+                        .entities()
+                        .filter_map(|e| match e {
+                            acadrust::EntityType::Viewport(v)
+                                if v.frozen_layers.contains(&source_handle) =>
+                            {
+                                Some(e.common().handle)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for handle in viewports {
+                        if let Some(acadrust::EntityType::Viewport(v)) =
+                            candidate.get_entity_mut(handle)
+                        {
+                            for h in &mut v.frozen_layers {
+                                if *h == source_handle {
+                                    *h = target_layer.handle;
+                                }
+                            }
+                        }
+                    }
+                    candidate.layers.add(target_layer)?;
+                    if self.document.current_layer == Some(id) {
+                        let layer = candidate.layers.get(&target).unwrap();
+                        candidate.header.current_layer_name = target;
+                        candidate.header.current_layer_handle = layer.handle;
+                    }
+                } else {
+                    candidate.layers.remove(&old).ok_or("缺少原生图层记录")?;
+                    if self.document.current_layer == Some(id) {
+                        let zero = candidate.layers.get("0").ok_or("缺少默认图层")?;
+                        candidate.header.current_layer_name = zero.name.clone();
+                        candidate.header.current_layer_handle = zero.handle;
+                    }
+                }
+            }
+            LayerEdit::Current(id) => {
+                self.ensure_layer_editable(id)?;
+                let name = layer_name(id)?;
+                let layer = candidate.layers.get(&name).ok_or("缺少原生图层记录")?;
+                candidate.header.current_layer_name = name;
+                candidate.header.current_layer_handle = layer.handle;
+            }
+            LayerEdit::Color { id, color: c } => {
+                let name = layer_name(id)?;
+                let layer = candidate.layers.get_mut(&name).ok_or("缺少原生图层记录")?;
+                layer.color = color(c)?;
+                layer.color_name = None;
+                layer.book_name = None;
+            }
+            LayerEdit::Visible { id, visible } => {
+                let name = layer_name(id)?;
+                let layer = candidate.layers.get_mut(&name).ok_or("缺少原生图层记录")?;
+                layer.flags.off = !visible;
+                if visible {
+                    layer.flags.frozen = false;
+                }
+            }
+            LayerEdit::Locked { id, locked } => {
+                let name = layer_name(id)?;
+                candidate
+                    .layers
+                    .get_mut(&name)
+                    .ok_or("缺少原生图层记录")?
+                    .flags
+                    .locked = locked;
+            }
+        }
+        self.commit_with_layers(
+            candidate,
+            self.ids.clone(),
+            DrawingChangeKind::Layers,
+            1,
+            BTreeSet::new(),
+            Vec::new(),
+            layer_ids,
+        )
+    }
+
+    fn rename_vertex_layers(candidate: &mut CadDocument, old: &str, new: &str) {
+        // Touch only affected polylines: a bulk mutable pass would discard unrelated raw records.
+        let handles: Vec<_> = candidate
+            .entities()
+            .filter_map(|e| match e {
+                acadrust::EntityType::Polyline3D(p)
+                    if p.vertices.iter().any(|v| v.layer.eq_ignore_ascii_case(old)) =>
+                {
+                    Some(e.common().handle)
+                }
+                _ => None,
+            })
+            .collect();
+        for handle in handles {
+            if let Some(acadrust::EntityType::Polyline3D(p)) = candidate.get_entity_mut(handle) {
+                for vertex in &mut p.vertices {
+                    if vertex.layer.eq_ignore_ascii_case(old) {
+                        vertex.layer = new.to_owned();
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_layer_name(name: &str) -> Result<(), String> {
+        if name.trim().is_empty()
+            || name != name.trim()
+            || name
+                .chars()
+                .any(|c| c.is_control() || "<>/\\\":;?*|=,".contains(c))
+        {
+            return Err("图层名称不能为空、首尾空格或包含非法符号".into());
+        }
+        Ok(())
     }
 
     fn unit_scale(&self) -> Result<f64, String> {
@@ -508,13 +809,33 @@ impl EditableDrawing {
     fn commit(
         &mut self,
         candidate: CadDocument,
-        mut ids: BTreeMap<Handle, EntityId>,
+        ids: BTreeMap<Handle, EntityId>,
         kind: DrawingChangeKind,
         affected: usize,
         removed: BTreeSet<EntityId>,
         created: Vec<EntityId>,
     ) -> Result<Option<DrawingChange>, String> {
-        let mut layer_ids = self.layer_ids.clone();
+        self.commit_with_layers(
+            candidate,
+            ids,
+            kind,
+            affected,
+            removed,
+            created,
+            self.layer_ids.clone(),
+        )
+    }
+
+    fn commit_with_layers(
+        &mut self,
+        candidate: CadDocument,
+        mut ids: BTreeMap<Handle, EntityId>,
+        kind: DrawingChangeKind,
+        affected: usize,
+        removed: BTreeSet<EntityId>,
+        created: Vec<EntityId>,
+        mut layer_ids: BTreeMap<String, LayerId>,
+    ) -> Result<Option<DrawingChange>, String> {
         let document = self.convert_snapshot(&candidate, &mut ids, &mut layer_ids);
         let converted: BTreeSet<_> = document.entities.iter().map(|e| e.id).collect();
         if self
@@ -526,7 +847,10 @@ impl EditableDrawing {
         {
             return Err("编辑后存在无法转换的图元，已取消整批修改".into());
         }
-        if document.entities == self.document.entities {
+        if document.entities == self.document.entities
+            && document.layers == self.document.layers
+            && document.current_layer == self.document.current_layer
+        {
             return Ok(None);
         }
         self.serial += 1;

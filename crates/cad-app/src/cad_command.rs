@@ -1,14 +1,23 @@
 //! Command steps and transient previews; only confirmation submits a CAD edit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::cad_tools::{ToolOptions, TransformKind};
 use bevy::prelude::*;
 use bevy_egui::egui;
 use cad_core::geometry_edit::{AffineTransform, Sketch, SketchKind};
-use cad_core::model::{Geometry, Point3, WorkPlane};
+use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
+use cad_core::properties::{self, GripKind};
 
 enum Step {
+    Grip {
+        id: EntityId,
+        geometry: Geometry,
+        kind: GripKind,
+        base: Point3,
+        target: Option<Point3>,
+        dragging: bool,
+    },
     Draw {
         sketch: Sketch,
         confirmed: bool,
@@ -50,6 +59,7 @@ pub struct MoveCommit {
 }
 
 pub enum CommandCommit {
+    Geometry(BTreeMap<EntityId, Geometry>),
     Move(MoveCommit),
     Create {
         geometry: Vec<Geometry>,
@@ -94,7 +104,10 @@ impl CommandState {
             && !matches!(
                 self.step,
                 Some(
-                    Step::Confirm { .. }
+                    Step::Grip {
+                        target: Some(_),
+                        ..
+                    } | Step::Confirm { .. }
                         | Step::Draw {
                             confirmed: true,
                             ..
@@ -106,6 +119,17 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::Grip {
+                target, dragging, ..
+            }) => {
+                return if *dragging {
+                    "夹点：拖动预览，松开后等待确认；Esc 取消".into()
+                } else if target.is_some() {
+                    "夹点：Enter 提交；可输入坐标改目标；Esc 取消".into()
+                } else {
+                    "夹点：指定目标坐标或点选；Esc 取消".into()
+                }
+            }
             Some(Step::Draw { sketch, confirmed }) => {
                 return if *confirmed {
                     format!(
@@ -164,6 +188,61 @@ impl CommandState {
             Some(Step::PlaneThird { .. }) => "三点平面 3/3：指定 +V 一侧的点；三点不能共线",
         }
         .to_string()
+    }
+
+    pub fn begin_grip(
+        &mut self,
+        id: EntityId,
+        geometry: Geometry,
+        kind: GripKind,
+        target: Option<Point3>,
+        dragging: bool,
+    ) -> Result<(), String> {
+        let base = properties::grips(&geometry)
+            .into_iter()
+            .find(|g| g.kind == kind)
+            .ok_or("夹点已失效")?
+            .point;
+        if let Some(p) = target {
+            properties::move_grip(&geometry, kind, p)?;
+        }
+        self.cancel();
+        self.step = Some(Step::Grip {
+            id,
+            geometry,
+            kind,
+            base,
+            target,
+            dragging,
+        });
+        Ok(())
+    }
+    pub fn grip_dragging(&self) -> bool {
+        matches!(self.step, Some(Step::Grip { dragging: true, .. }))
+    }
+    pub fn stop_grip_drag(&mut self) {
+        if let Some(Step::Grip { dragging, .. }) = &mut self.step {
+            *dragging = false;
+        }
+    }
+    fn point_plane(&self) -> WorkPlane {
+        if let Some(Step::Grip { geometry, base, .. }) = &self.step {
+            let plane = match geometry {
+                Geometry::Circle(c) => Some(c.plane),
+                Geometry::Arc(a) => Some(a.plane),
+                Geometry::Polyline(p) => p.plane,
+                Geometry::Ellipse(e) => {
+                    Some(Plane::new(e.major_axis.cross(e.minor_axis), e.major_axis))
+                }
+                _ => None,
+            };
+            return WorkPlane {
+                origin: *base,
+                x_axis: plane.map_or(self.plane.x_axis, |p| p.x_axis),
+                y_axis: plane.map_or(self.plane.y_axis, |p| p.y_axis()),
+            };
+        }
+        self.plane
     }
 
     pub fn begin_move(&mut self, ids: &BTreeSet<u32>) {
@@ -263,6 +342,7 @@ impl CommandState {
 
     fn reference(&self) -> [f64; 3] {
         match &self.step {
+            Some(Step::Grip { base, .. }) => array(*base),
             Some(Step::Draw { sketch, .. }) => sketch
                 .points
                 .last()
@@ -280,6 +360,7 @@ impl CommandState {
 
     fn snap_reference(&self) -> Option<Point3> {
         match &self.step {
+            Some(Step::Grip { base, .. }) => Some(*base),
             Some(Step::Draw { sketch, .. }) if !sketch.points.is_empty() => {
                 Some(*sketch.points.last().unwrap())
             }
@@ -304,6 +385,21 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::Grip {
+            id,
+            geometry,
+            kind,
+            target: Some(target),
+            ..
+        }) = &self.step
+        {
+            if text.trim().is_empty() {
+                return Ok(Some(CommandCommit::Geometry(BTreeMap::from([(
+                    *id,
+                    properties::move_grip(geometry, *kind, *target)?,
+                )]))));
+            }
+        }
         if let Some(Step::TransformSelect { kind }) = self.step {
             if !text.trim().is_empty() || selected.is_empty() {
                 return Err("请先选择图元，再按 Enter".into());
@@ -431,7 +527,7 @@ impl CommandState {
             let point = self.hover.ok_or("请点选有效位置，或输入精确坐标")?;
             self.accept_point(point)?;
         } else {
-            let point = parse_point(text, self.plane, self.reference())?;
+            let point = parse_point(text, self.point_plane(), self.reference())?;
             self.accept_point(point)?;
         }
         Ok(None)
@@ -439,6 +535,23 @@ impl CommandState {
 
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::Grip {
+                id,
+                geometry,
+                kind,
+                base,
+                ..
+            } => {
+                properties::move_grip(geometry, *kind, as_point(point))?;
+                Some(Step::Grip {
+                    id: *id,
+                    geometry: geometry.clone(),
+                    kind: *kind,
+                    base: *base,
+                    target: Some(as_point(point)),
+                    dragging: false,
+                })
+            }
             Step::Draw { sketch, confirmed } => {
                 let mut next = sketch.clone();
                 if *confirmed {
@@ -522,12 +635,13 @@ impl CommandState {
             return false;
         }
         let reference = self.snap_reference();
+        let plane = self.point_plane();
         let point = frame
             .ray(camera, transform, cursor)
             .ok_or_else(|| "当前相机无法取点".to_string())
             .and_then(|ray| {
                 self.aids.resolve(
-                    document, frame, camera, transform, cursor, ray, self.plane, reference,
+                    document, frame, camera, transform, cursor, ray, plane, reference,
                 )
             })
             .map(array)
@@ -539,7 +653,12 @@ impl CommandState {
                 if click {
                     match self.accept_point(point) {
                         Ok(()) => return true,
-                        Err(error) => self.error = error,
+                        Err(error) => {
+                            self.error = error;
+                            if let Some(Step::Grip { dragging, .. }) = &mut self.step {
+                                *dragging = false;
+                            }
+                        }
                     }
                 }
             }
@@ -569,6 +688,19 @@ impl CommandState {
     }
 
     pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        if let Some(Step::Grip {
+            geometry,
+            kind,
+            target,
+            ..
+        }) = &self.step
+        {
+            return target
+                .or(self.hover.map(as_point))
+                .and_then(|p| properties::move_grip(geometry, *kind, p).ok())
+                .map(|g| super::display::tessellate_geometry(&g))
+                .unwrap_or_default();
+        }
         let Some(Step::Draw { sketch, confirmed }) = &self.step else {
             return Vec::new();
         };
@@ -615,6 +747,12 @@ impl CommandState {
             }
         }
         ui.label(self.prompt());
+        if let Some(Step::Grip { base, .. }) = &self.step {
+            ui.small(format!(
+                "夹点临时平面原点：{:.4}, {:.4}, {:.4}；U/V 沿图元平面，三维输入仍为 WCS。",
+                base.x, base.y, base.z
+            ));
+        }
         if self.is_active() {
             if !self.error_message().is_empty() {
                 ui.colored_label(egui::Color32::LIGHT_RED, self.error_message());
@@ -624,7 +762,7 @@ impl CommandState {
                     "WCS：{:.4}, {:.4}, {:.4} mm",
                     point[0], point[1], point[2]
                 ));
-                let local = self.plane.to_local(as_point(point));
+                let local = self.point_plane().to_local(as_point(point));
                 ui.small(format!(
                     "平面 U/V/N：{:.4}, {:.4}, {:.4} mm",
                     local[0], local[1], local[2]
@@ -641,7 +779,7 @@ impl CommandState {
                 if matches!(
                     self.step,
                     Some(
-                        Step::Confirm { .. }
+                        Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
                             | Step::Draw {
                                 confirmed: true,
                                 ..
@@ -763,9 +901,10 @@ impl CommandState {
     }
 
     pub fn draw_plane(&self, gizmos: &mut Gizmos, extent: f64, frame: super::cad_view::ViewFrame) {
-        self.aids.draw(gizmos, frame, self.plane);
+        let plane = self.point_plane();
+        self.aids.draw(gizmos, frame, plane);
         let length = (extent * 0.2).clamp(5.0, 1000.0);
-        let origin = frame.point(array(self.plane.origin));
+        let origin = frame.point(array(plane.origin));
         if !origin.is_finite() {
             return;
         }
@@ -774,11 +913,7 @@ impl CommandState {
             ([0.0, length, 0.0], Color::srgb(0.3, 0.8, 1.0)),
             ([0.0, 0.0, length * 0.5], Color::srgb(0.4, 1.0, 0.5)),
         ] {
-            gizmos.line(
-                origin,
-                frame.point(array(self.plane.to_world(local))),
-                color,
-            );
+            gizmos.line(origin, frame.point(array(plane.to_world(local))), color);
         }
         let corners = [
             [-length, -length, 0.0],
@@ -789,8 +924,8 @@ impl CommandState {
         ];
         for pair in corners.windows(2) {
             gizmos.line(
-                frame.point(array(self.plane.to_world(pair[0]))),
-                frame.point(array(self.plane.to_world(pair[1]))),
+                frame.point(array(plane.to_world(pair[0]))),
+                frame.point(array(plane.to_world(pair[1]))),
                 Color::srgb(0.2, 0.35, 0.45),
             );
         }

@@ -26,6 +26,7 @@ mod cad_aids;
 mod cad_command;
 mod cad_edit;
 mod cad_file;
+mod cad_layers;
 mod cad_selection;
 mod cad_tools;
 mod cad_view;
@@ -51,6 +52,7 @@ struct ViewerState {
     drawing: Option<cad_core::EditableDrawing>,
     file_ui: cad_file::FileState,
     cad_controls: cad_edit::EditControls,
+    cad_layers: cad_layers::LayerControls,
     cad_command: cad_command::CommandState,
     cad_history: BTreeMap<u64, CadUndoState>,
     file_name: String,
@@ -86,6 +88,7 @@ struct ViewerState {
 }
 
 struct CadUndoState {
+    layer_rules: BTreeMap<String, Option<gcode::CodeRule>>,
     selected: BTreeSet<u32>,
     cam_selected: BTreeSet<cam::UnitId>,
     machining: Option<(
@@ -368,12 +371,19 @@ fn submit_command(
     match result {
         Ok(Some(commit)) => {
             let action = match commit {
+                cad_command::CommandCommit::Geometry(updates) => {
+                    cad_edit::EditAction::Geometry(updates)
+                }
                 cad_command::CommandCommit::Move(commit) => {
                     selection.selected = commit.ids;
                     cad_edit::EditAction::Apply(DrawingEdit::Translate(commit.offset))
                 }
                 cad_command::CommandCommit::Create { geometry, normal } => {
-                    let Some(layer) = state.cad_command.tools.layer else {
+                    let Some(layer) = state
+                        .drawing
+                        .as_ref()
+                        .and_then(|d| d.document().current_layer)
+                    else {
                         push_message(state, "请先选择新图元所属图层");
                         return;
                     };
@@ -640,6 +650,9 @@ fn draw_scene(
         .then(|| state.cad_command.preview())
         .flatten();
     for path in &state.display.paths {
+        if !path.visible {
+            continue;
+        }
         let unit = state.cam.unit_for_entity(path.entity_id);
         let is_selected = match space.mode {
             SpaceMode::Cad => selection.selected.contains(&path.entity_id),
@@ -680,6 +693,31 @@ fn draw_scene(
                     .point(std::array::from_fn(|i| pair[1][i] + preview.offset[i]));
                 if start.is_finite() && end.is_finite() {
                     selected_gizmos.line(start, end, Color::srgb(0.15, 1.0, 1.0));
+                }
+            }
+        }
+    }
+
+    if space.mode == SpaceMode::Cad
+        && !state.cad_command.is_active()
+        && selection.selected.len() == 1
+    {
+        if let Some(doc) = state.drawing.as_ref().map(|d| d.document()) {
+            if let Some(entity) =
+                doc.entity(cad_core::EntityId(*selection.selected.first().unwrap()))
+            {
+                if doc
+                    .layer(entity.layer_id)
+                    .is_none_or(|l| l.visible && !l.locked)
+                {
+                    for grip in cad_core::properties::grips(&entity.geometry) {
+                        let position = state.view.point([grip.point.x, grip.point.y, grip.point.z]);
+                        selected_gizmos.cube(
+                            Transform::from_translation(position)
+                                .with_scale(Vec3::splat((state.view.pixel_size * 6.0) as f32)),
+                            Color::srgb(0.2, 1.0, 0.5),
+                        );
+                    }
                 }
             }
         }
@@ -766,6 +804,7 @@ fn selection_input(
         .display
         .entities
         .iter()
+        .filter(|entity| entity.visible)
         .map(|entity| entity.id)
         .collect();
     if selection.load_version != state.load_version {
@@ -785,6 +824,9 @@ fn selection_input(
     selection.cam_selected.retain(|id| valid_units.contains(id));
 
     let Some(cursor) = window.cursor_position() else {
+        if mouse.just_released(MouseButton::Left) {
+            state.cad_command.stop_grip_drag();
+        }
         state.cad_command.clear_hover();
         selection.hover_hits.clear();
         selection.hover_cursor = None;
@@ -796,6 +838,9 @@ fn selection_input(
         || context.egui_wants_pointer_input()
         || context.egui_is_using_pointer();
     if ui_active {
+        if mouse.just_released(MouseButton::Left) {
+            state.cad_command.stop_grip_drag();
+        }
         selection.hover_hits.clear();
         selection.hover_cursor = None;
         selection.hover_index = 0;
@@ -808,6 +853,26 @@ fn selection_input(
         return Ok(());
     }
     let (camera, camera_transform) = camera.into_inner();
+    if space.mode == SpaceMode::Cad
+        && !state.cad_command.is_active()
+        && mouse.just_pressed(MouseButton::Left)
+    {
+        if let Some((id, geometry, kind)) =
+            pick_grip(&state, &selection, camera, camera_transform, cursor)
+        {
+            if state
+                .cad_command
+                .begin_grip(id, geometry, kind, None, true)
+                .is_ok()
+            {
+                state.command_open = true;
+                state.command_input.clear();
+                selection.drag_start = None;
+                selection.drag_current = None;
+                return Ok(());
+            }
+        }
+    }
     let nearby = pick_entities(
         &state.display,
         &state.view,
@@ -834,10 +899,17 @@ fn selection_input(
                     cursor,
                     *view,
                     drawing.document(),
-                    mouse.just_pressed(MouseButton::Left),
+                    if cad_command.grip_dragging() {
+                        mouse.just_released(MouseButton::Left)
+                    } else {
+                        mouse.just_pressed(MouseButton::Left)
+                    },
                 )
             })
         };
+        if mouse.just_released(MouseButton::Left) {
+            state.cad_command.stop_grip_drag();
+        }
         if accepted {
             state.command_input.clear();
             if !state.cad_command.is_active() {
@@ -1009,6 +1081,42 @@ fn selection_input(
     Ok(())
 }
 
+fn pick_grip(
+    state: &ViewerState,
+    selection: &SelectionState,
+    camera: &Camera,
+    transform: &GlobalTransform,
+    cursor: Vec2,
+) -> Option<(
+    cad_core::EntityId,
+    cad_core::Geometry,
+    cad_core::properties::GripKind,
+)> {
+    if selection.selected.len() != 1 {
+        return None;
+    }
+    let doc = state.drawing.as_ref()?.document();
+    let id = cad_core::EntityId(*selection.selected.first()?);
+    let entity = doc.entity(id)?;
+    if doc
+        .layer(entity.layer_id)
+        .is_some_and(|l| l.locked || !l.visible)
+    {
+        return None;
+    }
+    cad_core::properties::grips(&entity.geometry)
+        .into_iter()
+        .filter_map(|g| {
+            state
+                .view
+                .project(camera, transform, [g.point.x, g.point.y, g.point.z])
+                .map(|screen| (screen.distance(cursor), g.kind))
+        })
+        .filter(|(distance, _)| *distance <= 8.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, kind)| (id, entity.geometry.clone(), kind))
+}
+
 fn project_entity_point(
     camera: &Camera,
     camera_transform: &GlobalTransform,
@@ -1027,6 +1135,9 @@ fn pick_entities(
 ) -> Vec<u32> {
     let mut hits: BTreeMap<u32, (f32, f32)> = BTreeMap::new();
     for path in &display.paths {
+        if !path.visible {
+            continue;
+        }
         for pair in path.points.windows(2) {
             let (Some(a), Some(b)) = (
                 frame.project(camera, transform, pair[0]),
@@ -1088,6 +1199,9 @@ fn box_select(
     let mut selected = BTreeSet::new();
 
     for path in &display.paths {
+        if !path.visible {
+            continue;
+        }
         let projected: Vec<Vec2> = path
             .points
             .iter()
@@ -1142,6 +1256,9 @@ fn box_select_units(
         let mut intersects = false;
 
         for path in &display.paths {
+            if !path.visible {
+                continue;
+            }
             if cam.entity_to_unit.get(&path.entity_id) != Some(&unit.id) {
                 continue;
             }
@@ -2106,6 +2223,9 @@ fn unit_center(
     let mut sum = [0.0f64; 3];
     let mut count = 0usize;
     for path in &display.paths {
+        if !path.visible {
+            continue;
+        }
         if cam.unit_for_entity(path.entity_id) != Some(unit_id) {
             continue;
         }
@@ -2672,6 +2792,21 @@ fn drawing_ui(
                     egui::ScrollArea::vertical()
                         .id_salt("cad_features")
                         .show(ui, |ui| {
+                            {
+                                let ViewerState {
+                                    drawing,
+                                    cad_layers,
+                                    cad_command,
+                                    ..
+                                } = &mut *state;
+                                if let Some(drawing) = drawing.as_ref() {
+                                    ui.add_enabled_ui(!cad_command.is_active(), |ui| {
+                                        if let Some(edit) = cad_layers.ui(ui, drawing.document()) {
+                                            cad_action = Some(cad_edit::EditAction::Layer(edit));
+                                        }
+                                    });
+                                }
+                            }
                             let selection_enabled =
                                 !state.cad_command.is_active() || state.cad_command.selecting();
                             ui.add_enabled_ui(selection_enabled, |ui| {
@@ -2704,7 +2839,15 @@ fn drawing_ui(
                                     }
                                 }
                             }
-                            let editing_enabled = !state.cad_command.is_active();
+                            let editing_enabled = !state.cad_command.is_active()
+                                && !state
+                                    .display
+                                    .entities
+                                    .iter()
+                                    .any(|e| selection.selected.contains(&e.id) && e.locked);
+                            if !state.cad_command.is_active() && !editing_enabled {
+                                ui.weak("选择中含锁定图层，属性只读；请先在图层管理解锁。");
+                            }
                             let ViewerState {
                                 drawing,
                                 cad_controls,
@@ -4219,19 +4362,85 @@ fn apply_cad_action(
         return false;
     }
     match action {
+        cad_edit::EditAction::BeginGrip { id, kind, target } => {
+            let doc = state.drawing.as_ref().unwrap().document();
+            let Some(entity) = doc.entity(id) else {
+                return false;
+            };
+            if doc
+                .layer(entity.layer_id)
+                .is_some_and(|l| l.locked || !l.visible)
+            {
+                push_message(state, "请先显示并解锁图层");
+                return false;
+            }
+            match state.cad_command.begin_grip(
+                id,
+                entity.geometry.clone(),
+                kind,
+                Some(cad_core::model::Point3::new(
+                    target[0], target[1], target[2],
+                )),
+                false,
+            ) {
+                Ok(()) => {
+                    state.command_open = true;
+                    state.command_input.clear();
+                    return true;
+                }
+                Err(error) => {
+                    push_message(state, error);
+                    return false;
+                }
+            }
+        }
         action @ (cad_edit::EditAction::Apply(_)
         | cad_edit::EditAction::Create(_)
-        | cad_edit::EditAction::Transform { .. }) => {
+        | cad_edit::EditAction::Transform { .. }
+        | cad_edit::EditAction::Geometry(_)
+        | cad_edit::EditAction::Layer(_)) => {
             let geometry_changed = match &action {
                 cad_edit::EditAction::Apply(edit) => edit.changes_geometry(),
+                cad_edit::EditAction::Layer(_) => false,
                 _ => true,
             };
-            let before = capture_cad_context(state, selection, geometry_changed);
+            let mut before = capture_cad_context(state, selection, geometry_changed);
+            let rename =
+                if let cad_edit::EditAction::Layer(cad_core::LayerEdit::Rename { id, name }) =
+                    &action
+                {
+                    let Some(layer) = state.drawing.as_ref().unwrap().document().layer(*id) else {
+                        return false;
+                    };
+                    let old = layer.name.clone();
+                    let new = name.clone();
+                    if old != new
+                        && state.gcode_profile.layer_rules.contains_key(&old)
+                        && state.gcode_profile.layer_rules.contains_key(&new)
+                    {
+                        push_message(
+                            state,
+                            "图层改名取消：目标名称已有 G 代码规则，请先处理规则冲突",
+                        );
+                        return false;
+                    }
+                    for key in [&old, &new] {
+                        before.layer_rules.insert(
+                            key.clone(),
+                            state.gcode_profile.layer_rules.get(key).cloned(),
+                        );
+                    }
+                    Some((old, new))
+                } else {
+                    None
+                };
             let ids = cad_edit::entity_ids(&selection.selected);
             let drawing = state.drawing.as_mut().unwrap();
             let result = match action {
                 cad_edit::EditAction::Apply(edit) => drawing.apply(&ids, edit),
                 cad_edit::EditAction::Create(entities) => drawing.create(&entities),
+                cad_edit::EditAction::Geometry(updates) => drawing.set_geometry(&updates),
+                cad_edit::EditAction::Layer(edit) => drawing.edit_layer(edit),
                 cad_edit::EditAction::Transform { transforms, copies } => {
                     drawing.transform(&ids, &transforms, copies)
                 }
@@ -4243,6 +4452,16 @@ fn apply_cad_action(
                     return true;
                 }
                 Ok(Some(change)) => {
+                    if let Some((old, new)) = rename {
+                        if old != new {
+                            if let Some(rule) = state.gcode_profile.layer_rules.remove(&old) {
+                                state.gcode_profile.layer_rules.insert(new.clone(), rule);
+                            }
+                        }
+                        if state.gcode_selected_layer == old {
+                            state.gcode_selected_layer = new;
+                        }
+                    }
                     state.cad_history.insert(change.transaction_id, before);
                     refresh_edited_drawing(state, &change, None);
                     selection.cam_selected.clear();
@@ -4278,11 +4497,29 @@ fn apply_cad_action(
                 return false;
             };
             // Swap the context for this transaction so undo and redo stay symmetric.
-            let current = capture_cad_context(state, selection, change.kind.changes_geometry());
+            let mut current = capture_cad_context(state, selection, change.kind.changes_geometry());
+            if let Some(context) = state.cad_history.get(&change.transaction_id) {
+                for key in context.layer_rules.keys() {
+                    current.layer_rules.insert(
+                        key.clone(),
+                        state.gcode_profile.layer_rules.get(key).cloned(),
+                    );
+                }
+            }
             let restored = state
                 .cad_history
                 .insert(change.transaction_id, current)
                 .expect("every committed CAD transaction has an application context");
+            for (key, rule) in restored.layer_rules {
+                match rule {
+                    Some(rule) => {
+                        state.gcode_profile.layer_rules.insert(key, rule);
+                    }
+                    None => {
+                        state.gcode_profile.layer_rules.remove(&key);
+                    }
+                }
+            }
             selection.selected = restored.selected;
             selection.cam_selected = restored.cam_selected;
             refresh_edited_drawing(state, &change, restored.machining);
@@ -4302,6 +4539,7 @@ fn apply_cad_action(
         .display
         .entities
         .iter()
+        .filter(|entity| entity.visible)
         .map(|entity| entity.id)
         .collect();
     selection.selected.retain(|id| valid.contains(id));
@@ -4315,6 +4553,9 @@ fn apply_cad_action(
     selection.hover_cursor = None;
     selection.hover_index = 0;
     state.cad_controls = cad_edit::EditControls::default();
+    state
+        .cad_layers
+        .reset(state.drawing.as_ref().unwrap().document());
     true
 }
 
@@ -4324,6 +4565,7 @@ fn capture_cad_context(
     geometry_changed: bool,
 ) -> CadUndoState {
     CadUndoState {
+        layer_rules: BTreeMap::new(),
         selected: selection.selected.clone(),
         cam_selected: selection.cam_selected.clone(),
         machining: geometry_changed.then(|| {

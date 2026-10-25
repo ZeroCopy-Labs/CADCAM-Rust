@@ -140,6 +140,7 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     });
     state.drawing = drawing;
     state.cad_controls = Default::default();
+    state.cad_layers = Default::default();
     state.cad_command = Default::default();
     state.command_input.clear();
     state.cad_history.clear();
