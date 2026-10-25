@@ -73,6 +73,13 @@ enum Step {
     },
 }
 
+#[derive(Clone, Copy)]
+enum RectangleDimensions {
+    Length,
+    Width(f64),
+    Place([f64; 2]),
+}
+
 pub struct MoveCommit {
     pub ids: BTreeSet<u32>,
     pub offset: [f64; 3],
@@ -112,6 +119,7 @@ pub struct CommandState {
     copying: bool,
     copy_single: bool,
     copy_operations: Vec<u64>,
+    rectangle_dimensions: Option<RectangleDimensions>,
     pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
     step: Option<Step>,
@@ -162,6 +170,19 @@ impl CommandState {
     }
     pub fn circle_drawing(&self) -> bool {
         matches!(&self.step, Some(Step::Draw {sketch,..}) if sketch.kind.is_circle())
+    }
+    pub fn rectangle_drawing(&self) -> bool {
+        matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::Rectangle)
+    }
+    pub fn rectangle_corner(&self) -> bool {
+        matches!(&self.step,Some(Step::Draw{sketch,confirmed:false}) if sketch.kind==SketchKind::Rectangle && sketch.points.len()==1)
+    }
+    pub fn rectangle_placing(&self) -> bool {
+        self.rectangle_corner()
+            && matches!(
+                self.rectangle_dimensions,
+                Some(RectangleDimensions::Place(_))
+            )
     }
     pub fn circle_options(&self) -> &'static [(&'static str, &'static str)] {
         if let Some(Step::Draw {
@@ -346,6 +367,24 @@ impl CommandState {
     }
     pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
         use super::cad_input::{Kind, Spec};
+        if self.rectangle_corner() {
+            let kind = match self.rectangle_dimensions {
+                Some(RectangleDimensions::Length) => Some(Kind::RectangleLength),
+                Some(RectangleDimensions::Width(_)) => Some(Kind::RectangleWidth),
+                Some(RectangleDimensions::Place(_)) => return None,
+                None => None,
+            };
+            if let Some(kind) = kind {
+                return Some(Spec {
+                    kind,
+                    reference: None,
+                    plane: self.plane,
+                    point: None,
+                    value: 0.,
+                    secondary: 0.,
+                });
+            }
+        }
         if let Some(Step::TransformPick(s)) = &self.step {
             if let Some(spec) = s.spec(self.hover.map(as_point), &self.tools, self.plane) {
                 return Some(spec);
@@ -530,7 +569,7 @@ impl CommandState {
             } else {
                 dynamic.constrain(self, text, point)
             };
-            match result {
+            match result.and_then(|point| self.rectangle_target(point)) {
                 Ok(point) => {
                     self.hover = Some(point);
                     self.ray_error.clear();
@@ -587,6 +626,34 @@ impl CommandState {
             finite([c.x + d.x, c.y + d.y, c.z + d.z])
         })())
     }
+    fn rectangle_target(&self, point: [f64; 3]) -> Result<[f64; 3], String> {
+        let Some(RectangleDimensions::Place(size)) = self.rectangle_dimensions else {
+            return Ok(point);
+        };
+        let Some(Step::Draw {
+            sketch,
+            confirmed: false,
+        }) = &self.step
+        else {
+            return Ok(point);
+        };
+        if sketch.kind != SketchKind::Rectangle || sketch.points.len() != 1 {
+            return Ok(point);
+        }
+        let a = sketch.plane.to_local(sketch.points[0]);
+        let b = sketch.plane.to_local(as_point(point));
+        if !a.iter().chain(b.iter()).all(|v| v.is_finite()) {
+            return Err("矩形方向超出有效数值范围".into());
+        }
+        if b[2].abs() > 1e-5 {
+            return Err("矩形须在当前工作平面内放置；请启用投影捕捉或调整平面".into());
+        }
+        finite(array(sketch.plane.to_world([
+            a[0] + if b[0] < a[0] { -size[0] } else { size[0] },
+            a[1] + if b[1] < a[1] { -size[1] } else { size[1] },
+            0.,
+        ])))
+    }
     fn radius_grip_point(&self, text: &str) -> Result<[f64; 3], String> {
         let Some(Step::Grip { geometry, base, .. }) = &self.step else {
             return Err("当前不是半径夹点".into());
@@ -623,6 +690,14 @@ impl CommandState {
         ) || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
+        if self.rectangle_corner()
+            && matches!(
+                self.rectangle_dimensions,
+                Some(RectangleDimensions::Length | RectangleDimensions::Width(_))
+            )
+        {
+            return false;
+        }
         if let Some(Step::TransformPick(s)) = &self.step {
             return s.takes_point();
         }
@@ -657,6 +732,14 @@ impl CommandState {
     }
 
     pub fn prompt(&self) -> String {
+        if self.rectangle_corner() {
+            return match self.rectangle_dimensions {
+                Some(RectangleDimensions::Length)=>"矩形尺寸：输入沿工作平面 U 的正长度；U 返回对角点方式，Esc 取消".into(),
+                Some(RectangleDimensions::Width(length))=>format!("矩形尺寸：长度 {length:.4} mm；输入沿工作平面 V 的正宽度；U 重输长度"),
+                Some(RectangleDimensions::Place([length,width]))=>format!("矩形 {length:.4} × {width:.4} mm：移动鼠标选择放置象限，点击/Enter 确认；D 重输尺寸，U 重输宽度，Esc 取消"),
+                None=>"矩形：指定对角点，或 D 输入长度和宽度；U 撤回首角点，Esc 取消".into(),
+            };
+        }
         if let Some(multiple) = self.copy_mode() {
             if matches!(self.step, Some(Step::Base { .. } | Step::Target { .. })) {
                 return format!("复制（{}，已完成 {} 次）：{}；M 多次 / S 单次；U 撤回本命令上次复制；Esc 结束保留结果",
@@ -1001,6 +1084,7 @@ impl CommandState {
         false
     }
     pub fn cancel(&mut self) {
+        self.rectangle_dimensions = None;
         self.copying = false;
         self.copy_single = false;
         self.copy_operations.clear();
@@ -1095,8 +1179,17 @@ impl CommandState {
     pub fn cycle_snap(&mut self, reverse: bool) {
         if self.takes_point() {
             if let Some(point) = self.aids.cycle(reverse) {
-                self.hover = Some(array(point));
-                self.pointer_point = self.hover;
+                self.pointer_point = Some(array(point));
+                match self.rectangle_target(array(point)) {
+                    Ok(point) => {
+                        self.hover = Some(point);
+                        self.ray_error.clear();
+                    }
+                    Err(error) => {
+                        self.hover = None;
+                        self.ray_error = error;
+                    }
+                }
             }
         }
     }
@@ -1105,6 +1198,52 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if self.rectangle_corner() {
+            let upper = text.trim().to_uppercase();
+            if matches!(upper.as_str(), "D" | "DIMENSIONS") {
+                self.rectangle_dimensions = Some(RectangleDimensions::Length);
+                self.clear_hover();
+                self.ray_error.clear();
+                return Ok(None);
+            }
+            if matches!(upper.as_str(), "U" | "UNDO") {
+                if let Some(phase) = self.rectangle_dimensions {
+                    self.rectangle_dimensions = match phase {
+                        RectangleDimensions::Length => None,
+                        RectangleDimensions::Width(_) => Some(RectangleDimensions::Length),
+                        RectangleDimensions::Place([length, _]) => {
+                            Some(RectangleDimensions::Width(length))
+                        }
+                    };
+                    self.clear_hover();
+                    self.ray_error.clear();
+                    return Ok(None);
+                }
+            }
+            if let Some(phase @ (RectangleDimensions::Length | RectangleDimensions::Width(_))) =
+                self.rectangle_dimensions
+            {
+                let value = number(text)?;
+                if value <= 1e-9 {
+                    return Err("矩形长度和宽度须为大于几何容差的正数".into());
+                }
+                self.rectangle_dimensions = Some(match phase {
+                    RectangleDimensions::Length => RectangleDimensions::Width(value),
+                    RectangleDimensions::Width(length) => {
+                        RectangleDimensions::Place([length, value])
+                    }
+                    _ => unreachable!(),
+                });
+                self.clear_hover();
+                self.ray_error.clear();
+                return Ok(None);
+            }
+            if self.rectangle_placing() && text.trim().is_empty() {
+                let point = self.hover.ok_or("请先在画布选择矩形的放置象限")?;
+                self.accept_point(point)?;
+                return self.finish_ready(selected);
+            }
+        }
         if self.copy_mode().is_some() && !self.selecting() {
             match text.trim().to_uppercase().as_str() {
                 "M" | "MULTIPLE" | "多次" => {
@@ -1487,6 +1626,7 @@ impl CommandState {
         self.finish_ready(selected)
     }
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
+        let point = self.rectangle_target(point)?;
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
             Step::TransformPick(_) => {
                 if let Some(Step::TransformPick(s)) = &mut self.step {
@@ -1677,6 +1817,7 @@ impl CommandState {
             .inspect(|point| self.pointer_point = Some(*point))
             .and_then(|point| dynamic.constrain(self, draft, point))
             .and_then(|point| self.circle_value_point(draft).unwrap_or(Ok(point)))
+            .and_then(|point| self.rectangle_target(point))
             .and_then(finite);
         match point {
             Ok(point) => {
@@ -1896,6 +2037,9 @@ impl CommandState {
         let mut command = None;
         ui.strong("命令参数与工作平面");
         self.aids.controls(ui);
+        if self.rectangle_corner() && ui.button("D 矩形长度 / 宽度").clicked() {
+            command = Some("D".into());
+        }
         if self.copy_mode().is_some() && !self.selecting() {
             ui.horizontal(|ui| {
                 if ui.button("M 多次复制").clicked() {

@@ -19,6 +19,8 @@ pub enum Kind {
     ReferenceLength,
     TargetAngle,
     TargetLength,
+    RectangleLength,
+    RectangleWidth,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -52,6 +54,8 @@ impl Spec {
             Kind::ReferenceLength => &["原长度 mm"],
             Kind::TargetAngle => &["新方向 °"],
             Kind::TargetLength => &["新长度 mm"],
+            Kind::RectangleLength => &["矩形长度 mm"],
+            Kind::RectangleWidth => &["矩形宽度 mm"],
         }
     }
     fn values(self) -> [f64; 3] {
@@ -154,7 +158,7 @@ pub fn canonical(name: &str) -> &str {
     if name == "CP" {
         return "COPY";
     }
-    if name == "RECT" {
+    if matches!(name, "RECT" | "RECTANG") {
         return "RECTANGLE";
     }
     COMMANDS
@@ -340,6 +344,7 @@ impl DynamicInput {
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
                     || !command.circle_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
+                    || command.rectangle_corner() && typed.eq_ignore_ascii_case("D")
                     || command.copy_mode().is_some()
                         && !command.selecting()
                         && matches!(typed.to_uppercase().as_str(), "M" | "S")
@@ -425,7 +430,8 @@ impl DynamicInput {
         if self.at_cursor
             && self.literal
             && command.takes_point()
-            && command.input_spec().is_some_and(|s| s.reference.is_some())
+            && (command.input_spec().is_some_and(|s| s.reference.is_some())
+                || command.rectangle_placing())
             && !trimmed.starts_with(['@', '#'])
             && !trimmed.starts_with("W:")
             && !trimmed.starts_with("w:")
@@ -639,6 +645,9 @@ impl DynamicInput {
                             }
                             Kind::TargetAngle | Kind::TargetLength => {
                                 "新值相对于参照计算；确认提交"
+                            }
+                            Kind::RectangleLength | Kind::RectangleWidth => {
+                                "输入正尺寸后确认；U 返回上一步"
                             }
                         });
                         let mut fields = self.fields(spec, text);

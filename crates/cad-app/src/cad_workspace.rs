@@ -97,6 +97,16 @@ impl Workspace {
                             action = Some("U".into());
                         }
                     }
+                    if command.rectangle_drawing() {
+                        if command.rectangle_corner()
+                            && ui.button("输入矩形长度 / 宽度  D").clicked()
+                        {
+                            action = Some("D".into());
+                        }
+                        if ui.button("撤回矩形上一步  U").clicked() {
+                            action = Some("U".into());
+                        }
+                    }
                     if command.command_undo_active() {
                         if ui
                             .add_enabled(

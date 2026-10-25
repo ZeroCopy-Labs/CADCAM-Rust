@@ -379,7 +379,12 @@ fn submit_command(
     mode: SpaceMode,
     raw: &str,
 ) {
-    let repeated = if raw.trim().is_empty() && !state.cad_command.is_active() {
+    let repeated = if raw.trim().is_empty()
+        && state.cad_command.rectangle_corner()
+        && !state.cad_command.takes_point()
+    {
+        state.command_input.trim().to_string()
+    } else if raw.trim().is_empty() && !state.cad_command.is_active() {
         state.cad_command.last_command.clone()
     } else {
         raw.trim().to_string()
