@@ -57,6 +57,8 @@ pub enum SketchKind {
     Circle2P,
     Circle3P,
     Arc,
+    ArcCenterEnd,
+    ArcCenterAngle,
     Ellipse,
     Spline,
 }
@@ -71,6 +73,8 @@ impl SketchKind {
             Self::Circle2P => "圆（两点直径）",
             Self::Circle3P => "圆（三点）",
             Self::Arc => "三点圆弧",
+            Self::ArcCenterEnd => "圆弧（圆心/起点/终点方向）",
+            Self::ArcCenterAngle => "圆弧（圆心/起点/扫角）",
             Self::Ellipse => "椭圆",
             Self::Spline => "控制点样条",
         }
@@ -85,6 +89,8 @@ impl SketchKind {
             Self::Circle2P => "CIRCLE2P",
             Self::Circle3P => "CIRCLE3P",
             Self::Arc => "ARC",
+            Self::ArcCenterEnd => "ARCCE",
+            Self::ArcCenterAngle => "ARCCA",
             Self::Ellipse => "ELLIPSE",
             Self::Spline => "SPLINE",
         }
@@ -98,6 +104,9 @@ impl SketchKind {
             Self::Circle | Self::CircleDiameter | Self::Circle2P | Self::Circle3P
         )
     }
+    pub fn is_arc(self) -> bool {
+        matches!(self, Self::Arc | Self::ArcCenterEnd | Self::ArcCenterAngle)
+    }
     pub fn required(self) -> usize {
         match self {
             Self::Line
@@ -105,8 +114,9 @@ impl SketchKind {
             | Self::Rectangle
             | Self::Circle
             | Self::CircleDiameter
-            | Self::Circle2P => 2,
-            Self::Arc | Self::Ellipse | Self::Circle3P => 3,
+            | Self::Circle2P
+            | Self::ArcCenterAngle => 2,
+            Self::Arc | Self::ArcCenterEnd | Self::Ellipse | Self::Circle3P => 3,
             Self::Spline => 4,
         }
     }
@@ -118,6 +128,8 @@ pub struct Sketch {
     pub points: Vec<Point3>,
     pub closed: bool,
     pub degree: u32,
+    /// Signed sweep entered after the center and start picks for ArcCenterAngle.
+    pub sweep_degrees: Option<f64>,
 }
 impl Sketch {
     pub fn new(kind: SketchKind, plane: WorkPlane, degree: u32) -> Self {
@@ -127,6 +139,7 @@ impl Sketch {
             points: Vec::new(),
             closed: false,
             degree,
+            sweep_degrees: None,
         }
     }
     pub fn push(&mut self, p: Point3) -> Result<(), String> {
@@ -233,6 +246,44 @@ impl Sketch {
                 vec![Geometry::Circle(Circle {
                     center,
                     radius,
+                    plane,
+                })]
+            }
+            SketchKind::ArcCenterEnd | SketchKind::ArcCenterAngle => {
+                let start = delta(p[0], p[1]);
+                let radius = start.length();
+                if !radius.is_finite() || radius <= 1e-9 {
+                    return Err("圆弧半径须有限且大于几何容差".into());
+                }
+                let start_angle = start
+                    .dot(self.plane.y_axis)
+                    .atan2(start.dot(self.plane.x_axis));
+                let sweep_angle = if self.kind == SketchKind::ArcCenterAngle {
+                    let degrees = self.sweep_degrees.ok_or("请输入圆弧扫角")?;
+                    if !degrees.is_finite() || degrees.abs() >= 360. {
+                        return Err("扫角须有限，且绝对值小于 360°；整圆请用 CIRCLE".into());
+                    }
+                    degrees.to_radians()
+                } else {
+                    let end = delta(p[0], p[2]);
+                    let u = end.dot(self.plane.x_axis);
+                    let v = end.dot(self.plane.y_axis);
+                    if !u.hypot(v).is_finite() || u.hypot(v) <= 1e-9 {
+                        return Err("终点方向不能与圆心重合".into());
+                    }
+                    (v.atan2(u) - start_angle).rem_euclid(TAU)
+                };
+                if !sweep_angle.is_finite()
+                    || sweep_angle.abs() <= 1e-12
+                    || self.kind == SketchKind::ArcCenterEnd && TAU - sweep_angle <= 1e-12
+                {
+                    return Err("圆弧扫角不能为零或起止方向相同".into());
+                }
+                vec![Geometry::Arc(Arc {
+                    center: p[0],
+                    radius,
+                    start_angle,
+                    sweep_angle,
                     plane,
                 })]
             }

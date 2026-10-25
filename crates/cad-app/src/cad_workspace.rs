@@ -97,6 +97,16 @@ impl Workspace {
                             action = Some("U".into());
                         }
                     }
+                    if command.arc_drawing() {
+                        for &(option, label) in command.arc_options() {
+                            if ui.button(format!("{label}  {option}")).clicked() {
+                                action = Some(option.into());
+                            }
+                        }
+                        if ui.button("撤回圆弧上一取点  U").clicked() {
+                            action = Some("U".into());
+                        }
+                    }
                     if command.rectangle_drawing() {
                         if command.rectangle_corner() && ui.button("设置矩形旋转角度  R").clicked()
                         {
@@ -213,6 +223,8 @@ const DRAW: &[(&str, &str)] = &[
     ("CIRCLED", "圆心 / 直径圆"),
     ("CIRCLE2P", "两点直径圆"),
     ("CIRCLE3P", "三点圆"),
+    ("ARCCE", "圆心 / 起点 / 终点方向圆弧"),
+    ("ARCCA", "圆心 / 起点 / 扫角圆弧"),
 ];
 const MODIFY: &[(&str, &str)] = &[
     ("MOVE", "移动"),
@@ -714,7 +726,7 @@ fn icon(painter: &egui::Painter, rect: egui::Rect, command: &str, color: egui::C
                 .collect();
             painter.add(egui::Shape::line(points, stroke));
         }
-        "ARC" | "FILLET" | "ROTATE" | "ANGLE" => {
+        "ARC" | "ARCCE" | "ARCCA" | "FILLET" | "ROTATE" | "ANGLE" => {
             let points = (0..=20)
                 .map(|i| {
                     let t = i as f32 * std::f32::consts::PI / 20.;

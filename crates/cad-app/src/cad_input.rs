@@ -22,6 +22,7 @@ pub enum Kind {
     RectangleLength,
     RectangleWidth,
     RectangleAngle,
+    ArcSweep,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -58,6 +59,7 @@ impl Spec {
             Kind::RectangleLength => &["矩形长度 mm"],
             Kind::RectangleWidth => &["矩形宽度 mm"],
             Kind::RectangleAngle => &["矩形旋转 °"],
+            Kind::ArcSweep => &["圆弧扫角 °"],
         }
     }
     fn values(self) -> [f64; 3] {
@@ -121,6 +123,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("CIRCLE2P", "", "两点直径圆"),
     ("CIRCLE3P", "", "三点圆"),
     ("ARC", "A", "圆弧"),
+    ("ARCCE", "", "圆心/起点/终点方向圆弧"),
+    ("ARCCA", "", "圆心/起点/扫角圆弧"),
     ("ELLIPSE", "EL", "椭圆"),
     ("SPLINE", "SPL", "样条"),
     ("MOVE", "M", "移动"),
@@ -320,14 +324,19 @@ impl DynamicInput {
                 // "2P" / "3P" can arrive after the digit locked a coordinate field.
                 if !self.literal
                     && typed.eq_ignore_ascii_case("P")
-                    && command.circle_options().iter().any(|(key, _)| *key == "2P")
+                    && (!command.circle_options().is_empty() || !command.arc_options().is_empty())
                     && self.locked[0]
                     && !self.locked[1]
                     && !self.locked[2]
                 {
                     if let Some(spec) = self.spec(command) {
                         let fields = self.fields(spec, text);
-                        if matches!(fields[0].as_str(), "2" | "3") {
+                        if command
+                            .circle_options()
+                            .iter()
+                            .chain(command.arc_options().iter())
+                            .any(|(key, _)| *key == format!("{}P", fields[0]))
+                        {
                             *text = fields[0].clone();
                             self.locked = [false; 3];
                             self.literal = true;
@@ -346,6 +355,8 @@ impl DynamicInput {
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
                     || !command.circle_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
+                    || !command.arc_options().is_empty()
+                        && matches!(typed.to_uppercase().as_str(), "C" | "A" | "E" | "3P")
                     || command.rectangle_corner()
                         && matches!(typed.to_uppercase().as_str(), "D" | "R")
                     || command.copy_mode().is_some()
@@ -653,6 +664,7 @@ impl DynamicInput {
                                 "输入正尺寸后确认；U 返回上一步"
                             }
                             Kind::RectangleAngle => "相对工作平面 U 轴的角度；正角绕法向按右手方向",
+                            Kind::ArcSweep => "非零且绝对值小于 360°；正角逆时针，负角顺时针",
                         });
                         let mut fields = self.fields(spec, text);
                         let target = self.field;

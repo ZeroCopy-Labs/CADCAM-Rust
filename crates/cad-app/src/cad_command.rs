@@ -173,6 +173,36 @@ impl CommandState {
     pub fn circle_drawing(&self) -> bool {
         matches!(&self.step, Some(Step::Draw {sketch,..}) if sketch.kind.is_circle())
     }
+    pub fn arc_drawing(&self) -> bool {
+        matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind.is_arc())
+    }
+    pub fn arc_options(&self) -> &'static [(&'static str, &'static str)] {
+        if let Some(Step::Draw {
+            sketch,
+            confirmed: false,
+        }) = &self.step
+        {
+            if sketch.kind.is_arc() {
+                if sketch.points.is_empty() {
+                    return &[
+                        ("3P", "三点圆弧"),
+                        ("C", "圆心 / 起点 / 终点方向"),
+                        ("A", "圆心 / 起点 / 扫角"),
+                    ];
+                }
+                if matches!(
+                    sketch.kind,
+                    SketchKind::ArcCenterEnd | SketchKind::ArcCenterAngle
+                ) {
+                    return &[("E", "终点方向方式"), ("A", "扫角方式")];
+                }
+            }
+        }
+        &[]
+    }
+    pub fn arc_sweep_input(&self) -> bool {
+        matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::ArcCenterAngle && sketch.points.len()==2)
+    }
     pub fn rectangle_drawing(&self) -> bool {
         matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::Rectangle)
     }
@@ -369,6 +399,19 @@ impl CommandState {
     }
     pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
         use super::cad_input::{Kind, Spec};
+        if self.arc_sweep_input() {
+            let Some(Step::Draw { sketch, .. }) = &self.step else {
+                unreachable!()
+            };
+            return Some(Spec {
+                kind: Kind::ArcSweep,
+                reference: None,
+                plane: sketch.plane,
+                point: None,
+                value: sketch.sweep_degrees.unwrap_or(90.),
+                secondary: 0.,
+            });
+        }
         if self.rectangle_corner() {
             if self.rectangle_rotating {
                 return Some(Spec {
@@ -485,6 +528,14 @@ impl CommandState {
         })
     }
     pub fn preview_scalar(&mut self, text: &str) {
+        if self.arc_sweep_input() {
+            if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
+                if !text.trim().is_empty() || !*confirmed {
+                    sketch.sweep_degrees = number(text).ok();
+                }
+            }
+            return;
+        }
         if let Some(Step::TransformPick(s)) = &mut self.step {
             s.preview_value(text, &mut self.tools);
             return;
@@ -702,6 +753,9 @@ impl CommandState {
         ) || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
+        if self.arc_sweep_input() {
+            return false;
+        }
         if self.rectangle_corner() && self.rectangle_rotating {
             return false;
         }
@@ -840,6 +894,21 @@ impl CommandState {
                 }
             }
             Some(Step::Draw { sketch, confirmed }) => {
+                if sketch.kind.is_arc() && !confirmed {
+                    return format!(
+                        "{}：{}；U 撤回取点，Esc 取消",
+                        sketch.kind.label(),
+                        match (sketch.kind, sketch.points.len()) {
+                            (_, 0) => "指定首点；3P 三点 / C 圆心终点方向 / A 圆心扫角",
+                            (SketchKind::Arc, 1) => "指定经过点",
+                            (SketchKind::Arc, _) => "指定终点（三点不能共线）",
+                            (_, 1) => "指定起点（与圆心确定半径）；E 终点方向 / A 扫角",
+                            (SketchKind::ArcCenterEnd, _) =>
+                                "指定从圆心引出的终点射线，默认逆时针；A 改为扫角",
+                            _ => "输入扫角 <90°>，正角逆时针、负角顺时针；E 改为终点方向",
+                        }
+                    );
+                }
                 if sketch.kind.is_circle() && !confirmed {
                     return format!(
                         "{}：{}；U 撤回取点，Esc 取消",
@@ -1054,6 +1123,8 @@ impl CommandState {
             SketchKind::Circle2P,
             SketchKind::Circle3P,
             SketchKind::Arc,
+            SketchKind::ArcCenterEnd,
+            SketchKind::ArcCenterAngle,
             SketchKind::Ellipse,
             SketchKind::Spline,
         ] {
@@ -1165,6 +1236,11 @@ impl CommandState {
                 _ => *base,
             }),
             Some(Step::Grip { base, .. }) => array(*base),
+            Some(Step::Draw { sketch, .. })
+                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
+            {
+                array(sketch.points[0])
+            }
             Some(Step::Draw { sketch, .. }) => sketch
                 .points
                 .last()
@@ -1188,6 +1264,11 @@ impl CommandState {
                 Some(as_point(*base))
             }
             Some(Step::Grip { .. }) => Some(as_point(self.reference())),
+            Some(Step::Draw { sketch, .. })
+                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
+            {
+                Some(sketch.points[0])
+            }
             Some(Step::Draw { sketch, .. }) if !sketch.points.is_empty() => {
                 Some(*sketch.points.last().unwrap())
             }
@@ -1533,6 +1614,28 @@ impl CommandState {
         }
         if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
             let upper = text.trim().to_uppercase();
+            if sketch.kind.is_arc()
+                && matches!(
+                    upper.as_str(),
+                    "3P" | "C" | "CENTER" | "A" | "ANGLE" | "E" | "END"
+                )
+            {
+                let kind = match upper.as_str() {
+                    "3P" => SketchKind::Arc,
+                    "A" | "ANGLE" => SketchKind::ArcCenterAngle,
+                    _ => SketchKind::ArcCenterEnd,
+                };
+                if !sketch.points.is_empty()
+                    && (sketch.kind == SketchKind::Arc || kind == SketchKind::Arc || *confirmed)
+                {
+                    return Err("三点/圆心方式须在首点前选择；可 U 撤回后切换".into());
+                }
+                sketch.kind = kind;
+                sketch.sweep_degrees = None;
+                self.clear_hover();
+                self.ray_error.clear();
+                return Ok(None);
+            }
             if sketch.kind.is_circle()
                 && matches!(
                     upper.as_str(),
@@ -1561,6 +1664,7 @@ impl CommandState {
             }
             if matches!(upper.as_str(), "U" | "UNDO") {
                 sketch.points.pop().ok_or("没有可撤回的点")?;
+                sketch.sweep_degrees = None;
                 if sketch.kind == SketchKind::Rectangle && sketch.points.is_empty() {
                     sketch.plane = self.plane;
                     self.rectangle_angle = 0.;
@@ -1569,6 +1673,21 @@ impl CommandState {
                 sketch.closed = false;
                 *confirmed = false;
                 return Ok(None);
+            }
+            if sketch.kind == SketchKind::ArcCenterAngle && sketch.points.len() == 2 {
+                let mut next = sketch.clone();
+                next.sweep_degrees = Some(if text.trim().is_empty() {
+                    sketch.sweep_degrees.unwrap_or(90.)
+                } else {
+                    number(text)?
+                });
+                let geometry = next.geometry()?;
+                *sketch = next;
+                *confirmed = true;
+                return Ok(Some(CommandCommit::Create {
+                    geometry,
+                    normal: sketch.plane.normal(),
+                }));
             }
             if text.trim().is_empty() {
                 if sketch.points.len()
@@ -1777,7 +1896,8 @@ impl CommandState {
                 }
                 next.push(as_point(point))?;
                 let done = *confirmed
-                    || !next.kind.continuous() && next.points.len() >= next.kind.required();
+                    // Center/angle arcs wait for a separate scalar confirmation.
+                    || !next.kind.continuous() && next.kind!=SketchKind::ArcCenterAngle && next.points.len() >= next.kind.required();
                 if done {
                     next.geometry()?;
                 }
@@ -2013,6 +2133,9 @@ impl CommandState {
             if let Some(p) = self.hover {
                 let _ = sketch.push(as_point(p));
             }
+        }
+        if sketch.kind == SketchKind::ArcCenterAngle && sketch.sweep_degrees.is_none() {
+            sketch.sweep_degrees = Some(90.);
         }
         match sketch.geometry() {
             Ok(geometry) => geometry

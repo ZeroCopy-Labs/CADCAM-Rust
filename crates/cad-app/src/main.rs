@@ -380,8 +380,8 @@ fn submit_command(
     raw: &str,
 ) {
     let repeated = if raw.trim().is_empty()
-        && state.cad_command.rectangle_corner()
-        && !state.cad_command.takes_point()
+        && (state.cad_command.rectangle_corner() && !state.cad_command.takes_point()
+            || state.cad_command.arc_sweep_input())
     {
         state.command_input.trim().to_string()
     } else if raw.trim().is_empty() && !state.cad_command.is_active() {
@@ -2977,6 +2977,8 @@ fn drawing_ui(
                             cad_core::geometry_edit::SketchKind::Circle2P,
                             cad_core::geometry_edit::SketchKind::Circle3P,
                             cad_core::geometry_edit::SketchKind::Arc,
+                            cad_core::geometry_edit::SketchKind::ArcCenterEnd,
+                            cad_core::geometry_edit::SketchKind::ArcCenterAngle,
                             cad_core::geometry_edit::SketchKind::Ellipse,
                             cad_core::geometry_edit::SketchKind::Spline,
                         ] {
@@ -4350,7 +4352,10 @@ fn drawing_ui(
             let submission = dynamic_input.ui(context, canvas_rect, cad_command, command_input);
             cad_command.refresh_input_preview(dynamic_input, command_input);
             dynamic_input.sync(cad_command, command_input);
-            if dynamic_input.at_cursor || cad_command.transform_reference() {
+            if dynamic_input.at_cursor
+                || cad_command.transform_reference()
+                || cad_command.arc_sweep_input()
+            {
                 cad_command.preview_scalar(command_input);
             }
             submission
