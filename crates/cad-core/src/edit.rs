@@ -138,6 +138,11 @@ impl EditableDrawing {
         Self::new(document, native, ids, layer_ids)
     }
 
+    pub(crate) fn mark_import_materialized(&mut self) {
+        self.serial += 1;
+        self.revision = self.serial;
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -491,6 +496,9 @@ impl EditableDrawing {
     fn ensure_editable(&self, ids: &BTreeSet<EntityId>) -> Result<(), String> {
         for id in ids {
             let entity = self.document.entity(*id).ok_or("选择中存在失效图元")?;
+            if !entity.visible {
+                return Err("隐藏图元不能编辑".into());
+            }
             self.ensure_layer_editable(entity.layer_id)?;
         }
         Ok(())
@@ -1083,6 +1091,11 @@ impl EditableDrawing {
             .unwrap_or_else(|| Path::new(&source.file_name));
         let mut document = convert_document(path, source.format, native, ids, layer_ids);
         document.source = source;
+        document.import_report.blocks = self.document.import_report.blocks.clone();
+        document.import_report.parser_review_required =
+            self.document.import_report.parser_review_required;
+        document.import_report.parser_skipped_records =
+            self.document.import_report.parser_skipped_records;
         for warning in warnings {
             if !document.import_report.warnings.contains(&warning) {
                 document.import_report.warnings.push(warning);

@@ -12,6 +12,7 @@ use super::{cam, cam_analysis, display, push_message, remember_recent, ViewerSta
 #[derive(Default)]
 pub(super) struct FileState {
     pub report_open: bool,
+    pub coverage_acknowledged: bool,
     pub exit_requested: bool,
     report: Option<ImportReport>,
     report_name: String,
@@ -82,12 +83,15 @@ fn load_drawing(state: &mut ViewerState, path: &Path, recovered: bool) {
 
 fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     clear_recovery(state);
+    state.file_ui.coverage_acknowledged = false;
     state.file_ui.report = drawing
         .as_ref()
         .map(|drawing| drawing.document().import_report.clone());
-    state.file_ui.report_open = state.file_ui.report.as_ref().is_some_and(|report| {
-        !report.warnings.is_empty() || !report.skipped.is_empty() || report.skipped_omitted > 0
-    });
+    state.file_ui.report_open = state
+        .file_ui
+        .report
+        .as_ref()
+        .is_some_and(|report| !report.warnings.is_empty() || report.has_omissions());
     if let Some(document) = drawing.as_ref().map(EditableDrawing::document) {
         state.file_name = document.source.file_name.clone();
         state.file_ui.report_name = state.file_name.clone();
@@ -147,6 +151,7 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     }
     state.cad_controls = Default::default();
     state.cad_curves = Default::default();
+    state.cad_diagnostics = Default::default();
     state.cad_layers = Default::default();
     state.cad_command = Default::default();
     state.command_input.clear();
@@ -369,10 +374,21 @@ pub(super) fn import_report_ui(context: &egui::Context, state: &mut ViewerState)
                 });
             }
             if report.skipped_omitted > 0 { ui.label(format!("另有 {} 个跳过对象未逐项列出", report.skipped_omitted)); }
+            ui.separator();ui.strong("块实例展开与源映射");
+            ui.label(format!("原始对象 {} · 原始模型空间 {} · 已展开实例 {} · 独立图元 {}",report.blocks.original_entities,report.blocks.original_model_space,report.blocks.instances,report.blocks.entities));
+            for failure in &report.blocks.failures{ui.colored_label(egui::Color32::LIGHT_RED,failure);}
+            if report.blocks.failures_omitted>0{ui.label(format!("另有 {} 个未展开实例未逐项列出",report.blocks.failures_omitted));}
+            ui.label(format!("解析跳过原始记录 {}；需核对恢复/截断提示：{}",report.parser_skipped_records,report.parser_review_required));
+            for map in &report.blocks.mappings{
+                let path=map.path.iter().map(|s|format!("{:X}[{},{}]",s.handle,s.row,s.column)).collect::<Vec<_>>().join(" → ");
+                ui.small(format!("新句柄 {:X} ← {} → 源 {:X} / 段 {}",map.handle,path,map.source_handle,map.segment));
+            }
+            if report.blocks.mappings_omitted>0{ui.label(format!("另有 {} 条映射未列出",report.blocks.mappings_omitted));}
             ui.separator(); ui.strong("解析及单位提示");
             for warning in &report.warnings { ui.label(warning); }
             ui.label("报告保留本次打开时的统计；后续编辑不改写该报告。未转换对象不会进入当前加工模型，DXF 保留范围取决于解析库。");
         });
+        if report.has_omissions(){ui.separator();ui.colored_label(egui::Color32::LIGHT_RED,"存在未转换对象或解析恢复/截断记录，请核对加工范围。");ui.checkbox(&mut state.file_ui.coverage_acknowledged,"我已核对遗漏，允许仅导出当前已转换图元的加工代码");}
         ui.separator();
         close = ui.button("关闭").clicked();
     });

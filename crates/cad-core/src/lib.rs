@@ -12,9 +12,11 @@
 //! [`read_document`] returns the model; [`read_editable_document`] retains an
 //! editable native document behind [`EditableDrawing`]. Parser types remain private.
 
+mod blocks;
 mod convert;
 pub mod curve_edit;
 pub mod curves;
+pub mod diagnostics;
 mod edit;
 mod file_io;
 pub mod geometry_edit;

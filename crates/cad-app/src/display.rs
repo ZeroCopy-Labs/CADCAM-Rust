@@ -112,7 +112,8 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
             has_points = true;
             entity_paths.push(DisplayPath {
                 entity_id: entity.id.0,
-                visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
+                visible: entity.visible
+                    && document.layer(entity.layer_id).is_none_or(|l| l.visible),
                 color,
                 points,
             });
@@ -167,14 +168,18 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
         };
         entities.push(DisplayEntity {
             id: entity.id.0,
-            visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
+            visible: entity.visible && document.layer(entity.layer_id).is_none_or(|l| l.visible),
             locked: document.layer(entity.layer_id).is_some_and(|l| l.locked),
             kind: entity.geometry.kind(),
             layer: layer_name,
             color,
             layer_color,
             color_key,
-            properties: entity_properties(&entity.geometry),
+            properties: {
+                let mut rows = entity_properties(&entity.geometry);
+                rows.insert(0, ("原生句柄", format!("{:X}", entity.native_handle)));
+                rows
+            },
         });
     }
 
@@ -231,7 +236,7 @@ pub fn build_machining(document: &DrawingDocument) -> Result<DisplayData, String
         }
         data.paths.push(DisplayPath {
             entity_id: entity.id.0,
-            visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
+            visible: entity.visible && document.layer(entity.layer_id).is_none_or(|l| l.visible),
             color: resolve_color(entity, document),
             points: points.into_iter().map(to_array).collect(),
         });

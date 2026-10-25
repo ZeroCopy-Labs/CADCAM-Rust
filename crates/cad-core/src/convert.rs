@@ -46,7 +46,8 @@ pub fn read_document<P: AsRef<Path>>(path: P) -> Result<DrawingDocument, ImportE
 /// Read an editable drawing while retaining the native records for DXF export.
 pub fn read_editable_document<P: AsRef<Path>>(path: P) -> Result<EditableDrawing, ImportError> {
     let path = path.as_ref();
-    let native = read_native(path)?;
+    let mut native = read_native(path)?;
+    let blocks = crate::blocks::materialize(&mut native.document);
     let mut ids = BTreeMap::new();
     let mut layer_identities = BTreeMap::new();
     let mut document = convert_document(
@@ -72,14 +73,30 @@ pub fn read_editable_document<P: AsRef<Path>>(path: P) -> Result<EditableDrawing
         }
     }
 
+    if blocks.instances > 0 {
+        warnings.push(format!(
+            "已将 {} 个模型空间块实例展开为 {} 个独立图元；DXF 保存将写出展开结果并保留块定义。",
+            blocks.instances, blocks.entities
+        ));
+    }
+    document.import_report.source_entities = blocks.original_entities;
+    document.import_report.model_space_entities = blocks.original_model_space;
+    document.import_report.ignored_non_model_space = blocks
+        .original_entities
+        .saturating_sub(blocks.original_model_space);
+    document.import_report.parser_skipped_records = native.stats.skipped_source_records;
+    document.import_report.parser_review_required = native.stats.skipped_source_records > 0
+        || native.stats.recovered_errors > 0
+        || (native.stats.record_stream_read && !native.stats.stream_completed);
+    document.import_report.blocks = blocks;
     document.import_report.warnings.extend(warnings);
     deduplicate(&mut document.import_report.warnings);
-    Ok(EditableDrawing::new(
-        document,
-        native.document,
-        ids,
-        layer_identities,
-    ))
+    let materialized = document.import_report.blocks.instances > 0;
+    let mut drawing = EditableDrawing::new(document, native.document, ids, layer_identities);
+    if materialized {
+        drawing.mark_import_materialized();
+    }
+    Ok(drawing)
 }
 
 /// Convert the parser document for `path` into the internal model.
@@ -178,6 +195,8 @@ pub(crate) fn convert_document(
             report.record_converted(geometry.kind());
             entities.push(Entity {
                 id,
+                native_handle: native_entity.common().handle.value(),
+                visible: !native_entity.common().invisible,
                 layer_id,
                 color,
                 geometry,
@@ -263,7 +282,7 @@ fn scale_geometry(geometry: &mut Geometry, scale: f64) -> bool {
     }
 }
 
-fn convert_geometry(native: &EntityType, report: &mut ImportReport) -> Option<Geometry> {
+pub(crate) fn convert_geometry(native: &EntityType, report: &mut ImportReport) -> Option<Geometry> {
     let result: Result<Geometry, String> = match native {
         EntityType::Line(line) => Ok(convert_line(line)),
         EntityType::Circle(circle) => convert_circle(circle),
@@ -394,6 +413,10 @@ fn convert_lw_polyline(native: &NativeLwPolyline) -> Result<Geometry, String> {
 }
 
 fn convert_polyline2d(native: &NativePolyline2D) -> Result<Geometry, String> {
+    if native.flags.bits() & (2 | 4) != 0 {
+        return Err("fitted polyline semantics are not supported; source record retained".into());
+    }
+
     if native.flags.bits() & (16 | 64) != 0 {
         return Err("polygon mesh / polyface mesh polylines are not supported".to_string());
     }
@@ -421,6 +444,10 @@ fn convert_polyline2d(native: &NativePolyline2D) -> Result<Geometry, String> {
 }
 
 fn convert_polyline_3d_heavy(native: &NativePolyline) -> Result<Geometry, String> {
+    if native.flags.bits() & (2 | 4) != 0 {
+        return Err("fitted polyline semantics are not supported; source record retained".into());
+    }
+
     if native.flags.bits() & (16 | 64) != 0 {
         return Err("polygon mesh / polyface mesh polylines are not supported".to_string());
     }
@@ -434,6 +461,10 @@ fn convert_polyline_3d_heavy(native: &NativePolyline) -> Result<Geometry, String
 }
 
 fn convert_polyline3d(native: &NativePolyline3D) -> Result<Geometry, String> {
+    if native.flags.spline_fit {
+        return Err("fitted polyline semantics are not supported; source record retained".into());
+    }
+
     if native.flags.is_3d_mesh || native.flags.is_polyface_mesh {
         return Err("polygon mesh / polyface mesh polylines are not supported".to_string());
     }

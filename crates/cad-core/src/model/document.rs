@@ -222,9 +222,39 @@ pub struct SkippedEntity {
 /// Maximum number of individual skipped-entity samples kept in the report.
 pub const MAX_SKIPPED_SAMPLES: usize = 256;
 
+/// One original INSERT cell in an expanded instance path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertSource {
+    pub handle: u64,
+    pub row: u16,
+    pub column: u16,
+}
+/// Mapping retained for the current import report, not a persistent block relationship.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockMapping {
+    pub handle: u64,
+    pub path: Vec<InsertSource>,
+    pub source_handle: u64,
+    pub segment: usize,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockExpansionReport {
+    pub original_entities: usize,
+    pub original_model_space: usize,
+    pub instances: usize,
+    pub entities: usize,
+    pub mappings: Vec<BlockMapping>,
+    pub mappings_omitted: usize,
+    pub failures: Vec<String>,
+    pub failures_omitted: usize,
+}
+
 /// Summary of what the import converter did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImportReport {
+    pub blocks: BlockExpansionReport,
+    pub parser_review_required: bool,
+    pub parser_skipped_records: usize,
     /// All parsed entities, including block definitions and paper space.
     pub source_entities: usize,
     /// Entities presented to the model-space converter.
@@ -242,6 +272,14 @@ pub struct ImportReport {
 }
 
 impl ImportReport {
+    pub fn has_omissions(&self) -> bool {
+        self.parser_review_required
+            || !self.skipped.is_empty()
+            || self.skipped_omitted > 0
+            || !self.blocks.failures.is_empty()
+            || self.blocks.failures_omitted > 0
+    }
+
     /// Increment the converted counter for a geometry kind.
     pub(crate) fn record_converted(&mut self, kind: &'static str) {
         *self.converted.entry(kind.to_string()).or_insert(0) += 1;

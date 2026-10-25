@@ -22,8 +22,8 @@ mod work_plane;
 
 // Re-export the complete model surface so callers do not depend on file layout.
 pub use document::{
-    DrawingDocument, FileFormat, ImportReport, Layer, LengthUnit, SkipReason, SkippedEntity,
-    SourceInfo, MAX_SKIPPED_SAMPLES,
+    BlockExpansionReport, BlockMapping, DrawingDocument, FileFormat, ImportReport, InsertSource,
+    Layer, LengthUnit, SkipReason, SkippedEntity, SourceInfo, MAX_SKIPPED_SAMPLES,
 };
 pub use entity::{Color, Entity, EntityColor, LayerColor};
 pub use geometry::{

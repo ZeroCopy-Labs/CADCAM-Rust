@@ -118,7 +118,7 @@ impl DraftingAids {
             let mut near_entities = Vec::new();
             let radius = frame.pixel_size * super::PICK_TOLERANCE as f64;
             for entity in &document.entities {
-                if document.layer(entity.layer_id).is_some_and(|l| !l.visible) {
+                if !entity.visible || document.layer(entity.layer_id).is_some_and(|l| !l.visible) {
                     continue;
                 }
                 let mut modes = self.modes.clone();

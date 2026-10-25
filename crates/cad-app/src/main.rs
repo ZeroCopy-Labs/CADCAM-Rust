@@ -25,6 +25,7 @@ use cad_file::open_drawing;
 mod cad_aids;
 mod cad_command;
 mod cad_curves;
+mod cad_diagnostics;
 mod cad_edit;
 mod cad_file;
 mod cad_layers;
@@ -54,6 +55,7 @@ struct ViewerState {
     file_ui: cad_file::FileState,
     cad_controls: cad_edit::EditControls,
     cad_curves: cad_curves::CurveControls,
+    cad_diagnostics: cad_diagnostics::Controls,
     cad_layers: cad_layers::LayerControls,
     cad_command: cad_command::CommandState,
     cad_history: BTreeMap<u64, CadUndoState>,
@@ -673,7 +675,13 @@ fn draw_scene(
         };
         let is_hovered =
             space.mode == SpaceMode::Cad && selection.hovered() == Some(path.entity_id);
-        let color = if is_hovered && !is_selected {
+        let pending_delete = state
+            .cad_command
+            .removed_preview_ids()
+            .is_some_and(|ids| ids.contains(&cad_core::EntityId(path.entity_id)));
+        let color = if pending_delete {
+            Color::srgb(1.0, 0.18, 0.18)
+        } else if is_hovered && !is_selected {
             Color::srgb(1.0, 0.5, 0.12)
         } else if is_selected {
             Color::srgb(1.0, 0.82, 0.22)
@@ -685,7 +693,7 @@ fn draw_scene(
             let [x1, y1, z1] = pair[1];
             let start = state.view.point([x0, y0, z0]);
             let end = state.view.point([x1, y1, z1]);
-            if is_selected || is_hovered {
+            if is_selected || is_hovered || pending_delete {
                 selected_gizmos.line(start, end, color);
             } else {
                 gizmos.line(start, end, color);
@@ -717,9 +725,10 @@ fn draw_scene(
             if let Some(entity) =
                 doc.entity(cad_core::EntityId(*selection.selected.first().unwrap()))
             {
-                if doc
-                    .layer(entity.layer_id)
-                    .is_none_or(|l| l.visible && !l.locked)
+                if entity.visible
+                    && doc
+                        .layer(entity.layer_id)
+                        .is_none_or(|l| l.visible && !l.locked)
                 {
                     for grip in cad_core::properties::grips(&entity.geometry) {
                         let position = state.view.point([grip.point.x, grip.point.y, grip.point.z]);
@@ -1109,6 +1118,9 @@ fn pick_grip(
     let doc = state.drawing.as_ref()?.document();
     let id = cad_core::EntityId(*selection.selected.first()?);
     let entity = doc.entity(id)?;
+    if !entity.visible {
+        return None;
+    }
     if doc
         .layer(entity.layer_id)
         .is_some_and(|l| l.locked || !l.visible)
@@ -2826,6 +2838,34 @@ fn drawing_ui(
                                     });
                                 }
                             }
+                            {
+                                let ViewerState {
+                                    drawing,
+                                    cad_diagnostics,
+                                    cad_command,
+                                    ..
+                                } = &mut *state;
+                                if let Some(drawing) = drawing.as_ref() {
+                                    ui.add_enabled_ui(!cad_command.is_active(), |ui| {
+                                        if let Some(action) = cad_diagnostics.ui(
+                                            ui,
+                                            drawing.document(),
+                                            drawing.revision(),
+                                        ) {
+                                            match action {
+                                                cad_diagnostics::Action::Locate { ids, point } => {
+                                                    selection.selected =
+                                                        ids.iter().map(|id| id.0).collect();
+                                                    camera.target = [point.x, point.y, point.z];
+                                                }
+                                                cad_diagnostics::Action::Preview(edit) => {
+                                                    cad_command.begin_curves(edit);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             let selection_enabled =
                                 !state.cad_command.is_active() || state.cad_command.selecting();
                             ui.add_enabled_ui(selection_enabled, |ui| {
@@ -2931,6 +2971,20 @@ fn drawing_ui(
                 }
                 SpaceMode::Cam => {
                     ui.small("加工采样：弦差 0.01 mm · 曲线内转角 3°；独立于显示折线。");
+                    if state
+                        .drawing
+                        .as_ref()
+                        .is_some_and(|d| d.document().import_report.has_omissions())
+                        && !state.file_ui.coverage_acknowledged
+                    {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "有未转换对象，导出前需核对加工范围。",
+                        );
+                        if ui.button("打开导入报告并确认范围").clicked() {
+                            state.file_ui.report_open = true;
+                        }
+                    }
                     if let Some(error) = &state.machining_error {
                         ui.colored_label(egui::Color32::LIGHT_RED, error);
                     }
@@ -4419,9 +4473,10 @@ fn apply_cad_action(
             let Some(entity) = doc.entity(id) else {
                 return false;
             };
-            if doc
-                .layer(entity.layer_id)
-                .is_some_and(|l| l.locked || !l.visible)
+            if !entity.visible
+                || doc
+                    .layer(entity.layer_id)
+                    .is_some_and(|l| l.locked || !l.visible)
             {
                 push_message(state, "请先显示并解锁图层");
                 return false;
@@ -4676,6 +4731,7 @@ fn refresh_edited_drawing(
     state.layer_count = document.layers.len();
     state.warning_count = document.import_report.warnings.len();
     if change.kind.changes_geometry() {
+        state.file_ui.coverage_acknowledged = false;
         state.cam = cam::build_cam_model(document);
         if let Some((analysis, manual_tube, manual_pair)) = restored {
             state.analysis = analysis;
@@ -4717,7 +4773,28 @@ fn export_dxf_file(state: &mut ViewerState) {
     }
 }
 
+fn confirm_import_coverage(state: &mut ViewerState) -> bool {
+    if state
+        .drawing
+        .as_ref()
+        .is_some_and(|d| d.document().import_report.has_omissions())
+        && !state.file_ui.coverage_acknowledged
+    {
+        state.file_ui.report_open = true;
+        push_message(
+            state,
+            "导出暂停：请在导入报告中核对遗漏对象并明确确认加工范围",
+        );
+        return false;
+    }
+    true
+}
+
 fn export_gcode_file(state: &mut ViewerState) {
+    if !confirm_import_coverage(state) {
+        return;
+    }
+
     rebuild_state_trajectory(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");
@@ -4754,6 +4831,9 @@ fn export_gcode_file(state: &mut ViewerState) {
 }
 
 fn quick_export_gcode_file(state: &mut ViewerState) {
+    if !confirm_import_coverage(state) {
+        return;
+    }
     rebuild_state_trajectory(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
         push_message(state, "没有可导出的四轴轨迹，请先完成 CAM 分析");

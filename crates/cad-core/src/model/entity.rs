@@ -39,6 +39,9 @@ pub type EntityColor = Color;
 pub struct Entity {
     /// Stable internal identity. Not a DXF/DWG handle.
     pub id: EntityId,
+    /// Native handle in the current editable drawing.
+    pub native_handle: u64,
+    pub visible: bool,
     /// Layer this entity belongs to.
     pub layer_id: LayerId,
     /// Display color, possibly resolved through the layer.

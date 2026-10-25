@@ -123,8 +123,17 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
-            Some(Step::Curves(_)) => {
-                return "曲线整理：Enter / 确认提交；Esc 取消；修改参数请取消后重新预览".into()
+            Some(Step::Curves(edit)) => {
+                return format!(
+                    "预览：输出 {} 项，删除 {} 项{}；Enter 提交，Esc 取消。红色为待删除对象。",
+                    edit.replacements.values().map(Vec::len).sum::<usize>(),
+                    edit.remove.len(),
+                    if edit.copies {
+                        "（保留原件）"
+                    } else {
+                        ""
+                    }
+                )
             }
             Some(Step::Grip {
                 target, dragging, ..
@@ -195,6 +204,14 @@ impl CommandState {
             Some(Step::PlaneThird { .. }) => "三点平面 3/3：指定 +V 一侧的点；三点不能共线",
         }
         .to_string()
+    }
+
+    pub fn removed_preview_ids(&self) -> Option<&BTreeSet<EntityId>> {
+        if let Some(Step::Curves(edit)) = &self.step {
+            Some(&edit.remove)
+        } else {
+            None
+        }
     }
 
     pub fn begin_curves(&mut self, edit: cad_core::CurveEdit) {
