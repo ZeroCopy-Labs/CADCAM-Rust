@@ -151,14 +151,25 @@ pub fn open(state: &mut ViewerState, path: &Path) {
             return Err("项目参考对象包含未知图元 ID".to_string());
         }
         let source = project.drawing.source.file_path.clone();
+        let previous_count = project.drawing.entities.len();
         let drawing = cad_core::EditableDrawing::from_project(project.drawing)?;
-        let sampled = crate::display::build_machining(drawing.document(), &project.excluded);
+        let migrated = drawing.document().entities.len() != previous_count;
+        let mut excluded = project.excluded;
+        excluded.extend(
+            drawing
+                .document()
+                .entities
+                .iter()
+                .filter(|e| matches!(e.geometry, cad_core::Geometry::Text(_)))
+                .map(|e| e.id.0),
+        );
+        let sampled = crate::display::build_machining(drawing.document(), &excluded);
         // Unsupported machining geometry may still be opened and edited; NC remains blocked.
         let (machining, error) = match sampled {
             Ok(data) => (data, None),
             Err(e) => (Default::default(), Some(e)),
         };
-        let cam = crate::cam::build_cam_model(drawing.document(), &project.excluded);
+        let cam = crate::cam::build_cam_model(drawing.document(), &excluded);
         let analysis = CamAnalysis::restore_setup(project.machining, &machining, &cam)?;
         Ok((
             drawing,
@@ -167,17 +178,19 @@ pub fn open(state: &mut ViewerState, path: &Path) {
             cam,
             analysis,
             project.profile,
-            project.excluded,
+            excluded,
             source,
+            migrated,
         ))
     })();
-    let (drawing, machining, error, cam, analysis, profile, excluded, source) = match prepared {
-        Ok(data) => data,
-        Err(error) => {
-            crate::push_message(state, format!("项目打开失败：{error}"));
-            return;
-        }
-    };
+    let (drawing, machining, error, cam, analysis, profile, excluded, source, migrated) =
+        match prepared {
+            Ok(data) => data,
+            Err(error) => {
+                crate::push_message(state, format!("项目打开失败：{error}"));
+                return;
+            }
+        };
     if !crate::cad_file::confirm_replace(state) {
         return;
     }
@@ -199,7 +212,7 @@ pub fn open(state: &mut ViewerState, path: &Path) {
     state.project = ProjectState {
         path: normal.then(|| path.to_path_buf()),
         native_project: true,
-        saved: normal.then(|| checkpoint(state)).flatten(),
+        saved: (normal && !migrated).then(|| checkpoint(state)).flatten(),
     };
     crate::remember_recent(
         state,

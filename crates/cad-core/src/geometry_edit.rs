@@ -37,6 +37,16 @@ pub struct NewEntity {
     pub normal: Option<Vector3>,
 }
 
+/// Geometry clipboard: world millimeters and common color/layer attributes only.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardItem {
+    pub geometry: Geometry,
+    pub layer: String,
+    pub layer_color: Color,
+    pub color: Color,
+    pub reference: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchKind {
     Line,
@@ -345,6 +355,30 @@ fn normal(v: Vector3) -> NV {
 }
 pub(crate) fn native_geometry(geometry: &Geometry, scale: f64) -> Result<EntityType, String> {
     Ok(match geometry {
+        Geometry::Text(t) => {
+            if t.content.is_empty()
+                || t.content.contains(['\r', '\n'])
+                || !t.height.is_finite()
+                || t.height <= 0.0
+                || ![t.position.x, t.position.y, t.position.z]
+                    .iter()
+                    .all(|v| v.is_finite())
+                || (t.plane.normal.length() - 1.0).abs() > 1e-6
+                || (t.plane.x_axis.length() - 1.0).abs() > 1e-6
+                || t.plane.normal.dot(t.plane.x_axis).abs() > 1e-6
+            {
+                return Err("单行文字不能为空，位置有限、字高须大于零".into());
+            }
+            let n = normal(t.plane.normal);
+            let basis = Matrix3::arbitrary_axis(n).transpose();
+            let x = basis * normal(t.plane.x_axis);
+            let mut text =
+                acadrust::entities::Text::with_value(&t.content, basis * nv(t.position, scale))
+                    .with_height(t.height / scale)
+                    .with_rotation(x.y.atan2(x.x));
+            text.normal = n;
+            EntityType::Text(text)
+        }
         Geometry::Line(l) => {
             EntityType::Line(NLine::from_points(nv(l.start, scale), nv(l.end, scale)))
         }

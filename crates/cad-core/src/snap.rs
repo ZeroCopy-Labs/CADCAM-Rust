@@ -57,6 +57,7 @@ enum Curve<'a> {
 }
 fn curves(geometry: &Geometry) -> Vec<Curve<'_>> {
     match geometry {
+        Geometry::Text(_) => Vec::new(),
         Geometry::Line(l) => vec![Curve::Line(l.start, l.end)],
         Geometry::Circle(c) => vec![Curve::Circle {
             center: c.center,

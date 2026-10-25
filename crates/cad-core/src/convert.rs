@@ -194,6 +194,15 @@ pub(crate) fn convert_document(
             });
             report.record_converted(geometry.kind());
             entities.push(Entity {
+                reference: matches!(geometry, Geometry::Text(_))
+                    || native_entity
+                        .common()
+                        .extended_data
+                        .get_record("CADCAM_RUST")
+                        .is_some_and(|r| {
+                            r.values.first()
+                                == Some(&acadrust::xdata::XDataValue::String("REFERENCE_V1".into()))
+                        }),
                 id,
                 native_handle: native_entity.common().handle.value(),
                 visible: !native_entity.common().invisible,
@@ -241,6 +250,7 @@ fn scale_geometry(geometry: &mut Geometry, scale: f64) -> bool {
         r.is_finite() && *r > 0.0
     };
     match geometry {
+        Geometry::Text(t) => point(&mut t.position) & radius(&mut t.height),
         Geometry::Line(line) => point(&mut line.start) & point(&mut line.end),
         Geometry::Polyline(polyline) => polyline.segments.iter_mut().all(|segment| match segment {
             PolylineSegment::Line { start, end } => point(start) & point(end),
@@ -284,6 +294,34 @@ fn scale_geometry(geometry: &mut Geometry, scale: f64) -> bool {
 
 pub(crate) fn convert_geometry(native: &EntityType, report: &mut ImportReport) -> Option<Geometry> {
     let result: Result<Geometry, String> = match native {
+        EntityType::Text(t) => {
+            use acadrust::entities::{TextHorizontalAlignment as H, TextVerticalAlignment as V};
+            if t.horizontal_alignment != H::Left
+                || t.vertical_alignment != V::Baseline
+                || t.width_factor != 1.0
+                || t.oblique_angle != 0.0
+                || t.generation_flags != 0
+                || t.thickness != 0.0
+                || !t.height.is_finite()
+                || t.height <= 0.0
+                || !t.rotation.is_finite()
+            {
+                Err("TEXT currently supports left/baseline, unit width and no oblique/mirror/thickness".into())
+            } else {
+                plane_from_normal(t.normal).map(|basis| {
+                    let x = basis.x_axis * t.rotation.cos() + basis.y_axis() * t.rotation.sin();
+                    Geometry::Text(crate::model::Text {
+                        position: ocs_point(t.insertion_point, basis),
+                        content: t.value.clone(),
+                        height: t.height,
+                        plane: Plane {
+                            normal: basis.normal,
+                            x_axis: x,
+                        },
+                    })
+                })
+            }
+        }
         EntityType::Line(line) => Ok(convert_line(line)),
         EntityType::Circle(circle) => convert_circle(circle),
         EntityType::Arc(arc) => convert_arc(arc),

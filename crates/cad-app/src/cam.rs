@@ -146,6 +146,7 @@ enum Topology {
 
 fn entity_topology(geometry: &Geometry) -> Option<Topology> {
     match geometry {
+        Geometry::Text(_) => None,
         Geometry::Line(line) => Some(Topology::Open {
             start: line.start,
             end: line.end,

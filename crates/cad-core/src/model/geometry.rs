@@ -15,7 +15,7 @@ use std::ops::{Add, Mul, Sub};
 pub const GEOMETRY_EPSILON: f64 = 1e-9;
 
 /// A point in drawing world coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Point3 {
     /// X coordinate in WCS.
     pub x: f64,
@@ -33,7 +33,7 @@ impl Point3 {
 }
 
 /// A vector in drawing world coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vector3 {
     /// X component.
     pub x: f64,
@@ -107,7 +107,7 @@ impl Sub for Vector3 {
 ///
 /// `x_axis` defines the zero-angle direction for arcs and circles and is always
 /// perpendicular to `normal`. `y_axis` is `normal × x_axis`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Plane {
     /// Unit normal of the plane.
     pub normal: Vector3,
@@ -131,7 +131,7 @@ impl Plane {
 }
 
 /// A line segment defined by two points.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Line {
     /// Start point in WCS.
     pub start: Point3,
@@ -144,7 +144,7 @@ pub struct Line {
 /// Coordinates are WCS 3D. Arc angles are interpreted in the owning
 /// [`Polyline::plane`], not in an implicit XY plane and not in a per-segment
 /// plane.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PolylineSegment {
     /// Straight segment from `start` to `end`.
     Line {
@@ -177,7 +177,7 @@ pub enum PolylineSegment {
 ///
 /// `plane` is shared by all arc segments of a planar (2D-source) polyline.
 /// A 3D-source polyline has `plane == None` and line segments only.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Polyline {
     /// Ordered segments, including the closing segment for closed polylines.
     pub segments: Vec<PolylineSegment>,
@@ -188,7 +188,7 @@ pub struct Polyline {
 }
 
 /// A full circle.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Circle {
     /// Circle center in WCS.
     pub center: Point3,
@@ -202,7 +202,7 @@ pub struct Circle {
 ///
 /// `sweep_angle` is signed: positive means counter-clockwise around
 /// `plane.normal`. The full angle is measured from `plane.x_axis`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Arc {
     /// Arc center in WCS.
     pub center: Point3,
@@ -222,7 +222,7 @@ pub struct Arc {
 /// is the semi-major axis). `minor_axis` is the corresponding semi-minor axis
 /// vector; `major_axis × minor_axis` gives the plane normal. The parametric form
 /// is `center + major_axis·cos(t) + minor_axis·sin(t)`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Ellipse {
     /// Ellipse center in WCS.
     pub center: Point3,
@@ -241,7 +241,7 @@ pub struct Ellipse {
 ///
 /// The knot vector, control points, weights and flags are preserved as-is from
 /// the source file; evaluation is intentionally left to a later phase.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Spline {
     /// NURBS degree.
     pub degree: u32,
@@ -264,8 +264,10 @@ pub struct Spline {
 }
 
 /// Geometry of one entity in the internal model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Geometry {
+    /// Basic single-line text; never a cutting contour.
+    Text(Text),
     /// Standalone line.
     Line(Line),
     /// Ordered line/arc path.
@@ -284,6 +286,7 @@ impl Geometry {
     /// Stable name of the geometry kind, used in reports and summaries.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Text(_) => "TEXT",
             Self::Line(_) => "LINE",
             Self::Polyline(_) => "POLYLINE",
             Self::Circle(_) => "CIRCLE",
@@ -292,4 +295,12 @@ impl Geometry {
             Self::Spline(_) => "SPLINE",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Text {
+    pub position: Point3,
+    pub content: String,
+    pub height: f64,
+    pub plane: Plane,
 }

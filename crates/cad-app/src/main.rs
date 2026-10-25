@@ -23,6 +23,7 @@ use cad_core::{DrawingChange, DrawingEdit};
 use cad_file::open_drawing;
 
 mod cad_aids;
+mod cad_clipboard;
 mod cad_command;
 mod cad_curves;
 mod cad_diagnostics;
@@ -31,7 +32,9 @@ mod cad_file;
 mod cad_layers;
 mod cad_project;
 mod cad_selection;
+mod cad_text;
 mod cad_tools;
+mod cad_util;
 mod cad_view;
 mod cam;
 mod cam_analysis;
@@ -60,9 +63,13 @@ struct ViewerState {
     cad_curves: cad_curves::CurveControls,
     cad_diagnostics: cad_diagnostics::Controls,
     cad_layers: cad_layers::LayerControls,
+    text_edit: cad_text::Controls,
+    measurements: cad_util::Measurements,
     cad_command: cad_command::CommandState,
     cad_history: BTreeMap<u64, CadUndoState>,
     project: cad_project::ProjectState,
+    clipboard: Option<cad_clipboard::Payload>,
+    pending_copy: Option<(BTreeSet<u32>, [f64; 3])>,
     excluded: BTreeSet<u32>,
     file_name: String,
     format: String,
@@ -342,7 +349,12 @@ fn submit_command(
     mode: SpaceMode,
     raw: &str,
 ) {
-    let command = raw.trim();
+    let repeated = if raw.trim().is_empty() && !state.cad_command.is_active() {
+        state.cad_command.last_command.clone()
+    } else {
+        raw.trim().to_string()
+    };
+    let command = repeated.trim();
     let upper = command.to_uppercase();
     if matches!(upper.as_str(), "CANCEL" | "取消") {
         state.cad_command.cancel();
@@ -377,6 +389,10 @@ fn submit_command(
                 Ok(None)
             }
             "" => return,
+            "PASTE"=>{
+                if let Some(data)=state.clipboard.clone(){state.cad_command.begin_paste(data.items,data.base);Ok(None)}
+                else {Err("请先用 Ctrl+V 读取几何剪贴板".into())}
+            },
             _ if upper.starts_with("UCS ") => state
                 .cad_command
                 .set_preset(upper[4..].trim())
@@ -394,6 +410,24 @@ fn submit_command(
     match result {
         Ok(Some(commit)) => {
             let action = match commit {
+                cad_command::CommandCommit::Report(message) => {
+                    state.cad_command.last_measurement = message.clone();
+                    state.cad_command.cancel();
+                    push_message(state, message);
+                    return;
+                }
+                cad_command::CommandCommit::Clipboard { ids, base } => {
+                    // The UI processes clipboard output after this command has completed.
+                    state.pending_copy = Some((ids, base));
+                    state.cad_command.cancel();
+                    return;
+                }
+                cad_command::CommandCommit::Annotation(geometry) => {
+                    cad_edit::EditAction::Annotation(geometry)
+                }
+                cad_command::CommandCommit::Paste { items, offset } => {
+                    cad_edit::EditAction::Paste { items, offset }
+                }
                 cad_command::CommandCommit::Curves(edit) => cad_edit::EditAction::Curves(edit),
                 cad_command::CommandCommit::Geometry(updates) => {
                     cad_edit::EditAction::Geometry(updates)
@@ -439,6 +473,10 @@ fn submit_command(
             }
         }
         Ok(None) => {
+            if !was_active && !matches!(upper.as_str(), "UNDO" | "U" | "撤销" | "REDO" | "重做")
+            {
+                state.cad_command.last_command = command.to_string();
+            }
             state.cad_command.error.clear();
             if !state.cad_command.is_active() && (was_active || upper.starts_with("UCS ")) {
                 push_message(state, "工作平面已设置，图元坐标保持不变");
@@ -670,6 +708,13 @@ fn draw_scene(
     mut selected_gizmos: Gizmos<SelectedGizmos>,
     mut negative_axes: Gizmos<DashedAxisGizmos>,
 ) {
+    let text_ids: BTreeSet<_> = state
+        .display
+        .entities
+        .iter()
+        .filter(|e| e.kind == "TEXT")
+        .map(|e| e.id)
+        .collect();
     let preview = (space.mode == SpaceMode::Cad)
         .then(|| state.cad_command.preview())
         .flatten();
@@ -703,6 +748,9 @@ fn draw_scene(
                 Color::srgb(path.color[0], path.color[1], path.color[2])
             }
         };
+        if text_ids.contains(&path.entity_id) && !is_selected && !is_hovered && !pending_delete {
+            continue;
+        }
         for pair in path.points.windows(2) {
             let [x0, y0, z0] = pair[0];
             let [x1, y1, z1] = pair[1];
@@ -2298,6 +2346,7 @@ fn drawing_ui(
     view_camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut fonts_loaded: Local<bool>,
     mut ui_state: ResMut<UiState>,
+    mut system_clipboard: ResMut<bevy_egui::EguiClipboard>,
 ) -> Result {
     let (view_camera, view_transform) = view_camera.into_inner();
     let context = contexts.ctx_mut()?;
@@ -2372,6 +2421,47 @@ fn drawing_ui(
                 }
             }
         });
+    }
+    let mut copy_requested = false;
+    let mut paste_text = None;
+    if space.mode == SpaceMode::Cad
+        && !state.cad_command.is_active()
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !context.egui_wants_keyboard_input()
+    {
+        context.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::C) {
+                command_request = Some("COPYBASE".into());
+            } else {
+                copy_requested = input.consume_key(egui::Modifiers::CTRL, egui::Key::C)
+                    || input.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            }
+            paste_text = input.events.iter().find_map(|e| {
+                if let egui::Event::Paste(text) = e {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            });
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                command_request = Some(String::new());
+            }
+        });
+    }
+    if copy_requested {
+        queue_copy(&mut state, &selection.selected);
+    }
+    if let Some(text) = paste_text {
+        match cad_clipboard::decode(&text) {
+            Ok(data) => {
+                state.cad_command.begin_paste(data.items.clone(), data.base);
+                state.clipboard = Some(data);
+                state.cad_command.last_command = "PASTE".into();
+                state.command_open = true;
+            }
+            Err(e) => push_message(&mut state, e),
+        }
     }
     let mut export_dxf = false;
     let mut new_drawing = false;
@@ -2624,6 +2714,25 @@ fn drawing_ui(
             );
             ui.add_enabled_ui(space.mode == SpaceMode::Cad, |ui| {
                 ui.menu_button("编辑", |ui| {
+                    ui.add_enabled_ui(!state.cad_command.is_active(), |ui| {
+                        if ui.button("复制到几何剪贴板  Ctrl+C").clicked() {
+                            queue_copy(&mut state, &selection.selected);
+                            ui.close();
+                        }
+                        if ui.button("指定复制基点  Ctrl+Shift+C").clicked() {
+                            command_request = Some("COPYBASE".into());
+                            ui.close();
+                        }
+                        if ui.button("粘贴  Ctrl+V").clicked() {
+                            command_request = Some("PASTE".into());
+                            ui.close();
+                        }
+                        if ui.button("重复上一命令  Enter").clicked() {
+                            command_request = Some(String::new());
+                            ui.close();
+                        }
+                        ui.small("几何剪贴板：保留几何、颜色、图层和参考角色。");
+                    });
                     ui.add_enabled_ui(
                         state.drawing.is_some() && !state.cad_command.is_active(),
                         |ui| {
@@ -2772,7 +2881,9 @@ fn drawing_ui(
             .collect();
     }
     if let Some(command) = command_request.take() {
-        submit_command(&mut state, &mut selection, space.mode, &command);
+        if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
+            submit_command(&mut state, &mut selection, space.mode, &command);
+        }
         state.command_focus = state.cad_command.is_active();
     }
     if state.cad_command.is_active() {
@@ -2850,7 +2961,9 @@ fn drawing_ui(
                 let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
                 if enter && (response.has_focus() || response.lost_focus()) {
                     let command = std::mem::take(&mut state.command_input);
-                    submit_command(&mut state, &mut selection, space.mode, &command);
+                    if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
+                        submit_command(&mut state, &mut selection, space.mode, &command);
+                    }
                     response.request_focus();
                 }
             });
@@ -3050,6 +3163,40 @@ fn drawing_ui(
                                         }
                                     }
                                 });
+                            }
+                            let ViewerState {
+                                drawing,
+                                measurements,
+                                ..
+                            } = &mut *state;
+                            if let Some(drawing) = drawing.as_ref() {
+                                measurements.ui(
+                                    ui,
+                                    drawing.document(),
+                                    drawing.revision(),
+                                    &selection.selected,
+                                );
+                            }
+                            if !state.cad_command.is_active() && selection.selected.len() == 1 {
+                                let id = *selection.selected.first().unwrap();
+                                let ViewerState {
+                                    drawing, text_edit, ..
+                                } = &mut *state;
+                                if let Some(drawing) = drawing.as_ref() {
+                                    if let Some(e) =
+                                        drawing.document().entity(cad_core::EntityId(id))
+                                    {
+                                        if let cad_core::Geometry::Text(t) = &e.geometry {
+                                            if let Some(g) =
+                                                text_edit.ui(ui, id, drawing.revision(), t)
+                                            {
+                                                cad_action = Some(cad_edit::EditAction::Geometry(
+                                                    BTreeMap::from([(e.id, g)]),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             let editing_enabled = !state.cad_command.is_active()
                                 && !state
@@ -3258,7 +3405,9 @@ fn drawing_ui(
 
     let feature_rect = feature_panel.response.rect;
     if let Some(command) = command_request {
-        submit_command(&mut state, &mut selection, space.mode, &command);
+        if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
+            submit_command(&mut state, &mut selection, space.mode, &command);
+        }
         state.command_open = true;
         state.command_focus = state.cad_command.is_active();
     }
@@ -3373,7 +3522,14 @@ fn drawing_ui(
             if exclude {
                 state.excluded.insert(*id);
             } else {
-                state.excluded.remove(id);
+                if state
+                    .drawing
+                    .as_ref()
+                    .and_then(|d| d.document().entity(cad_core::EntityId(*id)))
+                    .is_none_or(|e| !matches!(e.geometry, cad_core::Geometry::Text(_)))
+                {
+                    state.excluded.remove(id);
+                }
             }
         }
         if before != state.excluded {
@@ -3478,6 +3634,23 @@ fn drawing_ui(
         export_gcode = false;
         quick_export_gcode = false;
     }
+    if let Some((ids, base)) = state.pending_copy.take() {
+        match cad_clipboard::encode(&state, &ids, base) {
+            Ok((data, text)) => {
+                let count = data.items.len();
+                state.clipboard = Some(data);
+                context.copy_text(text);
+                push_message(
+                    &mut state,
+                    format!(
+                        "已复制 {count} 个几何对象；基点 ({:.4}, {:.4}, {:.4}) mm",
+                        base[0], base[1], base[2]
+                    ),
+                );
+            }
+            Err(error) => push_message(&mut state, error),
+        }
+    }
     if new_drawing {
         cad_file::new_drawing(&mut state);
     }
@@ -3532,6 +3705,51 @@ fn drawing_ui(
     }
 
     if space.mode == SpaceMode::Cad && !state.gcode_settings_open && !state.file_ui.report_open {
+        let clip = egui::Rect::from_min_max(
+            egui::pos2(feature_rect.right(), menu_rect.bottom()),
+            egui::pos2(context.viewport_rect().right(), command_rect.top()),
+        );
+        if let Some(doc) = state.drawing.as_ref().map(|d| d.document()) {
+            for e in doc
+                .entities
+                .iter()
+                .filter(|e| matches!(e.geometry, cad_core::Geometry::Text(_)))
+            {
+                if e.visible && doc.layer(e.layer_id).is_none_or(|l| l.visible) {
+                    let color = if selection.selected.contains(&e.id.0) {
+                        egui::Color32::YELLOW
+                    } else {
+                        state
+                            .display
+                            .entities
+                            .iter()
+                            .find(|d| d.id == e.id.0)
+                            .map(|d| color32(d.color))
+                            .unwrap_or(egui::Color32::LIGHT_GRAY)
+                    };
+                    cad_text::paint(
+                        context,
+                        &e.geometry,
+                        state.view,
+                        view_camera,
+                        view_transform,
+                        color,
+                        clip,
+                    );
+                }
+            }
+            for g in state.cad_command.utility_preview_geometry() {
+                cad_text::paint(
+                    context,
+                    &g,
+                    state.view,
+                    view_camera,
+                    view_transform,
+                    egui::Color32::from_rgb(40, 255, 255),
+                    clip,
+                );
+            }
+        }
         state
             .cad_command
             .aids
@@ -4789,7 +5007,14 @@ fn apply_cad_action(
         | cad_edit::EditAction::Transform { .. }
         | cad_edit::EditAction::Geometry(_)
         | cad_edit::EditAction::Curves(_)
-        | cad_edit::EditAction::Layer(_)) => {
+        | cad_edit::EditAction::Layer(_)
+        | cad_edit::EditAction::Annotation(_)
+        | cad_edit::EditAction::Paste { .. }) => {
+            let paste_roles = if let cad_edit::EditAction::Paste { items, .. } = &action {
+                Some(items.iter().map(|i| i.reference).collect::<Vec<_>>())
+            } else {
+                None
+            };
             let geometry_changed = match &action {
                 cad_edit::EditAction::Apply(edit) => edit.changes_geometry(),
                 cad_edit::EditAction::Layer(_) => false,
@@ -4865,6 +5090,8 @@ fn apply_cad_action(
             let result = match action {
                 cad_edit::EditAction::Apply(edit) => drawing.apply(&ids, edit),
                 cad_edit::EditAction::Create(entities) => drawing.create(&entities),
+                cad_edit::EditAction::Annotation(g) => drawing.create_annotation(&g),
+                cad_edit::EditAction::Paste { items, offset } => drawing.paste(&items, offset),
                 cad_edit::EditAction::Geometry(updates) => drawing.set_geometry(&updates),
                 cad_edit::EditAction::Curves(edit) => drawing.apply_curves(&edit),
                 cad_edit::EditAction::Layer(edit) => drawing.edit_layer(edit),
@@ -4879,8 +5106,41 @@ fn apply_cad_action(
                     return true;
                 }
                 Ok(Some(change)) => {
-                    for (id, source) in &change.created_sources {
-                        if state.excluded.contains(&source.0) {
+                    let defaults: BTreeMap<_, _> = if change.created.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        state
+                            .drawing
+                            .as_ref()
+                            .unwrap()
+                            .document()
+                            .entities
+                            .iter()
+                            .map(|e| {
+                                (
+                                    e.id.0,
+                                    (
+                                        e.reference,
+                                        matches!(e.geometry, cad_core::Geometry::Text(_)),
+                                    ),
+                                )
+                            })
+                            .collect()
+                    };
+                    for (index, id) in change.created.iter().enumerate() {
+                        let intrinsic = defaults.get(&id.0).is_some_and(|(_, text)| *text);
+                        let reference = if let Some(source) = change.created_sources.get(id) {
+                            state.excluded.contains(&source.0)
+                        } else {
+                            paste_roles
+                                .as_ref()
+                                .and_then(|r| r.get(index))
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    defaults.get(&id.0).is_some_and(|(reference, _)| *reference)
+                                })
+                        };
+                        if intrinsic || reference {
                             state.excluded.insert(id.0);
                         }
                     }
@@ -5101,6 +5361,56 @@ fn open_trajectory_view(state: &mut ViewerState, selected: &BTreeSet<cam::UnitId
             .focus_order(order, state.trajectory.as_ref());
     }
     state.trajectory_view.open = true;
+}
+
+fn queue_copy(state: &mut ViewerState, ids: &BTreeSet<u32>) {
+    if ids.is_empty() {
+        push_message(state, "请先选择要复制的图元");
+        return;
+    }
+    let mut base = [f64::INFINITY; 3];
+    for p in state
+        .display
+        .paths
+        .iter()
+        .filter(|p| ids.contains(&p.entity_id))
+        .flat_map(|p| &p.points)
+    {
+        for i in 0..3 {
+            base[i] = base[i].min(p[i]);
+        }
+    }
+    if base.iter().all(|v| v.is_finite()) {
+        state.pending_copy = Some((ids.clone(), base));
+    }
+}
+
+fn prepare_clipboard(
+    state: &mut ViewerState,
+    clipboard: &mut bevy_egui::EguiClipboard,
+    command: &str,
+) -> bool {
+    if !command.trim().eq_ignore_ascii_case("PASTE")
+        && !(command.trim().is_empty()
+            && !state.cad_command.is_active()
+            && state.cad_command.last_command.eq_ignore_ascii_case("PASTE"))
+    {
+        return true;
+    }
+    match clipboard
+        .get_text()
+        .ok_or_else(|| "剪贴板没有可读文字".to_string())
+        .and_then(|text| cad_clipboard::decode(&text))
+    {
+        Ok(data) => {
+            state.clipboard = Some(data);
+            true
+        }
+        Err(error) => {
+            push_message(state, error);
+            false
+        }
+    }
 }
 
 fn refresh_machining_scope(state: &mut ViewerState) {

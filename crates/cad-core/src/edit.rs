@@ -137,6 +137,104 @@ pub struct EditableDrawing {
 }
 
 impl EditableDrawing {
+    pub fn create_annotation(
+        &mut self,
+        geometry: &[crate::model::Geometry],
+    ) -> Result<Option<DrawingChange>, String> {
+        let items: Vec<_> = geometry
+            .iter()
+            .map(|g| crate::geometry_edit::ClipboardItem {
+                geometry: g.clone(),
+                layer: crate::drafting::ANNOTATION_LAYER.into(),
+                layer_color: Color::Aci(8),
+                color: Color::ByLayer,
+                reference: true,
+            })
+            .collect();
+        self.paste(&items, [0.0; 3])
+    }
+
+    pub fn paste(
+        &mut self,
+        items: &[crate::geometry_edit::ClipboardItem],
+        offset: [f64; 3],
+    ) -> Result<Option<DrawingChange>, String> {
+        if items.is_empty() {
+            return Ok(None);
+        }
+        if items.len() > 50_000 {
+            return Err("单次粘贴最多 50000 个图元".into());
+        }
+        let scale = self.unit_scale()?;
+        let mut candidate = self.native.clone();
+        let mut ids = self.ids.clone();
+        let mut next = Self::next_id(&ids)?;
+        let mut created = Vec::new();
+        let color = |c| match c {
+            Color::ByLayer => NativeColor::ByLayer,
+            Color::ByBlock => NativeColor::ByBlock,
+            Color::None => NativeColor::None,
+            Color::Aci(i) => NativeColor::Index(i),
+            Color::Rgb { r, g, b } => NativeColor::Rgb { r, g, b },
+        };
+        for item in items {
+            Self::validate_layer_name(&item.layer)?;
+            if let Some(layer) = self
+                .document
+                .layers
+                .iter()
+                .find(|l| l.name.eq_ignore_ascii_case(&item.layer))
+            {
+                self.ensure_layer_editable(layer.id)?;
+            }
+            if candidate.layers.get(&item.layer).is_none() {
+                let mut layer = acadrust::tables::Layer::with_color(
+                    item.layer.clone(),
+                    color(item.layer_color),
+                );
+                layer.handle = candidate.allocate_handle();
+                candidate.layers.add(layer)?;
+            }
+            let g = crate::drafting::translated(&item.geometry, offset)?;
+            if !matches!(g, crate::model::Geometry::Text(_)) {
+                crate::curves::sample(&g, crate::curves::Sampling::default())?;
+            }
+            let mut entity = native_geometry(&g, scale)?;
+            if let acadrust::EntityType::Spline(s) = &mut entity {
+                if s.flags.planar
+                    && s.control_points.first().is_some_and(|origin| {
+                        s.control_points
+                            .iter()
+                            .any(|p| (*p - *origin).dot(&s.normal).abs() > 1e-6 / scale)
+                    })
+                {
+                    s.flags.planar = false;
+                }
+            }
+            entity.common_mut().layer = item.layer.clone();
+            entity.common_mut().color = color(item.color);
+            if item.reference || matches!(g, crate::model::Geometry::Text(_)) {
+                Self::mark_reference(&mut candidate, &mut entity)?;
+            }
+            if let acadrust::EntityType::Polyline3D(p) = &mut entity {
+                for v in &mut p.vertices {
+                    v.handle = candidate.allocate_handle();
+                }
+            }
+            let handle = candidate.add_entity(entity).map_err(|e| e.to_string())?;
+            created.push(Self::fresh_id(&mut ids, handle, &mut next)?);
+        }
+        self.commit(
+            candidate,
+            ids,
+            DrawingChangeKind::Create,
+            items.len(),
+            BTreeSet::new(),
+            created,
+            BTreeMap::new(),
+        )
+    }
+
     pub fn project_snapshot(&self) -> Result<ProjectDrawing, String> {
         let bytes = DxfWriter::new(&self.native)
             .write_to_vec()
@@ -168,6 +266,21 @@ impl EditableDrawing {
                 .ok_or("项目图纸必须先明确源单位")?,
             report: self.document.import_report.clone(),
         })
+    }
+
+    fn mark_reference(
+        document: &mut CadDocument,
+        entity: &mut acadrust::EntityType,
+    ) -> Result<(), String> {
+        if document.app_ids.get("CADCAM_RUST").is_none() {
+            let mut app = acadrust::tables::AppId::new("CADCAM_RUST");
+            app.handle = document.allocate_handle();
+            document.app_ids.add(app)?;
+        }
+        let mut record = acadrust::xdata::ExtendedDataRecord::new("CADCAM_RUST");
+        record.add_value(acadrust::xdata::XDataValue::String("REFERENCE_V1".into()));
+        entity.common_mut().extended_data.upsert_record(record);
+        Ok(())
     }
 
     pub fn from_project(snapshot: ProjectDrawing) -> Result<Self, String> {
@@ -222,7 +335,16 @@ impl EditableDrawing {
             .iter()
             .map(|l| (l.id.0, l.name.clone()))
             .collect();
-        if actual != snapshot.entities.into_iter().collect()
+        let expected: BTreeSet<_> = snapshot.entities.into_iter().collect();
+        let new_text: BTreeSet<_> = actual
+            .difference(&expected)
+            .filter(|(_, id, kind)| kind == "TEXT" && !values.contains(id))
+            .map(|(h, _, _)| *h)
+            .collect();
+        if !expected.is_subset(&actual)
+            || actual
+                .difference(&expected)
+                .any(|(h, _, _)| !new_text.contains(h))
             || actual_layers != snapshot.current_layers.into_iter().collect()
             || document.source_units != Some(snapshot.unit)
             || actual.len() != document.entities.len()
@@ -240,6 +362,21 @@ impl EditableDrawing {
         // Retain source omissions even if a DXF snapshot cannot recreate a lost record.
         let current_report = document.import_report;
         document.import_report = snapshot.report;
+        if !new_text.is_empty() {
+            document
+                .import_report
+                .skipped
+                .retain(|s| !s.handle.is_some_and(|h| new_text.contains(&h)));
+            *document
+                .import_report
+                .converted
+                .entry("TEXT".into())
+                .or_default() += new_text.len();
+            document.import_report.warnings.push(format!(
+                "项目升级：新增识别 {} 个基础 TEXT，已默认排除加工；请保存项目更新身份表",
+                new_text.len()
+            ));
+        }
         for skipped in current_report.skipped {
             if !document.import_report.skipped.contains(&skipped) {
                 if document.import_report.skipped.len() < crate::model::MAX_SKIPPED_SAMPLES {
@@ -531,6 +668,11 @@ impl EditableDrawing {
                 spline.normal = acadrust::types::Vector3::new(n.x, n.y, n.z);
             }
             entity.common_mut().layer = layer.name.clone();
+            if crate::drafting::is_annotation_layer(&layer.name)
+                || matches!(item.geometry, crate::model::Geometry::Text(_))
+            {
+                Self::mark_reference(&mut candidate, &mut entity)?;
+            }
             entity.common_mut().color = match item.color {
                 Color::ByLayer => NativeColor::ByLayer,
                 Color::ByBlock => NativeColor::ByBlock,

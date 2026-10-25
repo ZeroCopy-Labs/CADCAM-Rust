@@ -65,6 +65,7 @@ pub fn evaluate(g: &Geometry, t: f64) -> Result<Point3, String> {
     }
     let t = t.clamp(0.0, 1.0);
     let p = match g {
+        Geometry::Text(_) => return Err("文字不是可求值的切割曲线".into()),
         Geometry::Line(l) => add(l.start, delta(l.start, l.end) * t),
         Geometry::Arc(a) => arc_point(a, t),
         Geometry::Circle(c) => arc_point(
@@ -142,6 +143,7 @@ pub fn nearest_parameter(g: &Geometry, p: Point3) -> Result<f64, String> {
 pub fn reverse(g: &Geometry) -> Result<Geometry, String> {
     let mut g = g.clone();
     match &mut g {
+        Geometry::Text(_) => return Err("文字不支持曲线反向".into()),
         Geometry::Line(l) => std::mem::swap(&mut l.start, &mut l.end),
         Geometry::Arc(a) => {
             a.start_angle += a.sweep_angle;
@@ -406,6 +408,7 @@ pub fn sample(g: &Geometry, settings: Sampling) -> Result<Vec<Point3>, String> {
         Ok(n as usize)
     };
     let mut out = match g {
+        Geometry::Text(_) => return Err("文字不参加加工采样".into()),
         Geometry::Line(l) => vec![l.start, l.end],
         Geometry::Circle(c) => {
             let n = count(c.radius, TAU, 1.0)?;

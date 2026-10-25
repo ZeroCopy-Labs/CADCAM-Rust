@@ -11,7 +11,7 @@ use super::ids::{EntityId, LayerId};
 ///
 /// `ByLayer` and `ByBlock` only make sense for entity colors; layers normally
 /// carry a concrete ACI/RGB color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Color {
     /// Inherit the color from the entity's layer.
     ByLayer,
@@ -37,6 +37,8 @@ pub type EntityColor = Color;
 /// describes the geometric meaning and carries no render/selection/CAM state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
+    /// Default reference role retained in this application's DXF XData.
+    pub reference: bool,
     /// Stable internal identity. Not a DXF/DWG handle.
     pub id: EntityId,
     /// Native handle in the current editable drawing.

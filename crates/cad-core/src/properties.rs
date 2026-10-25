@@ -36,6 +36,7 @@ pub fn grips(g: &Geometry) -> Vec<Grip> {
     let mut out = Vec::new();
     let mut push = |kind, label: String, point| out.push(Grip { kind, label, point });
     match g {
+        Geometry::Text(t) => push(GripKind::Center, "文字插入点".into(), t.position),
         Geometry::Line(l) => {
             push(GripKind::Start, "起点".into(), l.start);
             push(GripKind::End, "终点".into(), l.end);
@@ -144,6 +145,7 @@ pub fn move_grip(g: &Geometry, kind: GripKind, p: Point3) -> Result<Geometry, St
     }
     let mut next = g.clone();
     match (&mut next, kind) {
+        (Geometry::Text(t), GripKind::Center) => t.position = p,
         (Geometry::Line(l), GripKind::Start) => {
             positive(v(p, l.end).length())?;
             l.start = p;
@@ -323,6 +325,13 @@ pub(crate) fn update_native(
     let new = native_geometry(g, scale)?;
     entity.common_mut().raw_record = None;
     match (entity, new) {
+        (EntityType::Text(e), EntityType::Text(n)) => {
+            e.value = n.value;
+            e.insertion_point = n.insertion_point;
+            e.height = n.height;
+            e.rotation = n.rotation;
+            e.normal = n.normal;
+        }
         (EntityType::Line(e), EntityType::Line(n)) => {
             e.start = n.start;
             e.end = n.end;

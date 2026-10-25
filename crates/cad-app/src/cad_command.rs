@@ -10,6 +10,21 @@ use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
+    Utility {
+        kind: super::cad_util::Kind,
+        points: Vec<Point3>,
+        confirmed: bool,
+        ids: BTreeSet<u32>,
+    },
+    Paste {
+        items: Vec<cad_core::geometry_edit::ClipboardItem>,
+        base: [f64; 3],
+        target: Option<[f64; 3]>,
+    },
+    ArraySpacing {
+        ids: BTreeSet<u32>,
+        base: [f64; 3],
+    },
     Curves(cad_core::CurveEdit),
     Grip {
         id: EntityId,
@@ -60,6 +75,16 @@ pub struct MoveCommit {
 }
 
 pub enum CommandCommit {
+    Report(String),
+    Annotation(Vec<Geometry>),
+    Clipboard {
+        ids: BTreeSet<u32>,
+        base: [f64; 3],
+    },
+    Paste {
+        items: Vec<cad_core::geometry_edit::ClipboardItem>,
+        offset: [f64; 3],
+    },
     Curves(cad_core::CurveEdit),
     Geometry(BTreeMap<EntityId, Geometry>),
     Move(MoveCommit),
@@ -76,6 +101,9 @@ pub enum CommandCommit {
 #[derive(Default)]
 pub struct CommandState {
     pub tools: ToolOptions,
+    pub utility: super::cad_util::Options,
+    pub last_command: String,
+    pub last_measurement: String,
     copying: bool,
     pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
@@ -99,6 +127,7 @@ impl CommandState {
     }
     pub fn selecting(&self) -> bool {
         matches!(self.step, Some(Step::Select | Step::TransformSelect { .. }))
+            || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
         self.is_active()
@@ -106,7 +135,13 @@ impl CommandState {
             && !matches!(
                 self.step,
                 Some(
-                    Step::Curves(_)
+                    Step::Utility {
+                        confirmed: true,
+                        ..
+                    } | Step::Paste {
+                        target: Some(_),
+                        ..
+                    } | Step::Curves(_)
                         | Step::Grip {
                             target: Some(_),
                             ..
@@ -123,6 +158,44 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::Utility {
+                kind,
+                points,
+                confirmed,
+                ids,
+            }) => {
+                return if *kind == super::cad_util::Kind::CopyBase && ids.is_empty() {
+                    "复制基点：选择图元后 Enter".into()
+                } else {
+                    format!(
+                        "{}：已取 {}/{} 点；{}",
+                        kind.label(),
+                        points.len(),
+                        kind.required(),
+                        if *confirmed {
+                            "Enter 完成；可输入坐标修改末点，Esc 取消"
+                        } else {
+                            "点选/输入坐标；Esc 取消"
+                        }
+                    )
+                }
+            }
+            Some(Step::Paste { base, target, .. }) => {
+                return format!(
+                    "粘贴：原基点 ({:.3}, {:.3}, {:.3}) mm；{}",
+                    base[0],
+                    base[1],
+                    base[2],
+                    if target.is_some() {
+                        "Enter 提交；可输入坐标改目标"
+                    } else {
+                        "指定目标点"
+                    }
+                )
+            }
+            Some(Step::ArraySpacing { .. }) => {
+                return "矩形阵列：相对于阵列基点拾取列/行间距；Esc 取消".into()
+            }
             Some(Step::Curves(edit)) => {
                 return format!(
                     "预览：输出 {} 项，删除 {} 项{}；Enter 提交，Esc 取消。红色为待删除对象。",
@@ -255,6 +328,12 @@ impl CommandState {
         }
     }
     fn point_plane(&self) -> WorkPlane {
+        if let Some(Step::ArraySpacing { base, .. }) = &self.step {
+            return WorkPlane {
+                origin: as_point(*base),
+                ..self.plane
+            };
+        }
         if let Some(Step::Grip { geometry, base, .. }) = &self.step {
             let plane = match geometry {
                 Geometry::Circle(c) => Some(c.plane),
@@ -274,6 +353,18 @@ impl CommandState {
         self.plane
     }
 
+    pub fn begin_paste(
+        &mut self,
+        items: Vec<cad_core::geometry_edit::ClipboardItem>,
+        base: [f64; 3],
+    ) {
+        self.cancel();
+        self.step = Some(Step::Paste {
+            items,
+            base,
+            target: None,
+        });
+    }
     pub fn begin_move(&mut self, ids: &BTreeSet<u32>) {
         self.copying = false;
         self.ray_error.clear();
@@ -287,6 +378,19 @@ impl CommandState {
     }
 
     pub fn begin_named(&mut self, name: &str, ids: &BTreeSet<u32>) -> bool {
+        if let Some(kind) = super::cad_util::Kind::ALL
+            .into_iter()
+            .find(|k| k.command() == name)
+        {
+            self.cancel();
+            self.step = Some(Step::Utility {
+                kind,
+                points: vec![],
+                confirmed: false,
+                ids: ids.clone(),
+            });
+            return true;
+        }
         if matches!(name, "COPY" | "CO" | "复制") {
             self.begin_move(ids);
             self.copying = true;
@@ -371,6 +475,12 @@ impl CommandState {
 
     fn reference(&self) -> [f64; 3] {
         match &self.step {
+            Some(Step::Utility { points, .. }) => points
+                .last()
+                .copied()
+                .map(array)
+                .unwrap_or(array(self.plane.origin)),
+            Some(Step::Paste { base, .. } | Step::ArraySpacing { base, .. }) => *base,
             Some(Step::Grip { base, .. }) => array(*base),
             Some(Step::Draw { sketch, .. }) => sketch
                 .points
@@ -389,6 +499,10 @@ impl CommandState {
 
     fn snap_reference(&self) -> Option<Point3> {
         match &self.step {
+            Some(Step::Utility { points, .. }) => points.last().copied(),
+            Some(Step::ArraySpacing { base, .. } | Step::Paste { base, .. }) => {
+                Some(as_point(*base))
+            }
             Some(Step::Grip { base, .. }) => Some(*base),
             Some(Step::Draw { sketch, .. }) if !sketch.points.is_empty() => {
                 Some(*sketch.points.last().unwrap())
@@ -414,6 +528,57 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::Utility {
+            kind,
+            points,
+            confirmed,
+            ids,
+        }) = &mut self.step
+        {
+            if *kind == super::cad_util::Kind::CopyBase && ids.is_empty() {
+                if !text.trim().is_empty() || selected.is_empty() {
+                    return Err("请先选择图元再 Enter".into());
+                }
+                *ids = selected.clone();
+                return Ok(None);
+            }
+            if *confirmed && text.trim().is_empty() {
+                if kind.measuring() {
+                    return Ok(Some(CommandCommit::Report(super::cad_util::result(
+                        *kind, points, self.plane,
+                    )?)));
+                }
+                if *kind == super::cad_util::Kind::CopyBase {
+                    return Ok(Some(CommandCommit::Clipboard {
+                        ids: ids.clone(),
+                        base: array(points[0]),
+                    }));
+                }
+                let geometry = self.utility.geometry(*kind, points, self.plane)?;
+                return Ok(Some(if *kind == super::cad_util::Kind::Dimension {
+                    CommandCommit::Annotation(geometry)
+                } else {
+                    CommandCommit::Create {
+                        geometry,
+                        normal: self.plane.normal(),
+                    }
+                }));
+            }
+        }
+        if let Some(Step::Paste {
+            items,
+            base,
+            target: Some(target),
+        }) = &self.step
+        {
+            if text.trim().is_empty() {
+                return Ok(Some(CommandCommit::Paste {
+                    items: items.clone(),
+                    offset: std::array::from_fn(|i| target[i] - base[i]),
+                }));
+            }
+        }
+
         if let Some(Step::Curves(edit)) = &self.step {
             if text.trim().is_empty() {
                 return Ok(Some(CommandCommit::Curves(edit.clone())));
@@ -570,6 +735,49 @@ impl CommandState {
 
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::Utility {
+                kind,
+                points,
+                confirmed,
+                ids,
+            } => {
+                let mut points = points.clone();
+                if *confirmed {
+                    points.pop();
+                }
+                points.push(as_point(point));
+                let confirmed = points.len() >= kind.required();
+                if confirmed {
+                    if kind.measuring() {
+                        super::cad_util::result(*kind, &points, self.plane)?;
+                    } else {
+                        self.utility.geometry(*kind, &points, self.plane)?;
+                    }
+                }
+                Some(Step::Utility {
+                    kind: *kind,
+                    points,
+                    confirmed,
+                    ids: ids.clone(),
+                })
+            }
+            Step::Paste { items, base, .. } => Some(Step::Paste {
+                items: items.clone(),
+                base: *base,
+                target: Some(point),
+            }),
+            Step::ArraySpacing { ids, base } => {
+                let a = self.plane.to_local(as_point(*base));
+                let b = self.plane.to_local(as_point(point));
+                self.tools.spacing = [b[0] - a[0], b[1] - a[1]];
+                self.tools
+                    .transforms(TransformKind::RectArray, *base, self.plane, ids.len())?;
+                Some(Step::Transform {
+                    kind: TransformKind::RectArray,
+                    ids: ids.clone(),
+                    base: Some(*base),
+                })
+            }
             Step::Curves(_) => return Err("当前为曲线整理确认步骤".into()),
             Step::Grip {
                 id,
@@ -724,6 +932,46 @@ impl CommandState {
     }
 
     pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        if let Some(Step::Paste {
+            items,
+            base,
+            target,
+        }) = &self.step
+        {
+            if let Some(target) = target.or(self.hover) {
+                let d = std::array::from_fn(|i| target[i] - base[i]);
+                return items
+                    .iter()
+                    .filter_map(|i| cad_core::drafting::translated(&i.geometry, d).ok())
+                    .flat_map(|g| super::display::tessellate_geometry(&g))
+                    .collect();
+            }
+        }
+        if let Some(Step::Utility {
+            kind,
+            points,
+            confirmed,
+            ..
+        }) = &self.step
+        {
+            let mut points = points.clone();
+            if !confirmed {
+                if let Some(p) = self.hover {
+                    points.push(as_point(p));
+                }
+            }
+            return self
+                .utility
+                .geometry(*kind, &points, self.plane)
+                .ok()
+                .filter(|g| !g.is_empty())
+                .map(|g| {
+                    g.iter()
+                        .flat_map(super::display::tessellate_geometry)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![points.into_iter().map(array).collect()]);
+        }
         if let Some(Step::Curves(edit)) = &self.step {
             return edit
                 .replacements
@@ -763,7 +1011,58 @@ impl CommandState {
             Err(_) => vec![sketch.points.iter().copied().map(array).collect()],
         }
     }
+    pub fn utility_preview_geometry(&self) -> Vec<Geometry> {
+        if let Some(Step::Utility {
+            kind,
+            points,
+            confirmed,
+            ..
+        }) = &self.step
+        {
+            let mut points = points.clone();
+            if !confirmed {
+                if let Some(p) = self.hover {
+                    points.push(as_point(p));
+                }
+            }
+            return self
+                .utility
+                .geometry(*kind, &points, self.plane)
+                .unwrap_or_default();
+        }
+        if let Some(Step::Paste {
+            items,
+            base,
+            target,
+        }) = &self.step
+        {
+            if let Some(target) = target.or(self.hover) {
+                return items
+                    .iter()
+                    .filter_map(|i| {
+                        cad_core::drafting::translated(
+                            &i.geometry,
+                            std::array::from_fn(|n| target[n] - base[n]),
+                        )
+                        .ok()
+                    })
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
     pub fn transform_preview(&self) -> Option<(BTreeSet<u32>, Vec<AffineTransform>)> {
+        if let Some(Step::ArraySpacing { ids, base }) = &self.step {
+            let point = self.hover?;
+            let a = self.plane.to_local(as_point(*base));
+            let b = self.plane.to_local(as_point(point));
+            let mut tools = self.tools.clone();
+            tools.spacing = [b[0] - a[0], b[1] - a[1]];
+            return tools
+                .transforms(TransformKind::RectArray, *base, self.plane, ids.len())
+                .ok()
+                .map(|(t, _)| (ids.clone(), t));
+        }
         let Some(Step::Transform { kind, ids, base }) = &self.step else {
             return None;
         };
@@ -791,12 +1090,41 @@ impl CommandState {
                 }
             }
         }
+        if let Some(Step::Utility {
+            kind,
+            points,
+            confirmed,
+            ..
+        }) = &self.step
+        {
+            self.utility.ui(ui, *kind);
+            if *confirmed && kind.measuring() {
+                if let Ok(result) = super::cad_util::result(*kind, points, self.plane) {
+                    ui.label(result);
+                }
+            }
+        }
+        if !self.last_measurement.is_empty() {
+            ui.label(&self.last_measurement);
+        }
         ui.label(self.prompt());
         if let Some(Step::Grip { base, .. }) = &self.step {
             ui.small(format!(
                 "夹点临时平面原点：{:.4}, {:.4}, {:.4}；U/V 沿图元平面，三维输入仍为 WCS。",
                 base.x, base.y, base.z
             ));
+        }
+        if let Some(Step::Transform {
+            kind: TransformKind::RectArray,
+            ids,
+            base: Some(base),
+        }) = &self.step
+        {
+            let ids = ids.clone();
+            let base = *base;
+            if ui.button("拾取列/行间距").clicked() {
+                self.step = Some(Step::ArraySpacing { ids, base });
+            }
         }
         if self.is_active() {
             if !self.error_message().is_empty() {
@@ -824,7 +1152,7 @@ impl CommandState {
                 if matches!(
                     self.step,
                     Some(
-                        Step::Curves(_) | Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
+                        Step::Utility{confirmed:true,..} | Step::Paste{target:Some(_),..} | Step::Curves(_) | Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
                             | Step::Draw {
                                 confirmed: true,
                                 ..
@@ -894,6 +1222,15 @@ impl CommandState {
                         }
                     });
                 });
+            egui::CollapsingHeader::new("测量、标注与孔模板").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for kind in super::cad_util::Kind::ALL {
+                        if ui.button(kind.label()).clicked() {
+                            command = Some(kind.command().into());
+                        }
+                    }
+                });
+            });
             if ui.button("基点 → 目标点移动  Ctrl+M").clicked() {
                 command = Some("MOVE".into());
             }

@@ -95,7 +95,17 @@ fn load_drawing(state: &mut ViewerState, path: &Path, recovered: bool) {
 
 pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     clear_recovery(state);
-    state.excluded.clear();
+    state.excluded = drawing
+        .as_ref()
+        .map(|d| {
+            d.document()
+                .entities
+                .iter()
+                .filter(|e| e.reference)
+                .map(|e| e.id.0)
+                .collect()
+        })
+        .unwrap_or_default();
     state.file_ui.coverage_acknowledged = false;
     state.file_ui.report = drawing
         .as_ref()
@@ -171,6 +181,9 @@ pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableD
     state.cad_curves = Default::default();
     state.cad_diagnostics = Default::default();
     state.cad_layers = Default::default();
+    state.text_edit = Default::default();
+    state.measurements = Default::default();
+    state.pending_copy = None;
     state.cad_command = Default::default();
     state.trajectory_view = Default::default();
     state.command_input.clear();

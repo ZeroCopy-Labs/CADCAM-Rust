@@ -34,6 +34,7 @@ impl TransformKind {
         }
     }
 }
+#[derive(Clone)]
 pub struct ToolOptions {
     pub layer: Option<LayerId>,
     pub color: Color,
@@ -50,6 +51,7 @@ pub struct ToolOptions {
     pub columns: u32,
     pub spacing: [f64; 2],
     pub count: u32,
+    pub sweep: f64,
 }
 impl Default for ToolOptions {
     fn default() -> Self {
@@ -69,6 +71,7 @@ impl Default for ToolOptions {
             columns: 3,
             spacing: [10.0; 2],
             count: 6,
+            sweep: 360.0,
         }
     }
 }
@@ -165,9 +168,14 @@ impl ToolOptions {
             }
             TransformKind::PolarArray => {
                 ui.horizontal(|ui| {
-                    ui.label("数量（含原件，等分整圆）");
+                    ui.label("数量（含原件）");
                     ui.add(egui::DragValue::new(&mut self.count).range(1..=1000));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("分布总角度 °");
+                    ui.add(egui::DragValue::new(&mut self.sweep).speed(1.0));
+                });
+                ui.small("整圆不重复终点；部分角度包含首末项，副本随轴旋转。");
             }
         }
         if matches!(
@@ -225,6 +233,12 @@ impl ToolOptions {
             }
             TransformKind::RectArray => {
                 let count = self.rows as usize * self.columns as usize;
+                if (self.rows > 1 && (!self.spacing[1].is_finite() || self.spacing[1].abs() < 1e-9))
+                    || (self.columns > 1
+                        && (!self.spacing[0].is_finite() || self.spacing[0].abs() < 1e-9))
+                {
+                    return Err("有多行/多列时，相应间距必须为非零有限数值".into());
+                }
                 if count.saturating_sub(1).saturating_mul(selected) > 50_000 {
                     return Err("本次数量超过 50000 个新增图元，请减少行列数".into());
                 }
@@ -242,6 +256,9 @@ impl ToolOptions {
                 Ok((result, true))
             }
             TransformKind::PolarArray => {
+                if !self.sweep.is_finite() || self.sweep.abs() < 1e-9 || self.sweep.abs() > 360.0 {
+                    return Err("环阵分布角须在 −360° 到 360° 内且非零".into());
+                }
                 if (self.count as usize)
                     .saturating_sub(1)
                     .saturating_mul(selected)
@@ -254,7 +271,12 @@ impl ToolOptions {
                     result.push(AffineTransform::rotation(
                         base,
                         axis,
-                        360.0 * i as f64 / self.count as f64,
+                        self.sweep * i as f64
+                            / if (self.sweep.abs() - 360.0).abs() < 1e-9 {
+                                self.count as f64
+                            } else {
+                                (self.count - 1) as f64
+                            },
                     )?);
                 }
                 Ok((result, true))

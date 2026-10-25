@@ -17,6 +17,7 @@ mod convert;
 pub mod curve_edit;
 pub mod curves;
 pub mod diagnostics;
+pub mod drafting;
 mod edit;
 mod file_io;
 pub mod geometry_edit;

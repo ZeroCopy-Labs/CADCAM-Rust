@@ -27,7 +27,7 @@ pub use document::{
 };
 pub use entity::{Color, Entity, EntityColor, LayerColor};
 pub use geometry::{
-    Arc, Circle, Ellipse, Geometry, Line, Plane, Point3, Polyline, PolylineSegment, Spline,
+    Arc, Circle, Ellipse, Geometry, Line, Plane, Point3, Polyline, PolylineSegment, Spline, Text,
     Vector3, GEOMETRY_EPSILON,
 };
 pub use ids::{EntityId, LayerId};

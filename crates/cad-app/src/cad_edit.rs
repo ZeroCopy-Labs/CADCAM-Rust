@@ -9,6 +9,11 @@ use cad_core::{DrawingEdit, LayerEdit};
 
 #[derive(Clone)]
 pub enum EditAction {
+    Annotation(Vec<cad_core::Geometry>),
+    Paste {
+        items: Vec<cad_core::geometry_edit::ClipboardItem>,
+        offset: [f64; 3],
+    },
     Apply(DrawingEdit),
     Create(Vec<cad_core::geometry_edit::NewEntity>),
     Transform {

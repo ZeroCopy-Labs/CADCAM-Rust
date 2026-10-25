@@ -190,7 +190,7 @@ fn same_geometry(a: &Geometry, b: &Geometry) -> bool {
         _ => false,
     }
 }
-fn length(g: &Geometry) -> Result<(f64, bool), String> {
+pub fn length(g: &Geometry) -> Result<(f64, bool), String> {
     Ok(match g {
         Geometry::Line(l) => (curves::distance(l.start, l.end), false),
         Geometry::Circle(c) => (TAU * c.radius, false),
@@ -301,8 +301,18 @@ pub fn analyze(doc: &DrawingDocument, gap_limit: f64) -> Report {
     } else {
         0.01
     };
-    let mut entities: Vec<_> = doc.entities.iter().take(50_000).collect();
-    report.truncated = entities.len() != doc.entities.len();
+    let mut entities: Vec<_> = doc
+        .entities
+        .iter()
+        .filter(|e| !matches!(e.geometry, Geometry::Text(_)))
+        .take(50_000)
+        .collect();
+    report.truncated = entities.len()
+        != doc
+            .entities
+            .iter()
+            .filter(|e| !matches!(e.geometry, Geometry::Text(_)))
+            .count();
     let mut endpoints = Vec::new();
     let mut lengths = Vec::new();
     let mut segments = Vec::new();
@@ -348,6 +358,7 @@ pub fn analyze(doc: &DrawingDocument, gap_limit: f64) -> Report {
             }
         }
         let pieces: Vec<_> = match g {
+            Geometry::Text(_) => Vec::new(),
             Geometry::Line(_) | Geometry::Arc(_) | Geometry::Circle(_) => vec![(g.clone(), false)],
             Geometry::Polyline(p) => p
                 .segments

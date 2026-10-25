@@ -268,7 +268,7 @@ pub fn build_machining(
     let mut max = [f64::NEG_INFINITY; 3];
     let mut total = 0;
     for entity in &document.entities {
-        if excluded.contains(&entity.id.0) {
+        if excluded.contains(&entity.id.0) || matches!(entity.geometry, Geometry::Text(_)) {
             continue;
         }
         let points =
@@ -340,6 +340,11 @@ pub fn aci_color(index: u8) -> [f32; 3] {
 /// Type-specific table rows for the selection panel.
 fn entity_properties(geometry: &Geometry) -> Vec<(&'static str, String)> {
     match geometry {
+        Geometry::Text(t) => vec![
+            ("文字", t.content.clone()),
+            ("字高", format!("{:.4}", t.height)),
+            ("插入点", format_point(t.position)),
+        ],
         Geometry::Line(line) => vec![
             ("起点", format_point(line.start)),
             ("终点", format_point(line.end)),
@@ -433,6 +438,22 @@ fn format_vector(vector: cad_core::model::Vector3) -> String {
 /// Dispatch one internal geometry value to its display tessellator.
 pub(crate) fn tessellate_geometry(geometry: &Geometry) -> Vec<Vec<[f64; 3]>> {
     match geometry {
+        Geometry::Text(t) => {
+            let width = t
+                .content
+                .chars()
+                .map(|c| if c.is_ascii() { 0.6 } else { 1.0 })
+                .sum::<f64>()
+                * t.height;
+            let a = to_array(t.position);
+            let u = t.plane.x_axis * width;
+            let v = t.plane.y_axis() * t.height;
+            let b = [a[0] + u.x, a[1] + u.y, a[2] + u.z];
+            let c = [b[0] + v.x, b[1] + v.y, b[2] + v.z];
+            let d = [a[0] + v.x, a[1] + v.y, a[2] + v.z];
+            vec![vec![a, b, c, d, a]]
+        }
+
         Geometry::Line(line) => vec![vec![to_array(line.start), to_array(line.end)]],
         Geometry::Polyline(polyline) => polyline_paths(polyline),
         Geometry::Circle(circle) => vec![sample_arc(
