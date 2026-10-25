@@ -7,9 +7,7 @@ use bevy::{app::AppExit, prelude::*, window::WindowCloseRequested};
 use bevy_egui::egui;
 use cad_core::{read_editable_document, EditableDrawing, ImportReport, LengthUnit};
 
-use super::{
-    cam, cam_analysis, cam_trajectory, display, push_message, remember_recent, ViewerState,
-};
+use super::{cam, cam_analysis, display, push_message, remember_recent, ViewerState};
 
 #[derive(Default)]
 pub(super) struct FileState {
@@ -106,6 +104,16 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
         state.layer_count = document.layers.len();
         state.warning_count = document.import_report.warnings.len();
         state.display = display::build_display(document);
+        match display::build_machining(document) {
+            Ok(data) => {
+                state.machining = data;
+                state.machining_error = None;
+            }
+            Err(error) => {
+                state.machining = Default::default();
+                state.machining_error = Some(error);
+            }
+        }
         state.cam = cam::build_cam_model(document);
     } else {
         state.file_name.clear();
@@ -116,11 +124,13 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
         state.layer_count = 0;
         state.warning_count = 0;
         state.display = Default::default();
+        state.machining = Default::default();
+        state.machining_error = None;
         state.cam = Default::default();
     }
-    state.analysis = cam_analysis::CamAnalysis::build(&state.display, &state.cam);
+    state.analysis = cam_analysis::CamAnalysis::build(&state.machining, &state.cam);
     state.analysis.set_machine_start(
-        &state.display,
+        &state.machining,
         &state.cam,
         [
             state.gcode_profile.initial_x,
@@ -130,16 +140,13 @@ fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
     );
     state.manual_tube = Default::default();
     state.manual_pair = [None, None];
-    state.trajectory = drawing.as_ref().map(|_| {
-        cam_trajectory::build_trajectory(
-            &state.display,
-            &state.cam,
-            &state.analysis,
-            state.gcode_profile.rotary_config(),
-        )
-    });
+    state.trajectory = None;
     state.drawing = drawing;
+    if state.drawing.is_some() {
+        super::rebuild_state_trajectory(state);
+    }
     state.cad_controls = Default::default();
+    state.cad_curves = Default::default();
     state.cad_layers = Default::default();
     state.cad_command = Default::default();
     state.command_input.clear();

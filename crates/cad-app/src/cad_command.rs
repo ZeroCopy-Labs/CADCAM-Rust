@@ -10,6 +10,7 @@ use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
+    Curves(cad_core::CurveEdit),
     Grip {
         id: EntityId,
         geometry: Geometry,
@@ -59,6 +60,7 @@ pub struct MoveCommit {
 }
 
 pub enum CommandCommit {
+    Curves(cad_core::CurveEdit),
     Geometry(BTreeMap<EntityId, Geometry>),
     Move(MoveCommit),
     Create {
@@ -104,10 +106,12 @@ impl CommandState {
             && !matches!(
                 self.step,
                 Some(
-                    Step::Grip {
-                        target: Some(_),
-                        ..
-                    } | Step::Confirm { .. }
+                    Step::Curves(_)
+                        | Step::Grip {
+                            target: Some(_),
+                            ..
+                        }
+                        | Step::Confirm { .. }
                         | Step::Draw {
                             confirmed: true,
                             ..
@@ -119,6 +123,9 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::Curves(_)) => {
+                return "曲线整理：Enter / 确认提交；Esc 取消；修改参数请取消后重新预览".into()
+            }
             Some(Step::Grip {
                 target, dragging, ..
             }) => {
@@ -188,6 +195,11 @@ impl CommandState {
             Some(Step::PlaneThird { .. }) => "三点平面 3/3：指定 +V 一侧的点；三点不能共线",
         }
         .to_string()
+    }
+
+    pub fn begin_curves(&mut self, edit: cad_core::CurveEdit) {
+        self.cancel();
+        self.step = Some(Step::Curves(edit));
     }
 
     pub fn begin_grip(
@@ -385,6 +397,12 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::Curves(edit)) = &self.step {
+            if text.trim().is_empty() {
+                return Ok(Some(CommandCommit::Curves(edit.clone())));
+            }
+            return Err("曲线预览只接受 Enter 提交或 Esc 取消".into());
+        }
         if let Some(Step::Grip {
             id,
             geometry,
@@ -535,6 +553,7 @@ impl CommandState {
 
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::Curves(_) => return Err("当前为曲线整理确认步骤".into()),
             Step::Grip {
                 id,
                 geometry,
@@ -688,6 +707,15 @@ impl CommandState {
     }
 
     pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        if let Some(Step::Curves(edit)) = &self.step {
+            return edit
+                .replacements
+                .values()
+                .flatten()
+                .flat_map(super::display::tessellate_geometry)
+                .collect();
+        }
+
         if let Some(Step::Grip {
             geometry,
             kind,
@@ -779,7 +807,7 @@ impl CommandState {
                 if matches!(
                     self.step,
                     Some(
-                        Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
+                        Step::Curves(_) | Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
                             | Step::Draw {
                                 confirmed: true,
                                 ..

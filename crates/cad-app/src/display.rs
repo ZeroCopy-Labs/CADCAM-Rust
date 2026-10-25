@@ -208,6 +208,45 @@ pub fn build_display(document: &DrawingDocument) -> DisplayData {
     }
 }
 
+/// CAM paths are sampled from analytic geometry, independently of viewport tessellation.
+pub fn build_machining(document: &DrawingDocument) -> Result<DisplayData, String> {
+    let mut data = build_display(document);
+    data.paths.clear();
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut total = 0;
+    for entity in &document.entities {
+        let points =
+            cad_core::curves::sample(&entity.geometry, cad_core::curves::Sampling::default())
+                .map_err(|e| format!("图元 #{} 加工采样失败：{e}", entity.id.0))?;
+        total += points.len();
+        if total > 2_000_000 {
+            return Err("加工采样超出整图 2000000 点预算，未输出部分刀路".into());
+        }
+        for p in &points {
+            for (i, v) in [p.x, p.y, p.z].into_iter().enumerate() {
+                min[i] = min[i].min(v);
+                max[i] = max[i].max(v);
+            }
+        }
+        data.paths.push(DisplayPath {
+            entity_id: entity.id.0,
+            visible: document.layer(entity.layer_id).is_none_or(|l| l.visible),
+            color: resolve_color(entity, document),
+            points: points.into_iter().map(to_array).collect(),
+        });
+    }
+    data.bounds = (!data.paths.is_empty()).then_some(Bounds {
+        min_x: min[0],
+        min_y: min[1],
+        min_z: min[2],
+        max_x: max[0],
+        max_y: max[1],
+        max_z: max[2],
+    });
+    Ok(data)
+}
+
 /// Resolve the display color from the entity, falling back to its layer color.
 fn resolve_color(entity: &Entity, document: &DrawingDocument) -> [f32; 3] {
     let layer_color = document

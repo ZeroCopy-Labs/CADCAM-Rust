@@ -11,6 +11,14 @@ use crate::model::{Color, DrawingDocument, EntityId, FileFormat, LayerId, Length
 
 const HISTORY_LIMIT: usize = 100;
 
+/// One previewed structural edit; primary replacements retain their IDs.
+#[derive(Clone, Debug, Default)]
+pub struct CurveEdit {
+    pub replacements: BTreeMap<EntityId, Vec<crate::model::Geometry>>,
+    pub remove: BTreeSet<EntityId>,
+    pub copies: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum LayerEdit {
     Create {
@@ -486,6 +494,127 @@ impl EditableDrawing {
             self.ensure_layer_editable(entity.layer_id)?;
         }
         Ok(())
+    }
+
+    pub fn apply_curves(&mut self, edit: &CurveEdit) -> Result<Option<DrawingChange>, String> {
+        if edit.replacements.is_empty() && edit.remove.is_empty() {
+            return Ok(None);
+        }
+        if edit.copies && !edit.remove.is_empty() {
+            return Err("创建副本不能同时删除源对象".into());
+        }
+        let selected: BTreeSet<_> = edit
+            .replacements
+            .keys()
+            .copied()
+            .chain(edit.remove.iter().copied())
+            .collect();
+        self.ensure_editable(&selected)?;
+        if edit
+            .remove
+            .iter()
+            .any(|id| edit.replacements.contains_key(id))
+        {
+            return Err("替换与删除对象重复".into());
+        }
+        let output: usize = edit.replacements.values().map(Vec::len).sum();
+        if output > 50_000 {
+            return Err("单次曲线整理结果不能超过 50000 个图元".into());
+        }
+        let scale = self.unit_scale()?;
+        let mut candidate = self.native.clone();
+        let mut ids = self.ids.clone();
+        let mut next = Self::next_id(&ids)?;
+        let mut created = Vec::new();
+        let handles: BTreeMap<_, _> = ids.iter().map(|(h, id)| (*id, *h)).collect();
+        for id in &selected {
+            let source = self
+                .native
+                .get_entity(*handles.get(id).ok_or("源记录失效")?)
+                .ok_or("源记录失效")?;
+            let unsupported = match source {
+                acadrust::EntityType::Line(e) => e.thickness != 0.0,
+                acadrust::EntityType::Circle(e) => e.thickness != 0.0,
+                acadrust::EntityType::Arc(e) => e.thickness != 0.0,
+                acadrust::EntityType::LwPolyline(p) => {
+                    p.constant_width != 0.0
+                        || p.thickness != 0.0
+                        || p.vertices
+                            .iter()
+                            .any(|v| v.start_width != 0.0 || v.end_width != 0.0)
+                }
+                acadrust::EntityType::Polyline2D(p) => {
+                    p.start_width != 0.0
+                        || p.end_width != 0.0
+                        || p.thickness != 0.0
+                        || p.flags.is_spline_fit()
+                        || p.vertices
+                            .iter()
+                            .any(|v| v.start_width != 0.0 || v.end_width != 0.0)
+                }
+                acadrust::EntityType::Polyline3D(p) => {
+                    p.flags.spline_fit || p.default_start_width != 0.0 || p.default_end_width != 0.0
+                }
+                _ => false,
+            };
+            if unsupported {
+                return Err("带宽度、厚度或拟合标记的图元暂不支持结构整理，未丢弃附加属性".into());
+            }
+        }
+        let mut removed = edit.remove.clone();
+        for id in &edit.remove {
+            candidate.remove_entity(*handles.get(id).ok_or("源记录失效")?);
+        }
+        for (id, results) in &edit.replacements {
+            let handle = *handles.get(id).ok_or("源记录失效")?;
+            let source = self.native.get_entity(handle).ok_or("源记录失效")?;
+            if results.is_empty() {
+                if !edit.copies {
+                    candidate.remove_entity(handle);
+                    removed.insert(*id);
+                }
+                continue;
+            }
+            for (index, geometry) in results.iter().enumerate() {
+                // Sampling validates each result before any authoritative state is changed.
+                crate::curves::sample(geometry, crate::curves::Sampling::default())?;
+                let mut native = source.clone();
+                if crate::properties::update_native(&mut native, geometry, scale).is_err() {
+                    native = native_geometry(geometry, scale)?;
+                    *native.common_mut() = source.common().clone();
+                }
+                native.common_mut().raw_record = None;
+                if index == 0 && !edit.copies {
+                    if self
+                        .document
+                        .entity(*id)
+                        .is_some_and(|e| e.geometry == *geometry)
+                    {
+                        continue;
+                    }
+                    *candidate.get_entity_mut(handle).ok_or("源记录失效")? = native;
+                } else {
+                    let common = native.common_mut();
+                    common.handle = Handle::NULL;
+                    common.owner_handle = Handle::NULL;
+                    if let acadrust::EntityType::Polyline3D(p) = &mut native {
+                        for v in &mut p.vertices {
+                            v.handle = candidate.allocate_handle();
+                        }
+                    }
+                    let h = candidate.add_entity(native).map_err(|e| e.to_string())?;
+                    created.push(Self::fresh_id(&mut ids, h, &mut next)?);
+                }
+            }
+        }
+        self.commit(
+            candidate,
+            ids,
+            DrawingChangeKind::Geometry,
+            selected.len(),
+            removed,
+            created,
+        )
     }
 
     pub fn set_geometry(

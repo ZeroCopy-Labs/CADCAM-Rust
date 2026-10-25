@@ -130,7 +130,7 @@ fn parameter(angle: f64, start: f64, sweep: f64) -> Option<f64> {
         None
     }
 }
-fn spline_point(s: &Spline, t: f64) -> Option<Point3> {
+pub(crate) fn spline_point(s: &Spline, t: f64) -> Option<Point3> {
     let n = s.control_points.len();
     let p = s.degree as usize;
     if n <= p

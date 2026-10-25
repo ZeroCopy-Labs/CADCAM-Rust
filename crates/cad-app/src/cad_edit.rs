@@ -16,6 +16,7 @@ pub enum EditAction {
         copies: bool,
     },
     Geometry(BTreeMap<EntityId, cad_core::Geometry>),
+    Curves(cad_core::CurveEdit),
     Layer(LayerEdit),
     BeginGrip {
         id: EntityId,

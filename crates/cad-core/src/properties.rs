@@ -354,6 +354,8 @@ pub(crate) fn update_native(
             e.weights = n.weights;
             e.degree = n.degree;
             e.flags = n.flags;
+            e.begin_tangent = NV::ZERO;
+            e.end_tangent = NV::ZERO;
             if e.flags.planar {
                 if let Some(origin) = e.control_points.first() {
                     if e.control_points
@@ -373,6 +375,7 @@ pub(crate) fn update_native(
         {
             e.normal = n.normal;
             e.elevation = n.elevation;
+            e.is_closed = n.is_closed;
             for (v, p) in e.vertices.iter_mut().zip(n.vertices) {
                 v.location = p.location;
                 v.bulge = p.bulge;
@@ -381,6 +384,7 @@ pub(crate) fn update_native(
         (EntityType::Polyline2D(e), EntityType::LwPolyline(n))
             if e.vertices.len() == n.vertices.len() =>
         {
+            e.flags.set_closed(n.is_closed);
             e.normal = n.normal;
             e.elevation = n.elevation;
             for (v, p) in e.vertices.iter_mut().zip(n.vertices) {
@@ -391,6 +395,7 @@ pub(crate) fn update_native(
         (EntityType::Polyline3D(e), EntityType::Polyline3D(n))
             if e.vertices.len() == n.vertices.len() =>
         {
+            e.flags.closed = n.flags.closed;
             for (v, p) in e.vertices.iter_mut().zip(n.vertices) {
                 v.position = p.position;
             }
@@ -398,6 +403,7 @@ pub(crate) fn update_native(
         (EntityType::Polyline(e), EntityType::Polyline3D(n))
             if e.vertices.len() == n.vertices.len() =>
         {
+            e.flags.set_closed(n.flags.closed);
             for (v, p) in e.vertices.iter_mut().zip(n.vertices) {
                 v.location = p.position;
             }

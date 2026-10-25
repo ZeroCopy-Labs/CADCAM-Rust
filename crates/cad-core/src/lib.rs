@@ -13,6 +13,8 @@
 //! editable native document behind [`EditableDrawing`]. Parser types remain private.
 
 mod convert;
+pub mod curve_edit;
+pub mod curves;
 mod edit;
 mod file_io;
 pub mod geometry_edit;
@@ -23,7 +25,9 @@ pub mod model;
 pub mod snap;
 
 pub use convert::{aci_color_rgb, read_document, read_editable_document};
-pub use edit::{DrawingChange, DrawingChangeKind, DrawingEdit, EditableDrawing, LayerEdit};
+pub use edit::{
+    CurveEdit, DrawingChange, DrawingChangeKind, DrawingEdit, EditableDrawing, LayerEdit,
+};
 pub use import::ImportError;
 pub use model::{
     DrawingDocument, Entity, EntityId, FileFormat, Geometry, ImportReport, Layer, LayerId,

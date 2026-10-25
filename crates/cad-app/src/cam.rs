@@ -189,13 +189,8 @@ fn entity_topology(geometry: &Geometry) -> Option<Topology> {
             if spline.closed || spline.periodic {
                 return Some(Topology::Closed);
             }
-            let points = if spline.control_points.is_empty() {
-                &spline.fit_points
-            } else {
-                &spline.control_points
-            };
-            let start = *points.first()?;
-            let end = *points.last()?;
+            let start = cad_core::curves::evaluate(geometry, 0.0).ok()?;
+            let end = cad_core::curves::evaluate(geometry, 1.0).ok()?;
             Some(Topology::Open { start, end })
         }
     }

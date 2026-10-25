@@ -24,6 +24,7 @@ use cad_file::open_drawing;
 
 mod cad_aids;
 mod cad_command;
+mod cad_curves;
 mod cad_edit;
 mod cad_file;
 mod cad_layers;
@@ -52,6 +53,7 @@ struct ViewerState {
     drawing: Option<cad_core::EditableDrawing>,
     file_ui: cad_file::FileState,
     cad_controls: cad_edit::EditControls,
+    cad_curves: cad_curves::CurveControls,
     cad_layers: cad_layers::LayerControls,
     cad_command: cad_command::CommandState,
     cad_history: BTreeMap<u64, CadUndoState>,
@@ -63,6 +65,8 @@ struct ViewerState {
     layer_count: usize,
     warning_count: usize,
     display: display::DisplayData,
+    machining: display::DisplayData,
+    machining_error: Option<String>,
     view: cad_view::ViewFrame,
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
@@ -364,6 +368,12 @@ fn submit_command(
                 .cad_command
                 .set_preset(upper[4..].trim())
                 .map(|_| None),
+            _ if cad_curves::TOOLS.iter().any(|(_,name)|*name==upper)=>{
+                state.cad_curves.tool=cad_curves::TOOLS.iter().find(|(_,name)|*name==upper).map(|(tool,_)|*tool);
+                match state.cad_curves.recipe(state.drawing.as_ref().unwrap().document(),&selection.selected,state.cad_command.plane){
+                    Ok(edit)=>{state.cad_command.begin_curves(edit);Ok(None)},Err(error)=>Err(error),
+                }
+            },
             _ if state.cad_command.begin_named(&upper, &selection.selected) => Ok(None),
             _ => Err("可用命令见左侧工具或绘图/编辑菜单：LINE、PLINE、RECTANGLE、CIRCLE、ARC、ELLIPSE、SPLINE、COPY、ROTATE、SCALE、MIRROR、ARRAYRECT、ARRAYPOLAR".into()),
         }
@@ -371,6 +381,7 @@ fn submit_command(
     match result {
         Ok(Some(commit)) => {
             let action = match commit {
+                cad_command::CommandCommit::Curves(edit) => cad_edit::EditAction::Curves(edit),
                 cad_command::CommandCommit::Geometry(updates) => {
                     cad_edit::EditAction::Geometry(updates)
                 }
@@ -1378,7 +1389,7 @@ fn apply_reorder_click(
     }
     if current != target {
         let ViewerState {
-            display,
+            machining: display,
             cam,
             analysis,
             ..
@@ -2060,7 +2071,7 @@ fn draw_machining_order_labels(
             // a section whose center is off-screen or under a panel still gets
             // its start marker when the start itself is visible.
             if let Some(path) = cam_analysis::oriented_unit_path_from(
-                &state.display,
+                &state.machining,
                 &state.cam,
                 unit.unit_id,
                 unit.direction,
@@ -2110,7 +2121,7 @@ fn draw_machining_order_labels(
                 }
             }
 
-            let Some(center) = unit_center(&state.display, &state.cam, unit.unit_id) else {
+            let Some(center) = unit_center(&state.machining, &state.cam, unit.unit_id) else {
                 continue;
             };
             let world = state.view.point(center);
@@ -2172,7 +2183,7 @@ fn draw_machining_section_labels(
     let viewport = context.viewport_rect();
 
     for (index, section) in state.analysis.machining_sections.iter().enumerate() {
-        let Some(center) = unit_center(&state.display, &state.cam, section.unit_id) else {
+        let Some(center) = unit_center(&state.machining, &state.cam, section.unit_id) else {
             continue;
         };
         let world = state.view.point(center);
@@ -2538,6 +2549,14 @@ fn drawing_ui(
                     ui.add_enabled_ui(
                         state.drawing.is_some() && !state.cad_command.is_active(),
                         |ui| {
+                            ui.menu_button("曲线整理", |ui| {
+                                for (tool, name) in cad_curves::TOOLS {
+                                    if ui.button(tool.label()).clicked() {
+                                        command_request = Some(name.into());
+                                        ui.close();
+                                    }
+                                }
+                            });
                             if ui.button("复制（基点/目标点）").clicked() {
                                 command_request = Some("COPY".into());
                                 ui.close();
@@ -2839,6 +2858,28 @@ fn drawing_ui(
                                     }
                                 }
                             }
+                            {
+                                let ViewerState {
+                                    cad_curves,
+                                    cad_command,
+                                    drawing,
+                                    ..
+                                } = &mut *state;
+                                ui.add_enabled_ui(!cad_command.is_active(), |ui| {
+                                    if cad_curves.ui(ui) {
+                                        if let Some(doc) = drawing.as_ref().map(|d| d.document()) {
+                                            match cad_curves.recipe(
+                                                doc,
+                                                &selection.selected,
+                                                cad_command.plane,
+                                            ) {
+                                                Ok(edit) => cad_command.begin_curves(edit),
+                                                Err(error) => cad_command.error = error,
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                             let editing_enabled = !state.cad_command.is_active()
                                 && !state
                                     .display
@@ -2889,6 +2930,10 @@ fn drawing_ui(
                         });
                 }
                 SpaceMode::Cam => {
+                    ui.small("加工采样：弦差 0.01 mm · 曲线内转角 3°；独立于显示折线。");
+                    if let Some(error) = &state.machining_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let ViewerState {
                             analysis,
@@ -2936,7 +2981,7 @@ fn drawing_ui(
                                 cam_unit_info_ui(
                                     ui,
                                     selected_units[0],
-                                    &state.display,
+                                    &state.machining,
                                     zone_profile,
                                     section_index,
                                     machining_candidate,
@@ -2978,7 +3023,7 @@ fn drawing_ui(
                                         cam_unit_info_ui(
                                             ui,
                                             unit,
-                                            &state.display,
+                                            &state.machining,
                                             zone_profile,
                                             section_index,
                                             machining_candidate,
@@ -3009,7 +3054,7 @@ fn drawing_ui(
     let mut pairing_error = None;
     {
         let ViewerState {
-            display,
+            machining: display,
             cam,
             analysis,
             ..
@@ -4327,7 +4372,7 @@ fn sync_machine_start(state: &mut ViewerState) {
         state.gcode_profile.initial_z,
     ];
     let ViewerState {
-        display,
+        machining: display,
         cam,
         analysis,
         ..
@@ -4336,9 +4381,16 @@ fn sync_machine_start(state: &mut ViewerState) {
 }
 
 fn rebuild_state_trajectory(state: &mut ViewerState) {
+    if let Some(error) = &state.machining_error {
+        state.trajectory = Some(cam_trajectory::MachineTrajectory {
+            error: Some(error.clone()),
+            ..Default::default()
+        });
+        return;
+    }
     sync_machine_start(state);
     let ViewerState {
-        display,
+        machining: display,
         cam,
         analysis,
         trajectory,
@@ -4398,11 +4450,26 @@ fn apply_cad_action(
         | cad_edit::EditAction::Create(_)
         | cad_edit::EditAction::Transform { .. }
         | cad_edit::EditAction::Geometry(_)
+        | cad_edit::EditAction::Curves(_)
         | cad_edit::EditAction::Layer(_)) => {
             let geometry_changed = match &action {
                 cad_edit::EditAction::Apply(edit) => edit.changes_geometry(),
                 cad_edit::EditAction::Layer(_) => false,
                 _ => true,
+            };
+            let curve_results = if let cad_edit::EditAction::Curves(edit) = &action {
+                if edit.copies {
+                    Some(BTreeSet::new())
+                } else {
+                    Some(
+                        edit.replacements
+                            .keys()
+                            .map(|id| id.0)
+                            .collect::<BTreeSet<_>>(),
+                    )
+                }
+            } else {
+                None
             };
             let mut before = capture_cad_context(state, selection, geometry_changed);
             let rename =
@@ -4440,6 +4507,7 @@ fn apply_cad_action(
                 cad_edit::EditAction::Apply(edit) => drawing.apply(&ids, edit),
                 cad_edit::EditAction::Create(entities) => drawing.create(&entities),
                 cad_edit::EditAction::Geometry(updates) => drawing.set_geometry(&updates),
+                cad_edit::EditAction::Curves(edit) => drawing.apply_curves(&edit),
                 cad_edit::EditAction::Layer(edit) => drawing.edit_layer(edit),
                 cad_edit::EditAction::Transform { transforms, copies } => {
                     drawing.transform(&ids, &transforms, copies)
@@ -4467,6 +4535,10 @@ fn apply_cad_action(
                     selection.cam_selected.clear();
                     if !change.created.is_empty() {
                         selection.selected = change.created.iter().map(|id| id.0).collect();
+                    }
+                    if let Some(mut results) = curve_results {
+                        results.extend(change.created.iter().map(|id| id.0));
+                        selection.selected = results;
                     }
                     let operation = change.kind.label();
                     push_message(
@@ -4590,6 +4662,16 @@ fn refresh_edited_drawing(
     let drawing = state.drawing.as_ref().unwrap();
     let document = drawing.document();
     state.display = display::build_display(document);
+    match display::build_machining(document) {
+        Ok(data) => {
+            state.machining = data;
+            state.machining_error = None;
+        }
+        Err(error) => {
+            state.machining = Default::default();
+            state.machining_error = Some(error);
+        }
+    }
     state.entity_count = document.entity_count();
     state.layer_count = document.layers.len();
     state.warning_count = document.import_report.warnings.len();
@@ -4602,10 +4684,10 @@ fn refresh_edited_drawing(
         } else {
             let lazy = state.analysis.lazy_rotation;
             let direction = state.analysis.rotation_direction;
-            state.analysis = cam_analysis::CamAnalysis::build(&state.display, &state.cam);
+            state.analysis = cam_analysis::CamAnalysis::build(&state.machining, &state.cam);
             state
                 .analysis
-                .set_plan_options(lazy, direction, &state.display, &state.cam);
+                .set_plan_options(lazy, direction, &state.machining, &state.cam);
             state.manual_pair = [None, None];
         }
     }
