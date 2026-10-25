@@ -7,17 +7,17 @@
 /// Identifier of an entity inside a [`DrawingDocument`](crate::model::DrawingDocument).
 ///
 /// This is an internal identifier, not a DXF/DWG handle. For the current
-/// version it is assigned sequentially and is equal to the entity's index in
-/// `DrawingDocument::entities`.
+/// version it is assigned sequentially on import. Editing preserves it, so after
+/// deletion it need not equal an index in `DrawingDocument::entities`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EntityId(
-    /// Zero-based index into `DrawingDocument::entities`.
+    /// Stable zero-based identity assigned on import.
     pub u32,
 );
 
 /// Identifier of a layer inside a [`DrawingDocument`](crate::model::DrawingDocument).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerId(
-    /// Zero-based index into `DrawingDocument::layers`.
+    /// Stable identity preserved across edits, undo and redo; not an array index.
     pub u32,
 );

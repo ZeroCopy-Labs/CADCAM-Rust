@@ -5,7 +5,7 @@
 //! types are translated into `DrawingDocument`. The public entry point is
 //! [`read_document`]: parse a file, then convert only model-space entities.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::path::Path;
 
@@ -15,7 +15,9 @@ use acadrust::entities::{
     Polyline3D as NativePolyline3D, Spline as NativeSpline,
 };
 use acadrust::types::Vector3 as NativeVector3;
-use acadrust::{CadDocument, Color as NativeColor, EntityType, ReadStats};
+use acadrust::{CadDocument, Color as NativeColor, EntityType, Handle, ReadStats};
+
+use crate::edit::EditableDrawing;
 
 use crate::import::{read_native, ImportError};
 use crate::model::{
@@ -26,6 +28,11 @@ use crate::model::{
 
 const BULGE_EPSILON: f64 = 1e-12;
 
+/// Resolve an ACI entry using the parser's complete AutoCAD color table.
+pub fn aci_color_rgb(index: u8) -> Option<[u8; 3]> {
+    NativeColor::Index(index).rgb().map(|(r, g, b)| [r, g, b])
+}
+
 /// Read a DXF or DWG file and convert it into the parser-independent model.
 ///
 /// This is the only public read API of the crate. It:
@@ -33,9 +40,22 @@ const BULGE_EPSILON: f64 = 1e-12;
 /// 2. converts model-space entities with `convert_document`;
 /// 3. folds parser diagnostics/notifications into `ImportReport::warnings`.
 pub fn read_document<P: AsRef<Path>>(path: P) -> Result<DrawingDocument, ImportError> {
+    Ok(read_editable_document(path)?.into_document())
+}
+
+/// Read an editable drawing while retaining the native records for DXF export.
+pub fn read_editable_document<P: AsRef<Path>>(path: P) -> Result<EditableDrawing, ImportError> {
     let path = path.as_ref();
     let native = read_native(path)?;
-    let mut document = convert_document(path, native.detection.format, &native.document);
+    let mut ids = BTreeMap::new();
+    let mut layer_identities = BTreeMap::new();
+    let mut document = convert_document(
+        path,
+        native.detection.format,
+        &native.document,
+        &mut ids,
+        &mut layer_identities,
+    );
 
     let mut warnings = Vec::new();
     if let Some(mismatch) = &native.detection.extension_mismatch {
@@ -54,16 +74,32 @@ pub fn read_document<P: AsRef<Path>>(path: P) -> Result<DrawingDocument, ImportE
 
     document.import_report.warnings.extend(warnings);
     deduplicate(&mut document.import_report.warnings);
-    Ok(document)
+    Ok(EditableDrawing::new(
+        document,
+        native.document,
+        ids,
+        layer_identities,
+    ))
 }
 
 /// Convert the parser document for `path` into the internal model.
-fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> DrawingDocument {
+pub(crate) fn convert_document(
+    path: &Path,
+    format: FileFormat,
+    native: &CadDocument,
+    ids: &mut BTreeMap<Handle, EntityId>,
+    layer_identities: &mut BTreeMap<String, LayerId>,
+) -> DrawingDocument {
     let model_space: Vec<&EntityType> = native.model_space_entities().collect();
     let total_entities = native.entities().count();
     let ignored_non_model_space = total_entities.saturating_sub(model_space.len());
 
-    let mut report = ImportReport::default();
+    let mut report = ImportReport {
+        source_entities: total_entities,
+        model_space_entities: model_space.len(),
+        ignored_non_model_space,
+        ..Default::default()
+    };
     if ignored_non_model_space > 0 {
         report.warn(format!(
             "ignored {ignored_non_model_space} entity(ies) outside model space \
@@ -74,7 +110,10 @@ fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> Dr
     let mut layers = Vec::new();
     let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
     for native_layer in native.layers.iter() {
-        let id = LayerId(layers.len() as u32);
+        let next_id = LayerId(layer_identities.len() as u32);
+        let id = *layer_identities
+            .entry(layer_key(&native_layer.name))
+            .or_insert(next_id);
         layer_ids.insert(layer_key(&native_layer.name), id);
         layers.push(Layer {
             id,
@@ -89,12 +128,16 @@ fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> Dr
         ensure_layer(
             &mut layers,
             &mut layer_ids,
+            layer_identities,
             entity_layer_name(native_entity),
             &mut report,
         );
     }
 
-    let units = convert_units(native.header.insertion_units, &mut report);
+    let source_units = convert_units(native.header.insertion_units, &mut report);
+    let scale = source_units
+        .map(LengthUnit::millimeters_per_unit)
+        .unwrap_or(1.0);
 
     let mut entities = Vec::new();
     for native_entity in model_space {
@@ -104,8 +147,18 @@ fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> Dr
             .expect("layer pre-pass must register every referenced layer");
         let color = convert_color(native_entity.as_entity().color());
 
-        if let Some(geometry) = convert_geometry(native_entity, &mut report) {
-            let id = EntityId(entities.len() as u32);
+        if let Some(mut geometry) = convert_geometry(native_entity, &mut report) {
+            if !scale_geometry(&mut geometry, scale) {
+                record_skip(
+                    native_entity,
+                    SkipReason::ConversionFailed,
+                    "coordinates are non-finite after unit conversion",
+                    &mut report,
+                );
+                continue;
+            }
+            let next_id = EntityId(ids.len() as u32);
+            let id = *ids.entry(native_entity.common().handle).or_insert(next_id);
             report.record_converted(geometry.kind());
             entities.push(Entity {
                 id,
@@ -122,7 +175,8 @@ fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> Dr
         .unwrap_or_else(|| path.display().to_string());
 
     DrawingDocument {
-        units,
+        units: source_units.map(|_| LengthUnit::Millimeters),
+        source_units,
         layers,
         entities,
         source: SourceInfo {
@@ -132,6 +186,59 @@ fn convert_document(path: &Path, format: FileFormat, native: &CadDocument) -> Dr
             version: native.version.to_string(),
         },
         import_report: report,
+    }
+}
+
+fn scale_geometry(geometry: &mut Geometry, scale: f64) -> bool {
+    let point = |p: &mut Point3| {
+        p.x *= scale;
+        p.y *= scale;
+        p.z *= scale;
+        p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+    };
+    let radius = |r: &mut f64| {
+        *r *= scale;
+        r.is_finite() && *r > 0.0
+    };
+    match geometry {
+        Geometry::Line(line) => point(&mut line.start) & point(&mut line.end),
+        Geometry::Polyline(polyline) => polyline.segments.iter_mut().all(|segment| match segment {
+            PolylineSegment::Line { start, end } => point(start) & point(end),
+            PolylineSegment::Arc {
+                start,
+                end,
+                center,
+                radius,
+                ..
+            } => {
+                point(start) & point(end) & point(center) & {
+                    *radius *= scale;
+                    radius.is_finite() && *radius > 0.0
+                }
+            }
+        }),
+        Geometry::Circle(circle) => point(&mut circle.center) & radius(&mut circle.radius),
+        Geometry::Arc(arc) => point(&mut arc.center) & radius(&mut arc.radius),
+        Geometry::Ellipse(ellipse) => {
+            ellipse.major_axis = ellipse.major_axis * scale;
+            ellipse.minor_axis = ellipse.minor_axis * scale;
+            point(&mut ellipse.center)
+                && [
+                    ellipse.major_axis.x,
+                    ellipse.major_axis.y,
+                    ellipse.major_axis.z,
+                    ellipse.minor_axis.x,
+                    ellipse.minor_axis.y,
+                    ellipse.minor_axis.z,
+                ]
+                .iter()
+                .all(|value| value.is_finite())
+        }
+        Geometry::Spline(spline) => spline
+            .control_points
+            .iter_mut()
+            .chain(&mut spline.fit_points)
+            .all(point),
     }
 }
 
@@ -551,6 +658,7 @@ fn convert_units(insunits: i16, report: &mut ImportReport) -> Option<LengthUnit>
 fn ensure_layer(
     layers: &mut Vec<Layer>,
     layer_ids: &mut HashMap<String, LayerId>,
+    layer_identities: &mut BTreeMap<String, LayerId>,
     name: &str,
     report: &mut ImportReport,
 ) -> LayerId {
@@ -559,7 +667,8 @@ fn ensure_layer(
         return *id;
     }
 
-    let id = LayerId(layers.len() as u32);
+    let next_id = LayerId(layer_identities.len() as u32);
+    let id = *layer_identities.entry(key.clone()).or_insert(next_id);
     layers.push(Layer {
         id,
         name: name.to_string(),

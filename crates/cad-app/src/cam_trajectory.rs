@@ -24,6 +24,8 @@ pub struct TransferConfig {
     pub auto_height: bool,
     pub rise_ratio: f64,
     pub fall_ratio: f64,
+    pub smooth_enabled: bool,
+    pub smooth_tolerance: f64,
 }
 
 impl Default for TransferConfig {
@@ -36,6 +38,8 @@ impl Default for TransferConfig {
             auto_height: false,
             rise_ratio: 0.5,
             fall_ratio: 0.5,
+            smooth_enabled: false,
+            smooth_tolerance: 0.05,
         }
     }
 }
@@ -56,11 +60,15 @@ impl TransferConfig {
             self.height,
             self.rise_ratio,
             self.fall_ratio,
+            self.smooth_tolerance,
         ]
         .iter()
         .all(|v| v.is_finite())
         {
             return Some("联动转移参数必须为有限数值");
+        }
+        if self.smooth_tolerance <= 0.0 {
+            return Some("平滑允许偏差必须大于零");
         }
         if self.retract_height < 0.0 || self.approach_height < 0.0 || self.height < 0.0 {
             return Some("联动抬落刀高度不能为负数");
@@ -91,7 +99,7 @@ pub struct RotaryConfig {
     pub return_position: Option<MachinePose>,
     pub overcut_distance: f64,
     pub keep_continuous_angle: bool,
-    pub feed: f64,
+    pub output_decimals: usize,
 }
 
 impl Default for RotaryConfig {
@@ -108,7 +116,7 @@ impl Default for RotaryConfig {
             return_position: None,
             overcut_distance: 0.0,
             keep_continuous_angle: true,
-            feed: 1000.0,
+            output_decimals: 3,
         }
     }
 }
@@ -492,6 +500,7 @@ pub fn build_trajectory(
                 local,
                 config.transfer,
                 config.same_zone_clearance,
+                config.output_decimals,
             ));
             if let Some(arc) = arc_cut_info(
                 display,
@@ -605,6 +614,7 @@ pub fn build_trajectory(
             false,
             config.transfer,
             config.same_zone_clearance,
+            config.output_decimals,
         ));
         if let Some(last_range) = unit_ranges.last_mut() {
             last_range.end = moves.len();
@@ -747,7 +757,7 @@ fn align_entry_angle(previous: f64, target: f64, continuous: bool) -> f64 {
     }
 }
 
-fn push_rapid(moves: &mut Vec<MachineMove>, pose: MachinePose) {
+pub(crate) fn push_rapid(moves: &mut Vec<MachineMove>, pose: MachinePose) {
     if moves
         .last()
         .map(|last| {
@@ -776,6 +786,7 @@ pub fn transfer_moves(
     local: bool,
     config: TransferConfig,
     legacy_clearance: f64,
+    output_decimals: usize,
 ) -> Vec<MachineMove> {
     let mut moves = Vec::new();
     if config.validation_error().is_some()
@@ -784,6 +795,7 @@ pub fn transfer_moves(
         || start.is_some_and(|p| !finite_pose(p))
         || !legacy_clearance.is_finite()
         || legacy_clearance < 0.0
+        || output_decimals > 9
     {
         return moves;
     }
@@ -803,6 +815,18 @@ pub fn transfer_moves(
         a: align_entry_angle(start.a, end.a, false),
         ..end
     };
+    if config.smooth_enabled {
+        if let Some(smoothed) = crate::cam_transfer::smooth_transfer(
+            start,
+            end,
+            safe_z,
+            local && (start.a - end.a).abs() <= 1.0e-6,
+            config,
+            output_decimals,
+        ) {
+            return smoothed;
+        }
+    }
     if local && (start.a - end.a).abs() <= 1.0e-6 {
         let distance = (end.x - start.x).hypot(end.y - start.y);
         if config.enabled && distance > 1.0e-9 {
@@ -904,14 +928,13 @@ fn valid_config(config: RotaryConfig) -> bool {
         config.rotation_safety_clearance,
         config.same_zone_clearance,
         config.overcut_distance,
-        config.feed,
     ]
     .iter()
     .all(|value| value.is_finite())
         && config.rotation_safety_clearance >= 0.0
         && config.same_zone_clearance >= 0.0
         && config.overcut_distance >= 0.0
-        && config.feed > 0.0
+        && config.output_decimals <= 9
         && config.transfer.validation_error().is_none()
         && config
             .initial_position
@@ -991,6 +1014,7 @@ fn build_without_tube_section(
                 false,
                 config.transfer,
                 config.same_zone_clearance,
+                config.output_decimals,
             ));
             for point in path.iter().skip(1) {
                 moves.push(MachineMove {
@@ -1023,6 +1047,7 @@ fn build_without_tube_section(
             false,
             config.transfer,
             config.same_zone_clearance,
+            config.output_decimals,
         ));
         if let Some(last_range) = unit_ranges.last_mut() {
             last_range.end = moves.len();

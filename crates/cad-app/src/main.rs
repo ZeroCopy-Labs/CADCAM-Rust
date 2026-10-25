@@ -19,11 +19,16 @@ use bevy::{
 };
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
-use cad_core::read_document;
+use cad_core::{DrawingChange, DrawingEdit};
+use cad_file::open_drawing;
 
+mod cad_command;
+mod cad_edit;
+mod cad_file;
 mod cam;
 mod cam_analysis;
 mod cam_trajectory;
+mod cam_transfer;
 mod cam_wall;
 mod display;
 mod gcode;
@@ -39,6 +44,11 @@ const PICK_TOLERANCE: f32 = 12.0;
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
 struct ViewerState {
+    drawing: Option<cad_core::EditableDrawing>,
+    file_ui: cad_file::FileState,
+    cad_controls: cad_edit::EditControls,
+    cad_command: cad_command::CommandState,
+    cad_history: BTreeMap<u64, CadUndoState>,
     file_name: String,
     format: String,
     version: String,
@@ -55,8 +65,7 @@ struct ViewerState {
     gcode_profile: gcode::GCodeProfile,
     gcode_settings_message: String,
     gcode_settings_error: bool,
-    transfer_example_distance: f64,
-    transfer_example_delta_z: f64,
+    transfer_example: TransferExample,
     gcode_settings_open: bool,
     gcode_settings_tab: usize,
     gcode_selected_type: String,
@@ -69,6 +78,24 @@ struct ViewerState {
     command_focus: bool,
     command_input: String,
     load_version: u64,
+}
+
+struct CadUndoState {
+    selected: BTreeSet<u32>,
+    cam_selected: BTreeSet<cam::UnitId>,
+    machining: Option<(
+        cam_analysis::CamAnalysis,
+        cam_analysis::TubeSection,
+        [Option<cam::UnitId>; 2],
+    )>,
+}
+
+#[derive(Default)]
+struct TransferExample {
+    distance: f64,
+    delta_z: f64,
+    cross_zone: bool,
+    delta_a: f64,
 }
 
 /// Orbit camera state, independent from the loaded drawing.
@@ -161,7 +188,11 @@ fn main() {
     let gcode_path = gcode_config_path();
     let mut state = ViewerState {
         recent: load_recent(),
-        transfer_example_distance: 100.0,
+        transfer_example: TransferExample {
+            distance: 100.0,
+            delta_a: 90.0,
+            ..Default::default()
+        },
         gcode_profile: gcode::GCodeProfile::load_or_create(&gcode_path),
         ..Default::default()
     };
@@ -171,6 +202,19 @@ fn main() {
         "视角：Shift+中键旋转 | 中键拖动平移 | 滚轮缩放 | 右上角魔方切换",
     );
     push_message(&mut state, format!("G代码配置：{}", gcode_path.display()));
+    if std::fs::read_dir(cad_file::recovery_directory()).is_ok_and(|entries| {
+        entries.filter_map(std::result::Result::ok).any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dxf"))
+        })
+    }) {
+        push_message(
+            &mut state,
+            "发现图纸恢复快照，可通过“文件 → 恢复图纸快照…”打开",
+        );
+    }
     if !initial_path.trim().is_empty() {
         open_drawing(&mut state, &initial_path);
     }
@@ -184,6 +228,7 @@ fn main() {
                     ..default()
                 })
                 .set(WindowPlugin {
+                    close_when_requested: false,
                     primary_window: Some(Window {
                         title: "CAD/CAM — Bevy Viewer".to_string(),
                         resolution: (1280, 800).into(),
@@ -210,6 +255,8 @@ fn main() {
                 update_camera,
                 selection_input,
                 draw_scene,
+                cad_file::maintain_recovery,
+                cad_file::close_requested,
             )
                 .chain(),
         )
@@ -242,79 +289,6 @@ fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
     selected.line.width = 3.5;
 }
 
-fn open_drawing(state: &mut ViewerState, raw_path: &str) {
-    let path = normalize_path(raw_path);
-    if path.is_empty() {
-        push_message(state, "请输入 DXF/DWG 路径");
-        return;
-    }
-
-    push_message(state, format!("正在读取 {path}"));
-    match read_document(&path) {
-        Ok(document) => {
-            let display = display::build_display(&document);
-            let cam_model = cam::build_cam_model(&document);
-            let mut analysis = cam_analysis::CamAnalysis::build(&display, &cam_model);
-            analysis.set_machine_start(
-                &display,
-                &cam_model,
-                [
-                    state.gcode_profile.initial_x,
-                    state.gcode_profile.initial_y,
-                    state.gcode_profile.initial_z,
-                ],
-            );
-            let trajectory = Some(cam_trajectory::build_trajectory(
-                &display,
-                &cam_model,
-                &analysis,
-                state.gcode_profile.rotary_config(),
-            ));
-            state.file_name = document.source.file_name.clone();
-            state.format = document.source.format.to_string();
-            state.version = document.source.version.clone();
-            state.unit = document
-                .units
-                .map(|unit| unit.to_string())
-                .unwrap_or_else(|| "未指定".to_string());
-            state.entity_count = document.entity_count();
-            state.layer_count = document.layers.len();
-            state.warning_count = document.import_report.warnings.len();
-            state.display = display;
-            state.cam = cam_model;
-            state.analysis = analysis;
-            state.manual_pair = [None, None];
-            state.trajectory = trajectory;
-            state.load_version += 1;
-            state.fit_dirty = true;
-
-            push_message(state, format!("已加载 {} 个实体", state.entity_count));
-            push_message(
-                state,
-                format!(
-                    "生成 {} 个加工单元 | 实体 {} | 图层 {} | {} | {} | {} | 警告 {}",
-                    state.cam.units.len(),
-                    state.entity_count,
-                    state.layer_count,
-                    state.format,
-                    state.version,
-                    state.unit,
-                    state.warning_count
-                ),
-            );
-
-            let mut recent_path = PathBuf::from(&path);
-            if !recent_path.is_absolute() {
-                recent_path = env::current_dir().unwrap_or_default().join(recent_path);
-            }
-            remember_recent(state, &recent_path);
-        }
-        Err(error) => {
-            push_message(state, format!("读取失败：{error}"));
-        }
-    }
-}
-
 fn push_message(state: &mut ViewerState, message: impl Into<String>) {
     state.messages.push(message.into());
     if state.messages.len() > MESSAGE_LIMIT {
@@ -322,13 +296,83 @@ fn push_message(state: &mut ViewerState, message: impl Into<String>) {
     }
 }
 
-/// Current command implementation: only echo the entered text.
-fn submit_command(state: &mut ViewerState, raw: &str) {
+fn submit_command(
+    state: &mut ViewerState,
+    selection: &mut SelectionState,
+    mode: SpaceMode,
+    raw: &str,
+) {
     let command = raw.trim();
-    if command.is_empty() {
+    let upper = command.to_uppercase();
+    if matches!(upper.as_str(), "CANCEL" | "取消") {
+        state.cad_command.cancel();
+        state.command_input.clear();
+        push_message(state, "已取消命令，图纸未改动");
         return;
     }
-    push_message(state, command.to_string());
+    if mode != SpaceMode::Cad {
+        push_message(state, "CAD 命令请在 CAD 工作区执行");
+        return;
+    }
+    if state.drawing.is_none() {
+        push_message(state, "请先打开或新建图纸");
+        return;
+    }
+    let was_active = state.cad_command.is_active();
+    let result = if was_active {
+        state.cad_command.input(command, &selection.selected)
+    } else {
+        match upper.as_str() {
+            "MOVE" | "M" | "移动" => {
+                state.command_input.clear();
+                state.cad_command.begin_move(&selection.selected);
+                Ok(None)
+            }
+            "UNDO" | "U" | "撤销" => {
+                apply_cad_action(state, selection, cad_edit::EditAction::Undo);
+                Ok(None)
+            }
+            "REDO" | "重做" => {
+                apply_cad_action(state, selection, cad_edit::EditAction::Redo);
+                Ok(None)
+            }
+            "" => return,
+            _ if upper.starts_with("UCS ") => state
+                .cad_command
+                .set_preset(upper[4..].trim())
+                .map(|_| None),
+            _ => Err("可用命令：MOVE / M、UCS XY / YZ / ZX / 3P、UNDO、REDO".into()),
+        }
+    };
+    match result {
+        Ok(Some(commit)) => {
+            selection.selected = commit.ids;
+            if apply_cad_action(
+                state,
+                selection,
+                cad_edit::EditAction::Apply(DrawingEdit::Translate(commit.offset)),
+            ) {
+                state.cad_command.cancel();
+            } else {
+                state.cad_command.error = "移动未提交，请修改目标坐标或取消".into();
+            }
+        }
+        Ok(None) => {
+            state.cad_command.error.clear();
+            if !state.cad_command.is_active() && (was_active || upper.starts_with("UCS ")) {
+                push_message(state, "工作平面已设置，图元坐标保持不变");
+            }
+        }
+        Err(error) => {
+            state.cad_command.error = error.clone();
+            state.command_input = command.to_string();
+            push_message(state, error);
+        }
+    }
+    if state.cad_command.is_active() {
+        state.command_open = true;
+        push_message(state, state.cad_command.prompt());
+    }
 }
 
 /// Orbit/pan/zoom controls for the 3D view.
@@ -535,6 +579,9 @@ fn draw_scene(
     mut selected_gizmos: Gizmos<SelectedGizmos>,
     mut negative_axes: Gizmos<DashedAxisGizmos>,
 ) {
+    let preview = (space.mode == SpaceMode::Cad)
+        .then(|| state.cad_command.preview())
+        .flatten();
     for path in &state.display.paths {
         let unit = state.cam.unit_for_entity(path.entity_id);
         let is_selected = match space.mode {
@@ -559,17 +606,35 @@ fn draw_scene(
                 gizmos.line(start, end, color);
             }
         }
+        if let Some(preview) = preview
+            .as_ref()
+            .filter(|preview| preview.ids.contains(&path.entity_id))
+        {
+            for pair in path.points.windows(2) {
+                let start =
+                    to_render_point(std::array::from_fn(|i| pair[0][i] + preview.offset[i]));
+                let end = to_render_point(std::array::from_fn(|i| pair[1][i] + preview.offset[i]));
+                if start.is_finite() && end.is_finite() {
+                    selected_gizmos.line(start, end, Color::srgb(0.15, 1.0, 1.0));
+                }
+            }
+        }
     }
 
-    let Some(bounds) = state.display.bounds else {
-        return;
-    };
-
     // Keep the axes at the CAD world origin, never at the drawing center.
-    let extent = ((bounds.max_x - bounds.min_x)
-        .max(bounds.max_y - bounds.min_y)
-        .max(bounds.max_z - bounds.min_z)
-        .max(1.0)) as f32;
+    let extent = state
+        .display
+        .bounds
+        .map(|bounds| {
+            ((bounds.max_x - bounds.min_x)
+                .max(bounds.max_y - bounds.min_y)
+                .max(bounds.max_z - bounds.min_z)
+                .max(1.0)) as f32
+        })
+        .unwrap_or(100.0);
+    if space.mode == SpaceMode::Cad {
+        state.cad_command.draw_plane(&mut gizmos, extent as f64);
+    }
     let axis = extent * 0.6;
     let z_axis = axis * 0.5;
     let red = Color::srgb(0.85, 0.25, 0.25);
@@ -621,6 +686,7 @@ fn selection_input(
     selection.cam_selected.retain(|id| valid_units.contains(id));
 
     let Some(cursor) = window.cursor_position() else {
+        state.cad_command.clear_hover();
         return Ok(());
     };
     let context = contexts.ctx_mut()?;
@@ -628,6 +694,7 @@ fn selection_input(
         || context.egui_wants_pointer_input()
         || context.egui_is_using_pointer();
     if ui_active {
+        state.cad_command.clear_hover();
         // A click that starts on the panel resize handle must be owned by the
         // panel, even if the first press frame already reached this system.
         selection.drag_start = None;
@@ -636,6 +703,26 @@ fn selection_input(
         return Ok(());
     }
     let (camera, camera_transform) = camera.into_inner();
+    if space.mode == SpaceMode::Cad
+        && state.cad_command.is_active()
+        && !state.cad_command.selecting()
+    {
+        let accepted = state.cad_command.viewport_point(
+            camera,
+            camera_transform,
+            cursor,
+            mouse.just_pressed(MouseButton::Left),
+        );
+        if accepted {
+            state.command_input.clear();
+            if !state.cad_command.is_active() {
+                push_message(&mut state, "工作平面已按三点设置，图元坐标保持不变");
+            }
+        }
+        selection.drag_start = None;
+        selection.drag_current = None;
+        return Ok(());
+    }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if !ctrl {
         selection.reorder_clicks = None;
@@ -1838,7 +1925,80 @@ fn drawing_ui(
     install_cjk_font(context, &mut fonts_loaded);
     context.set_visuals(egui::Visuals::dark());
 
+    let mut command_request = None;
+    if !state.gcode_settings_open && !state.file_ui.report_open {
+        let wants_keyboard = context.egui_wants_keyboard_input();
+        context.input_mut(|input| {
+            if state.cad_command.is_active()
+                && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            {
+                command_request = Some("CANCEL".to_string());
+            } else if !wants_keyboard {
+                if state.cad_command.is_active()
+                    && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                {
+                    command_request = Some(String::new());
+                } else if space.mode == SpaceMode::Cad
+                    && !state.cad_command.is_active()
+                    && input.consume_key(egui::Modifiers::CTRL, egui::Key::M)
+                {
+                    command_request = Some("MOVE".to_string());
+                }
+            }
+        });
+    }
+    let mut export_dxf = false;
+    let mut new_drawing = false;
+    let mut save_drawing = false;
+    let mut save_as = false;
+    let mut close_drawing = false;
+    let mut recover_drawing = false;
     let mut open_dialog = false;
+    if !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !context.egui_wants_keyboard_input()
+    {
+        context.input_mut(|input| {
+            new_drawing = input.consume_key(egui::Modifiers::CTRL, egui::Key::N);
+            open_dialog = input.consume_key(egui::Modifiers::CTRL, egui::Key::O);
+            save_as =
+                input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::S);
+            save_drawing = save_as || input.consume_key(egui::Modifiers::CTRL, egui::Key::S);
+            if state.cad_command.is_active() {
+                save_drawing = false;
+            }
+        });
+    }
+    let mut cad_action = None;
+    let mut select_all = false;
+    if space.mode == SpaceMode::Cad
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !context.egui_wants_keyboard_input()
+    {
+        context.input_mut(|input| {
+            if !state.cad_command.is_active()
+                && (input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                    || input.consume_key(egui::Modifiers::CTRL, egui::Key::Y))
+            {
+                cad_action = Some(cad_edit::EditAction::Redo);
+            } else if !state.cad_command.is_active()
+                && input.consume_key(egui::Modifiers::CTRL, egui::Key::Z)
+            {
+                cad_action = Some(cad_edit::EditAction::Undo);
+            }
+            if (!state.cad_command.is_active() || state.cad_command.selecting())
+                && input.consume_key(egui::Modifiers::CTRL, egui::Key::A)
+            {
+                select_all = true;
+            }
+            if !state.cad_command.is_active()
+                && input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+            {
+                cad_action = Some(cad_edit::EditAction::Apply(DrawingEdit::Delete));
+            }
+        });
+    }
     let mut export_gcode = false;
     let mut quick_export_gcode = false;
     let mut pending_path: Option<PathBuf> = None;
@@ -1846,7 +2006,19 @@ fn drawing_ui(
     let current_name = if state.file_name.is_empty() {
         "未打开文件".to_string()
     } else {
-        state.file_name.clone()
+        format!(
+            "{}{}",
+            state.file_name,
+            if state
+                .drawing
+                .as_ref()
+                .is_some_and(|drawing| drawing.is_modified())
+            {
+                " *"
+            } else {
+                ""
+            }
+        )
     };
 
     let mut root = egui::Ui::new(
@@ -1860,13 +2032,73 @@ fn drawing_ui(
     let menu_panel = egui::Panel::top("menu_bar").show(&mut root, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("文件", |ui| {
-                if ui.button("打开文件").clicked() {
+                if ui.button("新建图纸  Ctrl+N").clicked() {
+                    new_drawing = true;
+                    ui.close();
+                }
+                if ui.button("打开文件  Ctrl+O").clicked() {
                     open_dialog = true;
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("快速导出到 build").clicked() {
+                if ui
+                    .add_enabled(
+                        state.drawing.is_some() && !state.cad_command.is_active(),
+                        egui::Button::new("保存  Ctrl+S"),
+                    )
+                    .clicked()
+                {
+                    save_drawing = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        state.drawing.is_some() && !state.cad_command.is_active(),
+                        egui::Button::new("另存为 DXF…  Ctrl+Shift+S"),
+                    )
+                    .clicked()
+                {
+                    save_drawing = true;
+                    save_as = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        state.drawing.is_some() && !state.cad_command.is_active(),
+                        egui::Button::new("导出 DXF…"),
+                    )
+                    .clicked()
+                {
+                    export_dxf = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !state.cad_command.is_active(),
+                        egui::Button::new("快速导出到 build"),
+                    )
+                    .clicked()
+                {
                     quick_export_gcode = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(state.drawing.is_some(), egui::Button::new("导入报告"))
+                    .clicked()
+                {
+                    state.file_ui.report_open = true;
+                    ui.close();
+                }
+                if ui.button("恢复图纸快照…").clicked() {
+                    recover_drawing = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(state.drawing.is_some(), egui::Button::new("关闭图纸"))
+                    .clicked()
+                {
+                    close_drawing = true;
                     ui.close();
                 }
                 ui.separator();
@@ -1887,6 +2119,73 @@ fn drawing_ui(
                                 ui.close();
                             }
                         }
+                    }
+                });
+                ui.separator();
+                if ui.button("退出").clicked() {
+                    state.file_ui.exit_requested = true;
+                    ui.close();
+                }
+            });
+            ui.add_enabled_ui(space.mode == SpaceMode::Cad, |ui| {
+                ui.menu_button("编辑", |ui| {
+                    if ui
+                        .add_enabled(
+                            state.drawing.is_some() && !state.cad_command.is_active(),
+                            egui::Button::new("基点 → 目标点移动  Ctrl+M"),
+                        )
+                        .clicked()
+                    {
+                        command_request = Some("MOVE".into());
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            state
+                                .drawing
+                                .as_ref()
+                                .is_some_and(|drawing| drawing.can_undo())
+                                && !state.cad_command.is_active(),
+                            egui::Button::new("撤销  Ctrl+Z"),
+                        )
+                        .clicked()
+                    {
+                        cad_action = Some(cad_edit::EditAction::Undo);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            state
+                                .drawing
+                                .as_ref()
+                                .is_some_and(|drawing| drawing.can_redo())
+                                && !state.cad_command.is_active(),
+                            egui::Button::new("重做  Ctrl+Y / Ctrl+Shift+Z"),
+                        )
+                        .clicked()
+                    {
+                        cad_action = Some(cad_edit::EditAction::Redo);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !state.cad_command.is_active() || state.cad_command.selecting(),
+                            egui::Button::new("全选  Ctrl+A"),
+                        )
+                        .clicked()
+                    {
+                        select_all = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !selection.selected.is_empty() && !state.cad_command.is_active(),
+                            egui::Button::new("删除所选  Delete"),
+                        )
+                        .clicked()
+                    {
+                        cad_action = Some(cad_edit::EditAction::Apply(DrawingEdit::Delete));
+                        ui.close();
                     }
                 });
             });
@@ -1911,24 +2210,61 @@ fn drawing_ui(
                     ui.close();
                 }
             });
-            if ui.button("导出 G 代码").clicked() {
+            if ui
+                .add_enabled(
+                    !state.cad_command.is_active(),
+                    egui::Button::new("导出 G 代码"),
+                )
+                .clicked()
+            {
                 export_gcode = true;
             }
             if ui.button("G代码配置").clicked() {
                 state.gcode_settings_open = true;
             }
             ui.separator();
+            let old_mode = space.mode;
             space_switch_ui(ui, &mut space, &mut selection, &state.cam);
+            if old_mode != space.mode {
+                state.cad_command.cancel();
+                state.command_input.clear();
+            }
             ui.separator();
             ui.add(egui::Label::new(&current_name).truncate());
         });
     });
     let menu_rect = menu_panel.response.rect;
+    if select_all {
+        selection.selected = state
+            .display
+            .entities
+            .iter()
+            .map(|entity| entity.id)
+            .collect();
+    }
+    if let Some(command) = command_request.take() {
+        submit_command(&mut state, &mut selection, space.mode, &command);
+        state.command_focus = state.cad_command.is_active();
+    }
+    if state.cad_command.is_active() {
+        state.command_open = true;
+        if !context.egui_wants_keyboard_input()
+            && context.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Text(_)))
+            })
+        {
+            state.command_focus = true;
+        }
+    }
     let command_dimensions = state.command_open.then(|| {
         let history_lines = state.messages.len().min(COMMAND_MAX_HISTORY_LINES);
         let history_height = history_lines as f32 * COMMAND_ROW_HEIGHT;
-        let total_height =
-            (history_lines + 1) as f32 * COMMAND_ROW_HEIGHT + COMMAND_VERTICAL_PADDING;
+        let total_height = (history_lines + 1 + usize::from(state.cad_command.is_active())) as f32
+            * COMMAND_ROW_HEIGHT
+            + COMMAND_VERTICAL_PADDING;
         (total_height, history_height)
     });
     let mut command_panel = egui::Panel::bottom("command_line").frame(
@@ -1958,11 +2294,26 @@ fn drawing_ui(
             }
 
             let focus_input = std::mem::take(&mut state.command_focus);
+            if state.cad_command.is_active() {
+                let status = format!(
+                    "{} {}",
+                    state.cad_command.prompt(),
+                    state.cad_command.error_message()
+                );
+                ui.add(egui::Label::new(&status).truncate())
+                    .on_hover_text(status);
+            }
+            let input_id = egui::Id::new("cad_command_input");
+            if focus_input {
+                ui.memory_mut(|memory| memory.request_focus(input_id));
+            }
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 let response = ui.add_sized(
                     egui::Vec2::new(ui.available_width(), COMMAND_ROW_HEIGHT - 2.0),
-                    egui::TextEdit::singleline(&mut state.command_input).hint_text("输入命令"),
+                    egui::TextEdit::singleline(&mut state.command_input)
+                        .id(input_id)
+                        .hint_text("MOVE / UCS；坐标 x,y,z / u,v；相对 @；极坐标 @长度<角度"),
                 );
                 if focus_input {
                     response.request_focus();
@@ -1970,7 +2321,7 @@ fn drawing_ui(
                 let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
                 if enter && (response.has_focus() || response.lost_focus()) {
                     let command = std::mem::take(&mut state.command_input);
-                    submit_command(&mut state, &command);
+                    submit_command(&mut state, &mut selection, space.mode, &command);
                     response.request_focus();
                 }
             });
@@ -2010,22 +2361,41 @@ fn drawing_ui(
 
             match space.mode {
                 SpaceMode::Cad => {
-                    let selected_entities: Vec<&display::DisplayEntity> = state
-                        .display
-                        .entities
-                        .iter()
-                        .filter(|entity| selection.selected.contains(&entity.id))
-                        .collect();
-
-                    if selected_entities.is_empty() {
-                        ui.label("未选择图元");
-                        ui.label("左键点选 / 拖拽框选");
-                        ui.label("Shift + 左键追加选择");
-                    } else {
-                        ui.label(format!("已选择 {} 个图元", selected_entities.len()));
-                        ui.separator();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            if selected_entities.len() == 1 {
+                    egui::ScrollArea::vertical()
+                        .id_salt("cad_features")
+                        .show(ui, |ui| {
+                            if state.drawing.is_some() {
+                                if let Some(command) = state.cad_command.controls_ui(ui) {
+                                    command_request = Some(command);
+                                }
+                            }
+                            let editing_enabled = !state.cad_command.is_active();
+                            let ViewerState {
+                                drawing,
+                                cad_controls,
+                                ..
+                            } = &mut *state;
+                            if let Some(drawing) = drawing.as_ref() {
+                                ui.add_enabled_ui(editing_enabled, |ui| {
+                                    if let Some(action) = cad_edit::editing_ui(
+                                        ui,
+                                        drawing.document(),
+                                        &selection.selected,
+                                        cad_controls,
+                                    ) {
+                                        cad_action = Some(action);
+                                    }
+                                });
+                            }
+                            let selected_entities: Vec<_> = state
+                                .display
+                                .entities
+                                .iter()
+                                .filter(|entity| selection.selected.contains(&entity.id))
+                                .collect();
+                            if selected_entities.is_empty() {
+                                ui.label("左键点选 / 拖拽框选；Shift 追加选择");
+                            } else if selected_entities.len() == 1 {
                                 entity_info_ui(ui, selected_entities[0], "single");
                             } else {
                                 for entity in selected_entities {
@@ -2039,7 +2409,6 @@ fn drawing_ui(
                                 }
                             }
                         });
-                    }
                 }
                 SpaceMode::Cam => {
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2147,6 +2516,16 @@ fn drawing_ui(
         });
 
     let feature_rect = feature_panel.response.rect;
+    if let Some(command) = command_request {
+        submit_command(&mut state, &mut selection, space.mode, &command);
+        state.command_open = true;
+        state.command_focus = state.cad_command.is_active();
+    }
+    if let Some(action) = cad_action {
+        if space.mode == SpaceMode::Cad && !state.cad_command.is_active() {
+            apply_cad_action(&mut state, &mut selection, action);
+        }
+    }
 
     let mut cam_input_changed = false;
     let mut pairing_error = None;
@@ -2263,7 +2642,7 @@ fn drawing_ui(
         }
     }
 
-    if state.command_open {
+    if state.command_open && !state.cad_command.is_active() {
         let clicked = context.input(|input| input.pointer.any_click());
         let pointer = context.input(|input| input.pointer.interact_pos());
         if clicked {
@@ -2275,6 +2654,24 @@ fn drawing_ui(
         }
     }
 
+    if state.cad_command.is_active() {
+        save_drawing = false;
+        export_dxf = false;
+        export_gcode = false;
+        quick_export_gcode = false;
+    }
+    if new_drawing {
+        cad_file::new_drawing(&mut state);
+    }
+    if save_drawing {
+        cad_file::save_drawing(&mut state, save_as);
+    }
+    if close_drawing {
+        cad_file::close_drawing(&mut state);
+    }
+    if recover_drawing {
+        cad_file::recover_drawing(&mut state);
+    }
     if open_dialog {
         if let Some(path) = choose_drawing_file(&state) {
             pending_path = Some(path);
@@ -2282,6 +2679,9 @@ fn drawing_ui(
     }
     if let Some(path) = pending_path {
         open_drawing(&mut state, &path.to_string_lossy());
+    }
+    if export_dxf {
+        export_dxf_file(&mut state);
     }
     if export_gcode {
         export_gcode_file(&mut state);
@@ -2316,6 +2716,7 @@ fn drawing_ui(
     if state.gcode_settings_open {
         gcode_settings_ui(context, &mut state);
     }
+    cad_file::import_report_ui(context, &mut state);
 
     let pointer = context.input(|input| input.pointer.hover_pos());
     let over_panels = pointer
@@ -2326,6 +2727,7 @@ fn drawing_ui(
         })
         .unwrap_or(false);
     ui_state.pointer_over_ui = state.gcode_settings_open
+        || state.file_ui.report_open
         || over_panels
         || context.egui_is_using_pointer()
         || context.egui_wants_pointer_input();
@@ -2831,13 +3233,6 @@ fn gcode_file_tab(ui: &mut egui::Ui, profile: &mut gcode::GCodeProfile) {
                             ui.text_edit_singleline(value).on_hover_text(hint);
                             ui.end_row();
                         }
-                        gcode_number_row(
-                            ui,
-                            "进给速度",
-                            &mut profile.feed,
-                            1.0,
-                            "切削移动使用的进给速度 F，必须大于零",
-                        );
                         ui.label("小数位")
                             .on_hover_text("输出坐标的小数位数，范围为 0–9");
                         ui.add(egui::DragValue::new(&mut profile.decimals).range(0..=9));
@@ -2890,8 +3285,7 @@ fn gcode_number_row(ui: &mut egui::Ui, label: &str, value: &mut f64, speed: f64,
 fn gcode_safety_tab(ui: &mut egui::Ui, state: &mut ViewerState) {
     let ViewerState {
         gcode_profile: profile,
-        transfer_example_distance,
-        transfer_example_delta_z,
+        transfer_example,
         ..
     } = state;
     ui.columns(2, |columns| {
@@ -2949,8 +3343,8 @@ fn gcode_safety_tab(ui: &mut egui::Ui, state: &mut ViewerState) {
         transfer_diagram_ui(
             &mut columns[1],
             &profile.transfer,
-            transfer_example_distance,
-            transfer_example_delta_z,
+            transfer_example,
+            profile.decimals,
         );
     });
 }
@@ -3251,7 +3645,7 @@ fn transfer_settings_ui(ui: &mut egui::Ui, config: &mut cam_trajectory::Transfer
                 "进入下一加工单元前垂直落刀的最小高度",
             );
             ui.label("联动总高度")
-                .on_hover_text("相对两端较高点的峰值高度，不能小于最小抬刀和落刀高度");
+                .on_hover_text("同面为相对两端较高点的峰高；跨区位平滑时作为旋转净空上方的额外过渡高度。不能小于最小抬刀和落刀高度。");
             ui.add_enabled(
                 !config.auto_height,
                 egui::DragValue::new(&mut config.height).speed(0.1),
@@ -3281,17 +3675,36 @@ fn transfer_settings_ui(ui: &mut egui::Ui, config: &mut cam_trajectory::Transfer
         });
     ui.checkbox(&mut config.auto_height, "总高度取最小抬落高度的较大值")
         .on_hover_text("自动总高度不再单独读取联动总高度输入值");
+    ui.separator();
+    ui.checkbox(&mut config.smooth_enabled, "启用空移路径平滑（同区位 / 跨区位）")
+        .on_hover_text("最小安全抬落段保持竖直。同面需启用联动；跨区位在旋转净空以上增加过渡高度，XY/Z/A 联动后输出离散线段。空间不足时保留原路。");
+    ui.horizontal(|ui| {
+        ui.label("平滑允许偏差")
+            .on_hover_text("曲线离散及 XYZ 输出舍入的总允许偏差，必须大于输出精度产生的舍入误差");
+        ui.add_enabled(
+            config.smooth_enabled,
+            egui::DragValue::new(&mut config.smooth_tolerance).speed(0.01),
+        );
+    });
 }
 
 fn transfer_diagram_ui(
     ui: &mut egui::Ui,
     config: &cam_trajectory::TransferConfig,
-    distance: &mut f64,
-    delta_z: &mut f64,
+    example: &mut TransferExample,
+    decimals: usize,
 ) {
+    let TransferExample {
+        distance,
+        delta_z,
+        cross_zone,
+        delta_a,
+    } = example;
     ui.label("空移剖面示意").on_hover_text(
-        "横轴为 XY 行程，纵轴为 Z，非等比例；与实际转移共用计算，不代表速度平滑或碰撞验证",
+        "横轴为 XY 行程，纵轴为 Z，非等比例；与实际转移共用几何计算，不含控制器加减速或碰撞模型",
     );
+    ui.checkbox(cross_zone, "示例：跨区位转位")
+        .on_hover_text("仅切换示意。同面与跨区位使用相同的实际转移函数，示例参数不保存到工艺。");
     egui::Grid::new("transfer_example")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -3304,6 +3717,11 @@ fn transfer_diagram_ui(
                 .on_hover_text("仅用于右侧示意，不保存到配置");
             ui.add(egui::DragValue::new(delta_z).speed(0.1));
             ui.end_row();
+            if *cross_zone {
+                ui.label("示例 A 转角");
+                ui.add(egui::DragValue::new(delta_a).speed(1.0).suffix(" °"));
+                ui.end_row();
+            }
         });
     if let Some(error) = config.validation_error() {
         ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -3319,15 +3737,16 @@ fn transfer_diagram_ui(
         x: *distance,
         y: 0.0,
         z: *delta_z,
-        a: 0.0,
+        a: if *cross_zone { *delta_a } else { 0.0 },
     };
     let moves = cam_trajectory::transfer_moves(
         Some(start),
         end,
         config.total_height().max(*delta_z) + 1.0,
-        true,
+        !*cross_zone,
         *config,
         0.0,
+        decimals,
     );
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ui.available_height().max(80.0)),
@@ -3414,6 +3833,177 @@ fn rebuild_state_trajectory(state: &mut ViewerState) {
     ));
 }
 
+fn apply_cad_action(
+    state: &mut ViewerState,
+    selection: &mut SelectionState,
+    action: cad_edit::EditAction,
+) -> bool {
+    if state.drawing.is_none() {
+        return false;
+    }
+    match action {
+        cad_edit::EditAction::Apply(edit) => {
+            let before = capture_cad_context(state, selection, edit.changes_geometry());
+            match state
+                .drawing
+                .as_mut()
+                .unwrap()
+                .apply(&cad_edit::entity_ids(&selection.selected), edit)
+            {
+                Ok(None) => {
+                    push_message(state, "没有需要修改的图元");
+                    return true;
+                }
+                Ok(Some(change)) => {
+                    state.cad_history.insert(change.transaction_id, before);
+                    refresh_edited_drawing(state, change, None);
+                    selection.cam_selected.clear();
+                    let operation = match change.edit {
+                        DrawingEdit::SetColor(_) => "修改颜色",
+                        DrawingEdit::SetLayer(_) => "修改所属图层",
+                        DrawingEdit::Translate(_) => "三维移动",
+                        DrawingEdit::Delete => "删除",
+                    };
+                    push_message(
+                        state,
+                        format!(
+                            "已{operation} {} 个图元，可用 Ctrl+Z 撤销本次批量操作",
+                            change.affected
+                        ),
+                    );
+                    if change.edit.changes_geometry() {
+                        push_message(
+                            state,
+                            "已根据当前几何重建 CAM；手动断面、配对和排序需重新确认",
+                        );
+                    }
+                }
+                Err(error) => {
+                    push_message(state, format!("CAD 编辑失败：{error}"));
+                    return false;
+                }
+            }
+        }
+        cad_edit::EditAction::Undo | cad_edit::EditAction::Redo => {
+            let redo = matches!(action, cad_edit::EditAction::Redo);
+            let drawing = state.drawing.as_mut().unwrap();
+            let change = if redo { drawing.redo() } else { drawing.undo() };
+            let Some(change) = change else {
+                return false;
+            };
+            // Swap the context for this transaction so undo and redo stay symmetric.
+            let current = capture_cad_context(state, selection, change.edit.changes_geometry());
+            let restored = state
+                .cad_history
+                .insert(change.transaction_id, current)
+                .expect("every committed CAD transaction has an application context");
+            selection.selected = restored.selected;
+            selection.cam_selected = restored.cam_selected;
+            refresh_edited_drawing(state, change, restored.machining);
+            push_message(
+                state,
+                if redo {
+                    "已重做上一次 CAD 批量修改"
+                } else {
+                    "已撤销上一次 CAD 批量修改"
+                },
+            );
+        }
+    }
+    let retained: BTreeSet<_> = state.drawing.as_ref().unwrap().history_ids().collect();
+    state.cad_history.retain(|id, _| retained.contains(id));
+    let valid: BTreeSet<_> = state
+        .display
+        .entities
+        .iter()
+        .map(|entity| entity.id)
+        .collect();
+    selection.selected.retain(|id| valid.contains(id));
+    selection
+        .cam_selected
+        .retain(|id| state.cam.unit(*id).is_some());
+    selection.drag_start = None;
+    selection.drag_current = None;
+    selection.reorder_clicks = None;
+    state.cad_controls = cad_edit::EditControls::default();
+    true
+}
+
+fn capture_cad_context(
+    state: &ViewerState,
+    selection: &SelectionState,
+    geometry_changed: bool,
+) -> CadUndoState {
+    CadUndoState {
+        selected: selection.selected.clone(),
+        cam_selected: selection.cam_selected.clone(),
+        machining: geometry_changed.then(|| {
+            (
+                state.analysis.clone(),
+                state.manual_tube.clone(),
+                state.manual_pair,
+            )
+        }),
+    }
+}
+
+fn refresh_edited_drawing(
+    state: &mut ViewerState,
+    change: DrawingChange,
+    restored: Option<(
+        cam_analysis::CamAnalysis,
+        cam_analysis::TubeSection,
+        [Option<cam::UnitId>; 2],
+    )>,
+) {
+    let drawing = state.drawing.as_ref().unwrap();
+    let document = drawing.document();
+    state.display = display::build_display(document);
+    state.entity_count = document.entity_count();
+    state.layer_count = document.layers.len();
+    state.warning_count = document.import_report.warnings.len();
+    if change.edit.changes_geometry() {
+        state.cam = cam::build_cam_model(document);
+        if let Some((analysis, manual_tube, manual_pair)) = restored {
+            state.analysis = analysis;
+            state.manual_tube = manual_tube;
+            state.manual_pair = manual_pair;
+        } else {
+            let lazy = state.analysis.lazy_rotation;
+            let direction = state.analysis.rotation_direction;
+            state.analysis = cam_analysis::CamAnalysis::build(&state.display, &state.cam);
+            state
+                .analysis
+                .set_plan_options(lazy, direction, &state.display, &state.cam);
+            state.manual_pair = [None, None];
+        }
+    }
+    rebuild_state_trajectory(state);
+}
+
+fn export_dxf_file(state: &mut ViewerState) {
+    if state.drawing.is_none() {
+        return;
+    }
+    let stem = Path::new(&state.file_name)
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "drawing".to_string());
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出 CAD 图纸为 DXF")
+        .add_filter("DXF 图纸", &["dxf"])
+        .set_directory(dialog_directory(state))
+        .set_file_name(format!("{stem}-edited.dxf"))
+        .save_file()
+    else {
+        return;
+    };
+    match state.drawing.as_mut().unwrap().export_dxf(&path) {
+        Ok(()) => push_message(state, format!("已导出当前 CAD 图纸：{}", path.display())),
+        Err(error) => push_message(state, format!("DXF 导出失败：{error}")),
+    }
+}
+
 fn export_gcode_file(state: &mut ViewerState) {
     rebuild_state_trajectory(state);
     let Some(trajectory) = state.trajectory.as_ref() else {
@@ -3485,7 +4075,10 @@ fn quick_export_gcode_file(state: &mut ViewerState) {
 fn choose_drawing_file(state: &ViewerState) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("打开 CAD 图纸")
-        .add_filter("CAD 图纸 (*.dxf, *.dwg)", &["dxf", "dwg"])
+        .add_filter(
+            "CAD 图纸与备份 (*.dxf, *.dwg, *.bak)",
+            &["dxf", "dwg", "bak"],
+        )
         .set_directory(dialog_directory(state))
         .pick_file()
 }

@@ -230,20 +230,11 @@ fn color_to_rgb(color: Color) -> [f32; 3] {
     }
 }
 
-/// Small ACI lookup used by the viewer. Unknown indices fall back to gray.
+/// Resolve the complete ACI palette used by both DXF output and CAD editing.
 pub fn aci_color(index: u8) -> [f32; 3] {
-    match index {
-        1 => [1.00, 0.32, 0.32],
-        2 => [1.00, 0.84, 0.28],
-        3 => [0.36, 0.86, 0.42],
-        4 => [0.32, 0.84, 0.94],
-        5 => [0.42, 0.56, 1.00],
-        6 => [0.88, 0.44, 0.94],
-        7 => [0.92, 0.94, 0.98],
-        8 => [0.56, 0.60, 0.66],
-        9 => [0.72, 0.76, 0.82],
-        _ => [0.82, 0.86, 0.92],
-    }
+    cad_core::aci_color_rgb(index)
+        .map(|rgb| rgb.map(|value| f32::from(value) / 255.0))
+        .unwrap_or([0.82, 0.86, 0.92])
 }
 
 /// Type-specific table rows for the selection panel.

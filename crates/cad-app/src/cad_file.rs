@@ -1,0 +1,374 @@
+//! CAD file lifecycle, import diagnostics and recovery snapshots.
+
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bevy::{app::AppExit, prelude::*, window::WindowCloseRequested};
+use bevy_egui::egui;
+use cad_core::{read_editable_document, EditableDrawing, ImportReport, LengthUnit};
+
+use super::{
+    cam, cam_analysis, cam_trajectory, display, push_message, remember_recent, ViewerState,
+};
+
+#[derive(Default)]
+pub(super) struct FileState {
+    pub report_open: bool,
+    pub exit_requested: bool,
+    report: Option<ImportReport>,
+    report_name: String,
+    recovery_path: Option<PathBuf>,
+    recovery_revision: Option<u64>,
+    recovery_elapsed: f32,
+}
+
+pub(super) fn open_drawing(state: &mut ViewerState, raw_path: &str) {
+    let path = PathBuf::from(super::normalize_path(raw_path));
+    let backup = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bak"));
+    load_drawing(state, &path, backup);
+}
+
+fn load_drawing(state: &mut ViewerState, path: &Path, recovered: bool) {
+    if path.as_os_str().is_empty() || !confirm_replace(state) {
+        return;
+    }
+    push_message(state, format!("正在读取 {}", path.display()));
+    let mut drawing = match read_editable_document(path) {
+        Ok(drawing) => drawing,
+        Err(error) => {
+            push_message(state, format!("读取失败：{error}"));
+            return;
+        }
+    };
+    if drawing.document().source_units.is_none() {
+        let choice = rfd::MessageDialog::new()
+            .set_title("请选择无单位图纸的实际单位")
+            .set_description("图纸未声明有效单位。是：按毫米(mm)解释；否：按英寸(in)解释；取消：停止打开并保留当前图纸。工作区和加工尺寸统一为毫米。")
+            .set_buttons(rfd::MessageButtons::YesNoCancel).show();
+        let unit = match choice {
+            rfd::MessageDialogResult::Yes => LengthUnit::Millimeters,
+            rfd::MessageDialogResult::No => LengthUnit::Inches,
+            _ => return,
+        };
+        if let Err(error) = drawing.resolve_units(unit) {
+            push_message(state, error);
+            return;
+        }
+    }
+    if recovered {
+        drawing.mark_recovered();
+    }
+    install_drawing(state, Some(drawing));
+    if !recovered {
+        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        remember_recent(state, &absolute);
+    }
+    push_message(
+        state,
+        format!(
+            "已加载 {} 个图元、{} 个加工单元；{}。详情见“文件 → 导入报告”。",
+            state.entity_count,
+            state.cam.units.len(),
+            state.unit
+        ),
+    );
+    if recovered {
+        push_message(
+            state,
+            "已恢复备份或快照，请另存为 DXF；恢复不包含加工安排或撤销历史",
+        );
+    }
+}
+
+fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
+    clear_recovery(state);
+    state.file_ui.report = drawing
+        .as_ref()
+        .map(|drawing| drawing.document().import_report.clone());
+    state.file_ui.report_open = state.file_ui.report.as_ref().is_some_and(|report| {
+        !report.warnings.is_empty() || !report.skipped.is_empty() || report.skipped_omitted > 0
+    });
+    if let Some(document) = drawing.as_ref().map(EditableDrawing::document) {
+        state.file_name = document.source.file_name.clone();
+        state.file_ui.report_name = state.file_name.clone();
+        state.format = document.source.format.to_string();
+        state.version = document.source.version.clone();
+        state.unit = format!(
+            "工作 mm · 源 {}",
+            document
+                .source_units
+                .map(|unit| unit.to_string())
+                .unwrap_or_else(|| "未指定".into())
+        );
+        state.entity_count = document.entity_count();
+        state.layer_count = document.layers.len();
+        state.warning_count = document.import_report.warnings.len();
+        state.display = display::build_display(document);
+        state.cam = cam::build_cam_model(document);
+    } else {
+        state.file_name.clear();
+        state.format.clear();
+        state.version.clear();
+        state.unit.clear();
+        state.entity_count = 0;
+        state.layer_count = 0;
+        state.warning_count = 0;
+        state.display = Default::default();
+        state.cam = Default::default();
+    }
+    state.analysis = cam_analysis::CamAnalysis::build(&state.display, &state.cam);
+    state.analysis.set_machine_start(
+        &state.display,
+        &state.cam,
+        [
+            state.gcode_profile.initial_x,
+            state.gcode_profile.initial_y,
+            state.gcode_profile.initial_z,
+        ],
+    );
+    state.manual_tube = Default::default();
+    state.manual_pair = [None, None];
+    state.trajectory = drawing.as_ref().map(|_| {
+        cam_trajectory::build_trajectory(
+            &state.display,
+            &state.cam,
+            &state.analysis,
+            state.gcode_profile.rotary_config(),
+        )
+    });
+    state.drawing = drawing;
+    state.cad_controls = Default::default();
+    state.cad_command = Default::default();
+    state.command_input.clear();
+    state.cad_history.clear();
+    state.load_version += 1;
+    state.fit_dirty = true;
+}
+
+pub(super) fn new_drawing(state: &mut ViewerState) {
+    if confirm_replace(state) {
+        install_drawing(state, Some(EditableDrawing::blank()));
+        push_message(state, "已新建毫米图纸");
+    }
+}
+
+pub(super) fn close_drawing(state: &mut ViewerState) {
+    if confirm_replace(state) {
+        install_drawing(state, None);
+    }
+}
+
+fn confirm_replace(state: &mut ViewerState) -> bool {
+    if !state
+        .drawing
+        .as_ref()
+        .is_some_and(EditableDrawing::is_modified)
+    {
+        return true;
+    }
+    match rfd::MessageDialog::new().set_title("保存当前 CAD 修改？")
+        .set_description("是：保存后继续；否：放弃修改；取消：留在当前图纸。保存失败或取消另存为都不会关闭当前图纸。")
+        .set_buttons(rfd::MessageButtons::YesNoCancel).show() {
+        rfd::MessageDialogResult::Yes => save_drawing(state, false),
+        rfd::MessageDialogResult::No => true,
+        _ => false,
+    }
+}
+
+pub(super) fn save_drawing(state: &mut ViewerState, save_as: bool) -> bool {
+    let Some(drawing) = state.drawing.as_ref() else {
+        return false;
+    };
+    let source = &drawing.document().source;
+    let existing = source.file_path.as_ref().filter(|path| {
+        source.format.is_dxf()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dxf"))
+    });
+    let path = if save_as || existing.is_none() {
+        let file_name = Path::new(&source.file_name).with_extension("dxf");
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("保存 CAD 图纸为 DXF")
+            .add_filter("DXF 图纸", &["dxf"])
+            .set_directory(super::dialog_directory(state))
+            .set_file_name(file_name.to_string_lossy())
+            .save_file()
+        else {
+            return false;
+        };
+        path
+    } else {
+        existing.unwrap().clone()
+    };
+    match state.drawing.as_mut().unwrap().save_dxf(&path) {
+        Ok(()) => {
+            let source = &state.drawing.as_ref().unwrap().document().source;
+            state.file_name = source.file_name.clone();
+            state.format = source.format.to_string();
+            clear_recovery(state);
+            remember_recent(
+                state,
+                &std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+            );
+            push_message(
+                state,
+                format!(
+                    "已保存 {}；覆盖已有文件时保留同目录 .bak 备份",
+                    path.display()
+                ),
+            );
+            true
+        }
+        Err(error) => {
+            push_message(state, format!("保存失败：{error}"));
+            false
+        }
+    }
+}
+
+pub(super) fn close_requested(
+    mut events: MessageReader<WindowCloseRequested>,
+    mut state: ResMut<ViewerState>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let requested = events.read().count() > 0 || state.file_ui.exit_requested;
+    state.file_ui.exit_requested = false;
+    if requested && confirm_replace(&mut state) {
+        clear_recovery(&mut state);
+        exit.write(AppExit::Success);
+    }
+}
+
+pub(super) fn recovery_directory() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .join("CADCAM-Rust")
+        .join("Recovery")
+}
+
+fn clear_recovery(state: &mut ViewerState) {
+    if let Some(path) = state.file_ui.recovery_path.take() {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                push_message(state, format!("恢复快照未能清理：{error}"));
+            }
+        }
+    }
+    state.file_ui.recovery_revision = None;
+    state.file_ui.recovery_elapsed = 0.0;
+}
+
+pub(super) fn maintain_recovery(time: Res<Time>, mut state: ResMut<ViewerState>) {
+    state.file_ui.recovery_elapsed += time.delta_secs();
+    let Some(drawing) = state.drawing.as_ref() else {
+        return;
+    };
+    if !drawing.is_modified() {
+        if state.file_ui.recovery_path.is_some() {
+            clear_recovery(&mut state);
+        }
+        return;
+    }
+    let revision = drawing.revision();
+    if state.file_ui.recovery_revision == Some(revision)
+        || state.file_ui.recovery_path.is_some() && state.file_ui.recovery_elapsed < 30.0
+    {
+        return;
+    }
+    let directory = recovery_directory();
+    if state.file_ui.recovery_path.is_none() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let stem = Path::new(&state.file_name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        state.file_ui.recovery_path = Some(directory.join(format!(
+            "{stem}.recovery-{}-{stamp}.dxf",
+            std::process::id()
+        )));
+    }
+    state.file_ui.recovery_elapsed = 0.0;
+    let result = std::fs::create_dir_all(&directory)
+        .map_err(|error| error.to_string())
+        .and_then(|_| {
+            state
+                .drawing
+                .as_ref()
+                .unwrap()
+                .write_recovery(state.file_ui.recovery_path.as_ref().unwrap())
+        });
+    match result {
+        Ok(()) => state.file_ui.recovery_revision = Some(revision),
+        Err(error) => push_message(&mut state, format!("自动恢复快照写入失败：{error}")),
+    }
+}
+
+pub(super) fn recover_drawing(state: &mut ViewerState) {
+    let directory = recovery_directory();
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        push_message(state, format!("无法访问恢复目录：{error}"));
+        return;
+    }
+    if let Some(path) = rfd::FileDialog::new()
+        .set_title("恢复图纸快照（不含 CAM 安排和撤销历史）")
+        .add_filter("恢复 DXF / 备份", &["dxf", "bak"])
+        .set_directory(&directory)
+        .pick_file()
+    {
+        if state.file_ui.recovery_path.as_ref() == Some(&path) {
+            push_message(state, "该快照属于当前会话，请先保存或另存为当前图纸");
+            return;
+        }
+        load_drawing(state, &path, true);
+    }
+}
+
+pub(super) fn import_report_ui(context: &egui::Context, state: &mut ViewerState) {
+    if !state.file_ui.report_open {
+        return;
+    }
+    let Some(report) = state.file_ui.report.as_ref() else {
+        state.file_ui.report_open = false;
+        return;
+    };
+    let mut close = false;
+    let modal = egui::Modal::new(egui::Id::new("cad_import_report")).show(context, |ui| {
+        ui.set_width((context.viewport_rect().width() - 60.0).clamp(280.0, 960.0));
+        ui.heading("导入报告");
+        ui.label(&state.file_ui.report_name);
+        ui.label(&state.unit);
+        ui.label(format!("解析对象 {} · 模型空间 {} · 已转换 {} · 跳过 {} · 模型空间外 {}", report.source_entities, report.model_space_entities, report.converted.values().sum::<usize>(), report.skipped.len() + report.skipped_omitted, report.ignored_non_model_space));
+        ui.separator();
+        egui::ScrollArea::vertical().max_height((context.viewport_rect().height() - 230.0).max(140.0)).show(ui, |ui| {
+            ui.strong("已转换图元");
+            for (kind, count) in &report.converted { ui.label(format!("{kind}：{count}")); }
+            ui.separator(); ui.strong("未转换对象（仅列出模型空间中的样本）");
+            if report.skipped.is_empty() { ui.label("无跳过样本"); }
+            for (index, item) in report.skipped.iter().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.group(|ui| {
+                        ui.label(format!("{} · 图层 {} · 句柄 {} · {}", item.source_type, item.layer, item.handle.map(|handle| format!("{handle:X}")).unwrap_or_else(|| "无".into()), item.reason));
+                        ui.label(&item.message);
+                    });
+                });
+            }
+            if report.skipped_omitted > 0 { ui.label(format!("另有 {} 个跳过对象未逐项列出", report.skipped_omitted)); }
+            ui.separator(); ui.strong("解析及单位提示");
+            for warning in &report.warnings { ui.label(warning); }
+            ui.label("报告保留本次打开时的统计；后续编辑不改写该报告。未转换对象不会进入当前加工模型，DXF 保留范围取决于解析库。");
+        });
+        ui.separator();
+        close = ui.button("关闭").clicked();
+    });
+    if close || modal.should_close() {
+        state.file_ui.report_open = false;
+    }
+}

@@ -32,7 +32,6 @@ pub struct GCodeProfile {
     pub unit_end: String,
     pub rapid: String,
     pub cutting: String,
-    pub feed: f64,
     pub decimals: usize,
     pub line_ending: String,
     pub overcut: f64,
@@ -75,13 +74,12 @@ impl Default for GCodeProfile {
         Self {
             name: "default".to_string(),
             comment: String::new(),
-            header: "G90\nG21".to_string(),
-            footer: "M30".to_string(),
+            header: "%\nG90\nG21\nG17\nM8\nM7\nG00 Z50\nG80 G40 G49 G17 G90\nM05".to_string(),
+            footer: "G00 Z50\nM05\nM30\n%".to_string(),
             unit_start: "M03".to_string(),
             unit_end: "M05".to_string(),
             rapid: "G00".to_string(),
             cutting: "G01".to_string(),
-            feed: 1000.0,
             decimals: 3,
             line_ending: "crlf".to_string(),
             overcut: 0.0,
@@ -114,11 +112,9 @@ impl GCodeProfile {
             .wall_validation_error()
             .or_else(|| self.a_validation_error())
             .or_else(|| self.transfer.validation_error())
+            .or_else(|| self.smoothing_validation_error())
         {
             return Some(error);
-        }
-        if !self.feed.is_finite() || self.feed <= 0.0 {
-            return Some("进给速度必须是有限正数");
         }
         if !self.machining_z_offset.is_finite() {
             return Some("加工面 Z 修正必须是有限数值");
@@ -150,6 +146,15 @@ impl GCodeProfile {
             return Some("初始机床位置包含非法数值");
         }
         None
+    }
+
+    pub fn smoothing_validation_error(&self) -> Option<&'static str> {
+        let rounding_error = 3.0_f64.sqrt() * 0.5 * 10.0_f64.powi(-(self.decimals.min(9) as i32));
+        if self.transfer.smooth_enabled && self.transfer.smooth_tolerance <= rounding_error {
+            Some("平滑允许偏差须大于输出舍入误差，请增大小数位数或允许偏差")
+        } else {
+            None
+        }
     }
 
     pub fn wall_validation_error(&self) -> Option<&'static str> {
@@ -195,7 +200,7 @@ impl GCodeProfile {
             }),
             overcut_distance: self.overcut,
             keep_continuous_angle: self.keep_continuous_angle,
-            feed: self.feed,
+            output_decimals: self.decimals,
         }
     }
 
@@ -301,11 +306,11 @@ pub fn validate_trajectory(trajectory: &MachineTrajectory, profile: &GCodeProfil
     if let Some(error) = profile.a_validation_error() {
         issues.push(error.to_string());
     }
-    if let Some(error) = profile.transfer.validation_error() {
+    if let Some(error) = profile.smoothing_validation_error() {
         issues.push(error.to_string());
     }
-    if !profile.feed.is_finite() || profile.feed <= 0.0 {
-        issues.push("进给速度必须是有限正数".to_string());
+    if let Some(error) = profile.transfer.validation_error() {
+        issues.push(error.to_string());
     }
     if !profile.rotation_safety_clearance.is_finite() || profile.rotation_safety_clearance < 0.0 {
         issues.push("旋转安全抬刀距离非法".to_string());
@@ -542,12 +547,7 @@ fn rapid_line(movement: &MachineMove, profile: &GCodeProfile) -> String {
 
 fn cutting_line(movement: &MachineMove, profile: &GCodeProfile) -> String {
     let axis = format_axis(movement.pose, profile.decimals);
-    format!(
-        "{} {} F{}",
-        profile.cutting,
-        axis,
-        format_number(profile.feed, profile.decimals)
-    )
+    format!("{} {}", profile.cutting, axis)
 }
 
 fn arc_line(
@@ -568,11 +568,10 @@ fn arc_line(
         ArcPlane::YZ => format!("J{j} K{k}"),
     };
     format!(
-        "{} {} {} F{}",
+        "{} {} {}",
         code,
         format_axis_xyz(movement.pose, profile.decimals),
-        offsets,
-        format_number(profile.feed, profile.decimals)
+        offsets
     )
 }
 

@@ -18,6 +18,7 @@ mod document;
 mod entity;
 mod geometry;
 mod ids;
+mod work_plane;
 
 // Re-export the complete model surface so callers do not depend on file layout.
 pub use document::{
@@ -30,3 +31,4 @@ pub use geometry::{
     Vector3, GEOMETRY_EPSILON,
 };
 pub use ids::{EntityId, LayerId};
+pub use work_plane::WorkPlane;

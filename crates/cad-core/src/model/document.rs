@@ -92,6 +92,38 @@ pub enum LengthUnit {
     UsSurveyMile,
 }
 
+impl LengthUnit {
+    /// Conversion from source coordinates to the application's millimeter workspace.
+    pub fn millimeters_per_unit(self) -> f64 {
+        match self {
+            Self::Inches => 25.4,
+            Self::Feet => 304.8,
+            Self::Miles => 1_609_344.0,
+            Self::Millimeters => 1.0,
+            Self::Centimeters => 10.0,
+            Self::Meters => 1_000.0,
+            Self::Kilometers => 1_000_000.0,
+            Self::Microinches => 0.000_025_4,
+            Self::Mils => 0.0254,
+            Self::Yards => 914.4,
+            Self::Angstroms => 1e-7,
+            Self::Nanometers => 1e-6,
+            Self::Microns => 0.001,
+            Self::Decimeters => 100.0,
+            Self::Decameters => 10_000.0,
+            Self::Hectometers => 100_000.0,
+            Self::Gigameters => 1e12,
+            Self::AstronomicalUnits => 149_597_870_700_000.0,
+            Self::LightYears => 9.460_730_472_580_8e18,
+            Self::Parsecs => 3.085_677_581_491_367e19,
+            Self::UsSurveyFeet => 1_200_000.0 / 3937.0,
+            Self::UsSurveyInch => 100_000.0 / 3937.0,
+            Self::UsSurveyYard => 3_600_000.0 / 3937.0,
+            Self::UsSurveyMile => 6_336_000_000.0 / 3937.0,
+        }
+    }
+}
+
 impl fmt::Display for LengthUnit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let symbol = match self {
@@ -190,6 +222,12 @@ pub const MAX_SKIPPED_SAMPLES: usize = 256;
 /// Summary of what the import converter did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImportReport {
+    /// All parsed entities, including block definitions and paper space.
+    pub source_entities: usize,
+    /// Entities presented to the model-space converter.
+    pub model_space_entities: usize,
+    /// Parsed entities outside model space.
+    pub ignored_non_model_space: usize,
     /// Number of successfully converted entities per internal geometry kind.
     pub converted: BTreeMap<String, usize>,
     /// Samples of entities that were ignored, unsupported or failed.
@@ -240,9 +278,11 @@ impl ImportReport {
 /// built by the import module.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawingDocument {
-    /// Drawing unit from `$INSUNITS`; `None` when absent or unknown.
+    /// Workspace unit: millimeters after source units have been resolved.
     pub units: Option<LengthUnit>,
-    /// Layers in internal-id order.
+    /// Source coordinates' unit, retained for native editing and DXF output.
+    pub source_units: Option<LengthUnit>,
+    /// Current layers; stable IDs need not match their array positions.
     pub layers: Vec<Layer>,
     /// Model-space entities only, in conversion order.
     pub entities: Vec<Entity>,
@@ -260,11 +300,11 @@ impl DrawingDocument {
 
     /// Look up a layer by internal id.
     pub fn layer(&self, id: LayerId) -> Option<&Layer> {
-        self.layers.get(id.0 as usize)
+        self.layers.iter().find(|layer| layer.id == id)
     }
 
-    /// Look up an entity by internal id (ids are sequential in this version).
+    /// Look up a stable entity id; deletion can leave gaps in the id sequence.
     pub fn entity(&self, id: EntityId) -> Option<&Entity> {
-        self.entities.get(id.0 as usize)
+        self.entities.iter().find(|entity| entity.id == id)
     }
 }
