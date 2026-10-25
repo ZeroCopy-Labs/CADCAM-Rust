@@ -34,6 +34,10 @@ pub const TOOLS: [(CurveTool, &str); 9] = [
     (CurveTool::Reverse, "REVERSE"),
 ];
 impl CurveControls {
+    pub fn options(&self,plane:WorkPlane)->CurveOptions {
+        CurveOptions { plane:Plane::new(plane.normal(),plane.x_axis), ..self.options }
+    }
+    pub fn set_length(&mut self,length:f64) { self.options.length=length; }
     pub fn recipe(
         &self,
         doc: &DrawingDocument,
@@ -92,7 +96,8 @@ impl CurveControls {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut preview = false;
         let open = std::mem::take(&mut self.reveal).then_some(true);
-        egui::CollapsingHeader::new("曲线整理").default_open(false).open(open).show(ui,|ui|{
+        egui::CollapsingHeader::new("曲线整理（参数方式）").default_open(false).open(open).show(ui,|ui|{
+            ui.small("顶部常用曲线工具使用画布点选；此处保留参数方式。图形化偏移总是保留原件。");
             let tool=self.tool.get_or_insert(CurveTool::Break);
             egui::ComboBox::from_id_salt("curve_tool").selected_text(tool.label()).show_ui(ui,|ui|{
                 for (value,_) in TOOLS{ui.selectable_value(tool,value,value.label());}

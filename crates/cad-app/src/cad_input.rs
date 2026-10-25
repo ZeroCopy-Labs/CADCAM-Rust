@@ -11,6 +11,9 @@ pub enum Kind {
     Radius,
     Angle,
     Scale,
+    Distance,
+    ArrayRect,
+    Count,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -19,12 +22,13 @@ pub struct Spec {
     pub plane: WorkPlane,
     pub point: Option<[f64; 3]>,
     pub value: f64,
+    pub secondary: f64,
 }
 impl Spec {
     fn count(self) -> usize {
         match self.kind {
             Kind::Coordinates => 3,
-            Kind::Polar => 2,
+            Kind::Polar | Kind::ArrayRect => 2,
             _ => 1,
         }
     }
@@ -35,12 +39,17 @@ impl Spec {
             Kind::Radius => &["半径"],
             Kind::Angle => &["角度 °"],
             Kind::Scale => &["比例"],
+            Kind::Distance => &["距离 mm"],
+            Kind::ArrayRect => &["列数", "行数"],
+            Kind::Count => &["数量"],
         }
     }
     fn values(self) -> [f64; 3] {
         let point = self.point.unwrap_or(self.reference.unwrap_or([0.; 3]));
         let base = self.reference.unwrap_or([0.; 3]);
         match self.kind {
+            Kind::Radius if self.reference.is_none() => [self.value, 0., 0.],
+            Kind::ArrayRect => [self.value, self.secondary, 0.],
             Kind::Coordinates => std::array::from_fn(|i| point[i] - base[i]),
             Kind::Polar | Kind::Radius => {
                 let a = self.plane.to_local(Point3::new(base[0], base[1], base[2]));
@@ -341,10 +350,13 @@ impl DynamicInput {
         }
         if self.at_cursor && owned {
             let spec = self.spec(command);
-            let backwards =
-                ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            // Object-picking stages have no fields: leave Tab to candidate cycling.
+            let field_or_command = spec.is_some() || !command.is_active();
+            let backwards = field_or_command
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
             let tab = backwards
-                || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                || field_or_command
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
             if tab {
                 if let Some(spec) = spec.filter(|_| !self.literal) {
                     self.field =
@@ -410,6 +422,7 @@ impl DynamicInput {
                 fields[2]
             ),
             Kind::Polar => format!("@{}<{}", fields[0], fields[1]),
+            Kind::ArrayRect => format!("{},{}", fields[0], fields[1]),
             _ => fields[0].clone(),
         }
     }
@@ -557,6 +570,9 @@ impl DynamicInput {
                             Kind::Radius => "半径 mm · 输入值锁定预览",
                             Kind::Angle => "旋转角度（度） · Enter 确认参数",
                             Kind::Scale => "缩放比例 · Enter 确认参数",
+                            Kind::Distance => "输入距离后确认，随后在画布点选",
+                            Kind::ArrayRect => "列/行数量 · Tab 切换 · 确认提交",
+                            Kind::Count => "阵列数量 · 确认提交；分布角度在工具页设置",
                         });
                         let mut fields = self.fields(spec, text);
                         let target = self.field;

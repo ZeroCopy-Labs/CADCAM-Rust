@@ -10,6 +10,7 @@ use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
+    CurvePick(super::cad_curve_command::Session),
     PlaneSelect,
     EraseSelect,
     Utility {
@@ -119,6 +120,39 @@ pub struct CommandState {
 }
 
 impl CommandState {
+    pub fn begin_curve_pick(
+        &mut self,
+        tool: cad_core::curve_edit::CurveTool,
+        options: cad_core::curve_edit::CurveOptions,
+    ) {
+        self.cancel();
+        self.step = Some(Step::CurvePick(super::cad_curve_command::Session::new(
+            tool, options,
+        )));
+    }
+    pub fn curve_length(&self) -> Option<f64> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            Some(s.length())
+        } else {
+            None
+        }
+    }
+    pub fn picking_curve(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.picking())
+    }
+    pub fn curve_viewport(
+        &mut self,
+        doc: &cad_core::DrawingDocument,
+        id: Option<u32>,
+        ray: (Point3, cad_core::model::Vector3),
+        click: bool,
+    ) -> Result<bool, String> {
+        if let Some(Step::CurvePick(s)) = &mut self.step {
+            s.viewport(doc, id, ray, click)
+        } else {
+            Ok(false)
+        }
+    }
     pub fn begin_erase(&mut self) {
         self.cancel();
         self.step = Some(Step::EraseSelect);
@@ -134,6 +168,7 @@ impl CommandState {
         matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous() && sketch.geometry().is_ok())
     }
     pub fn ready(&self) -> bool {
+        if let Some(Step::CurvePick(s))=&self.step {return s.confirmed();}
         matches!(
             &self.step,
             Some(
@@ -172,11 +207,46 @@ impl CommandState {
         self.step.is_some()
     }
     pub fn needs_options(&self) -> bool {
-        matches!(self.step, Some(Step::Transform { .. } | Step::Curves(_)))
+        matches!(self.step, Some(Step::Transform { .. } | Step::Curves(_) | Step::CurvePick(_)))
             || matches!(self.step, Some(Step::Utility { kind, .. }) if !kind.measuring())
     }
     pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
         use super::cad_input::{Kind, Spec};
+        if let Some(Step::CurvePick(s)) = &self.step {
+            if !s.side() {
+                return s.parameter_spec(self.point_plane());
+            }
+        }
+        if let Some(Step::Grip {
+            base,
+            geometry,
+            kind,
+            target,
+            ..
+        }) = &self.step
+        {
+            let center = if *kind == GripKind::Radius {
+                match geometry {
+                    Geometry::Circle(c) => Some(c.center),
+                    Geometry::Arc(a) => Some(a.center),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            return Some(Spec {
+                kind: if center.is_some() {
+                    Kind::Radius
+                } else {
+                    Kind::Polar
+                },
+                reference: Some(array(center.unwrap_or(*base))),
+                plane: self.point_plane(),
+                point: target.map(array).or(self.hover).or(Some(array(*base))),
+                value: 0.,
+                secondary: 0.,
+            });
+        }
         if let Some(Step::Transform {
             kind,
             base: Some(_),
@@ -186,6 +256,8 @@ impl CommandState {
             let (kind, value) = match kind {
                 TransformKind::Rotate => (Kind::Angle, self.tools.angle),
                 TransformKind::Scale => (Kind::Scale, self.tools.scale),
+                TransformKind::RectArray => (Kind::ArrayRect, self.tools.columns as f64),
+                TransformKind::PolarArray => (Kind::Count, self.tools.count as f64),
                 _ => return None,
             };
             return Some(Spec {
@@ -194,6 +266,7 @@ impl CommandState {
                 plane: self.point_plane(),
                 point: None,
                 value,
+                secondary: self.tools.rows as f64,
             });
         }
         if !self.takes_point() {
@@ -213,6 +286,7 @@ impl CommandState {
             plane: self.point_plane(),
             point: self.hover,
             value: 0.,
+            secondary: 0.,
         })
     }
     pub fn preview_scalar(&mut self, text: &str) {
@@ -224,14 +298,9 @@ impl CommandState {
         else {
             return;
         };
-        let Ok(value) = number(text) else {
-            return;
-        };
         let mut tools = self.tools.clone();
-        match kind {
-            TransformKind::Rotate => tools.angle = value,
-            TransformKind::Scale => tools.scale = value,
-            _ => return,
+        if update_transform(&mut tools, *kind, text).is_err() {
+            return;
         }
         if tools
             .transforms(*kind, *base, self.plane, ids.len())
@@ -241,25 +310,74 @@ impl CommandState {
         }
     }
     pub fn refresh_input_preview(&mut self, dynamic: &super::cad_input::DynamicInput, text: &str) {
+        if matches!(
+            &self.step,
+            Some(Step::Grip {
+                target: Some(_),
+                dragging: false,
+                ..
+            })
+        ) && !text.trim().is_empty()
+        {
+            let point = if matches!(
+                &self.step,
+                Some(Step::Grip {
+                    kind: GripKind::Radius,
+                    ..
+                })
+            ) && !text.contains([',', ' ', '<'])
+                && !text.starts_with(['@', '#'])
+            {
+                self.radius_grip_point(text)
+            } else {
+                parse_point(
+                    &dynamic.submission(self, text),
+                    self.point_plane(),
+                    self.reference(),
+                )
+            };
+            if let Ok(point) = point {
+                if let Some(Step::Grip {
+                    geometry,
+                    kind,
+                    target,
+                    ..
+                }) = &mut self.step
+                {
+                    if properties::move_grip(geometry, *kind, as_point(point)).is_ok() {
+                        *target = Some(as_point(point));
+                    }
+                }
+            }
+        }
         if !self.takes_point() {
             return;
         }
-        if let Ok(point) = parse_point(
-            &dynamic.submission(self, text),
-            self.point_plane(),
-            self.reference(),
-        ) {
-            if dynamic.is_literal() {
-                self.hover = Some(point);
-                self.ray_error.clear();
-                return;
-            }
-        }
-        if let Some(point) = self.pointer_point {
-            match dynamic.constrain(self, text, point) {
+        let literal = if dynamic.is_literal() {
+            parse_point(
+                &dynamic.submission(self, text),
+                self.point_plane(),
+                self.reference(),
+            )
+            .ok()
+        } else {
+            None
+        };
+        if let Some(point) = literal.or(self.pointer_point) {
+            let result = if literal.is_some() {
+                Ok(point)
+            } else {
+                dynamic.constrain(self, text, point)
+            };
+            match result {
                 Ok(point) => {
                     self.hover = Some(point);
                     self.ray_error.clear();
+                    if let Some(Step::CurvePick(s)) = &mut self.step {
+                        if let Err(error) = s.preview_side(as_point(point), false) {
+                            self.ray_error = error;
+                        }
+                    }
                 }
                 Err(error) => {
                     self.hover = None;
@@ -268,15 +386,42 @@ impl CommandState {
             }
         }
     }
+    fn radius_grip_point(&self, text: &str) -> Result<[f64; 3], String> {
+        let Some(Step::Grip { geometry, base, .. }) = &self.step else {
+            return Err("当前不是半径夹点".into());
+        };
+        let center = match geometry {
+            Geometry::Circle(c) => c.center,
+            Geometry::Arc(a) => a.center,
+            _ => return Err("当前不是圆/圆弧半径夹点".into()),
+        };
+        let radius = number(text)?;
+        if radius <= cad_core::curves::DISTANCE_TOLERANCE {
+            return Err("半径须大于几何容差".into());
+        }
+        let d =
+            cad_core::model::Vector3::new(base.x - center.x, base.y - center.y, base.z - center.z)
+                .normalize()
+                * radius;
+        finite([center.x + d.x, center.y + d.y, center.z + d.z])
+    }
     pub fn pause_pointer(&mut self) {
         // Keep the last geometric point while the user edits a numeric field.
         self.aids.clear();
     }
     pub fn selecting(&self) -> bool {
-        matches!(self.step, Some(Step::EraseSelect | Step::Select | Step::TransformSelect { .. }))
-            || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
+        if let Some(Step::CurvePick(s)) = &self.step {
+            return s.selecting();
+        }
+        matches!(
+            self.step,
+            Some(Step::EraseSelect | Step::Select | Step::TransformSelect { .. })
+        ) || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            return s.side();
+        }
         self.is_active()
             && !self.selecting()
             && !matches!(
@@ -306,6 +451,7 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         match &self.step {
+            Some(Step::CurvePick(s)) => return s.prompt(),
             Some(Step::PlaneSelect) => {
                 return "工作平面：输入 XY / YZ / ZX / 3P，Enter 默认为 XY；Esc 取消".into()
             }
@@ -403,6 +549,10 @@ impl CommandState {
                         match kind {
                             TransformKind::Rotate => "输入角度后确认即完成；可在右侧设置轴",
                             TransformKind::Scale => "输入比例后确认即完成",
+                            TransformKind::RectArray => {
+                                "输入列数,行数后确认；间距可在右侧拾取或设置"
+                            }
+                            TransformKind::PolarArray => "输入数量后确认；总角度在右侧设置",
                             _ => "在右侧工具页设置参数，Enter/空格提交",
                         }
                     } else {
@@ -437,13 +587,15 @@ impl CommandState {
         .to_string()
     }
     pub fn removed_preview_ids(&self) -> Option<&BTreeSet<EntityId>> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            return Some(s.affected());
+        }
         if let Some(Step::Curves(edit)) = &self.step {
             Some(&edit.remove)
         } else {
             None
         }
     }
-
     pub fn begin_curves(&mut self, edit: cad_core::CurveEdit) {
         self.cancel();
         self.step = Some(Step::Curves(edit));
@@ -485,6 +637,11 @@ impl CommandState {
         }
     }
     fn point_plane(&self) -> WorkPlane {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            if s.side() {
+                return s.side_plane().unwrap_or(self.plane);
+            }
+        }
         if let Some(Step::ArraySpacing { base, .. }) = &self.step {
             return WorkPlane {
                 origin: as_point(*base),
@@ -509,7 +666,6 @@ impl CommandState {
         }
         self.plane
     }
-
     pub fn begin_paste(
         &mut self,
         items: Vec<cad_core::geometry_edit::ClipboardItem>,
@@ -634,12 +790,26 @@ impl CommandState {
 
     fn reference(&self) -> [f64; 3] {
         match &self.step {
+            Some(Step::CurvePick(s)) if s.side() => s
+                .side_plane()
+                .map(|p| array(p.origin))
+                .unwrap_or(array(self.plane.origin)),
             Some(Step::Utility { points, .. }) => points
                 .last()
                 .copied()
                 .map(array)
                 .unwrap_or(array(self.plane.origin)),
             Some(Step::Paste { base, .. } | Step::ArraySpacing { base, .. }) => *base,
+            Some(Step::Grip {
+                base,
+                kind: GripKind::Radius,
+                geometry,
+                ..
+            }) => array(match geometry {
+                Geometry::Circle(c) => c.center,
+                Geometry::Arc(a) => a.center,
+                _ => *base,
+            }),
             Some(Step::Grip { base, .. }) => array(*base),
             Some(Step::Draw { sketch, .. }) => sketch
                 .points
@@ -662,7 +832,7 @@ impl CommandState {
             Some(Step::ArraySpacing { base, .. } | Step::Paste { base, .. }) => {
                 Some(as_point(*base))
             }
-            Some(Step::Grip { base, .. }) => Some(*base),
+            Some(Step::Grip { .. }) => Some(as_point(self.reference())),
             Some(Step::Draw { sketch, .. }) if !sketch.points.is_empty() => {
                 Some(*sketch.points.last().unwrap())
             }
@@ -688,6 +858,27 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        if let Some(Step::CurvePick(s)) = &mut self.step {
+            if !s.side() {
+                return s
+                    .input(text, selected)
+                    .map(|edit| edit.map(CommandCommit::Curves));
+            }
+        }
+        if matches!(
+            &self.step,
+            Some(Step::Grip {
+                kind: GripKind::Radius,
+                ..
+            })
+        ) && !text.trim().is_empty()
+            && !text.contains([',', ' ', '<'])
+            && !text.starts_with(['@', '#'])
+        {
+            let point = self.radius_grip_point(text)?;
+            self.accept_point(point)?;
+            return self.finish_ready(selected);
+        }
         if matches!(self.step, Some(Step::PlaneSelect)) {
             let name = text.trim().to_uppercase();
             let name = if name.is_empty() { "XY" } else { name.as_str() };
@@ -802,15 +993,14 @@ impl CommandState {
                     copies,
                 }));
             }
-            if matches!(kind, TransformKind::Rotate | TransformKind::Scale)
-                && !text.contains([',', ' '])
-            {
-                let value = number(text)?;
-                if *kind == TransformKind::Rotate {
-                    self.tools.angle = value;
-                } else {
-                    self.tools.scale = value;
-                }
+            if matches!(
+                kind,
+                TransformKind::Rotate
+                    | TransformKind::Scale
+                    | TransformKind::RectArray
+                    | TransformKind::PolarArray
+            ) {
+                update_transform(&mut self.tools, *kind, text)?;
                 let (transforms, copies) =
                     self.tools.transforms(*kind, *base, self.plane, ids.len())?;
                 return Ok(Some(CommandCommit::Transform {
@@ -941,6 +1131,17 @@ impl CommandState {
     }
     fn accept_point(&mut self, point: [f64; 3]) -> Result<(), String> {
         self.step = match self.step.as_ref().ok_or("没有正在取点的命令")? {
+            Step::CurvePick(_) => {
+                if let Some(Step::CurvePick(s)) = &mut self.step {
+                    s.preview_side(as_point(point), true)?;
+                }
+                self.hover = None;
+                self.pointer_point = None;
+                self.aids.clear();
+                self.ray_error.clear();
+                self.error.clear();
+                return Ok(());
+            }
             Step::Utility {
                 kind,
                 points,
@@ -1063,7 +1264,9 @@ impl CommandState {
                 self.origin_input = array(self.plane.origin);
                 None
             }
-            Step::Select | Step::EraseSelect | Step::PlaneSelect => return Err("请先确认选择或工作平面选项".into()),
+            Step::Select | Step::EraseSelect | Step::PlaneSelect => {
+                return Err("请先确认选择或工作平面选项".into())
+            }
         };
         self.hover = None;
         self.aids.clear();
@@ -1105,6 +1308,15 @@ impl CommandState {
             .and_then(finite);
         match point {
             Ok(point) => {
+                if let Some(Step::CurvePick(s)) = &mut self.step {
+                    if s.side() {
+                        if let Err(error) = s.preview_side(as_point(point), false) {
+                            self.ray_error = error;
+                            self.hover = Some(point);
+                            return false;
+                        }
+                    }
+                }
                 self.hover = Some(point);
                 self.ray_error.clear();
                 if click {
@@ -1126,7 +1338,6 @@ impl CommandState {
         }
         false
     }
-
     pub fn clear_hover(&mut self) {
         self.aids.clear();
         self.hover = None;
@@ -1146,6 +1357,20 @@ impl CommandState {
     }
 
     pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            if let Some(edit) = s.preview() {
+                return edit
+                    .replacements
+                    .values()
+                    .flatten()
+                    .flat_map(super::display::tessellate_geometry)
+                    .collect();
+            }
+            return s
+                .first_geometry()
+                .map(super::display::tessellate_geometry)
+                .unwrap_or_default();
+        }
         if let Some(Step::Paste {
             items,
             base,
@@ -1526,6 +1751,38 @@ impl CommandState {
 fn as_point(p: [f64; 3]) -> Point3 {
     Point3::new(p[0], p[1], p[2])
 }
+fn update_transform(
+    tools: &mut ToolOptions,
+    kind: TransformKind,
+    text: &str,
+) -> Result<(), String> {
+    let count = |text: &str| -> Result<u32, String> {
+        let value = number(text)?;
+        if !(1.0..=1000.0).contains(&value) || value.fract() != 0. {
+            return Err("阵列数量须为 1～1000 的整数".into());
+        }
+        Ok(value as u32)
+    };
+    match kind {
+        TransformKind::Rotate => tools.angle = number(text)?,
+        TransformKind::Scale => tools.scale = number(text)?,
+        TransformKind::PolarArray => tools.count = count(text)?,
+        TransformKind::RectArray => {
+            let normalized = text.replace('，', ",");
+            let values: Vec<_> = normalized.split(',').collect();
+            let [column, row] = values.as_slice() else {
+                return Err("请输入列数,行数".into());
+            };
+            let columns = count(column)?;
+            let rows = count(row)?;
+            tools.columns = columns;
+            tools.rows = rows;
+        }
+        _ => return Err("该变换请在工具页设置参数".into()),
+    }
+    Ok(())
+}
+
 fn array(p: Point3) -> [f64; 3] {
     [p.x, p.y, p.z]
 }

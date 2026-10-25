@@ -15,6 +15,7 @@
 mod blocks;
 mod convert;
 pub mod curve_edit;
+pub mod curve_pick;
 pub mod curves;
 pub mod diagnostics;
 pub mod drafting;

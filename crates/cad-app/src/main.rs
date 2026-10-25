@@ -26,6 +26,7 @@ mod cad_aids;
 mod cad_clipboard;
 mod cad_command;
 mod cad_curves;
+mod cad_curve_command;
 mod cad_diagnostics;
 mod cad_edit;
 mod cad_file;
@@ -470,8 +471,14 @@ fn submit_command(
                 .map(|_| None),
             _ if cad_curves::TOOLS.iter().any(|(_,name)|*name==upper)=>{
                 state.cad_curves.tool=cad_curves::TOOLS.iter().find(|(_,name)|*name==upper).map(|(tool,_)|*tool);
+                if let Some(tool)=state.cad_curves.tool.filter(|tool|cad_curve_command::interactive(*tool)) {
+                    state.cad_command.begin_curve_pick(tool,state.cad_curves.options(state.cad_command.plane));
+                    state.cad_workspace.reveal(cad_workspace::Pane::Tools);
+                    Ok(None)
+                } else {
                 match state.cad_curves.recipe(state.drawing.as_ref().unwrap().document(),&selection.selected,state.cad_command.plane){
                     Ok(edit)=>{state.cad_command.begin_curves(edit);Ok(None)},Err(error)=>Err(error),
+                }
                 }
             },
             _ if state.cad_command.begin_named(&upper, &selection.selected) => Ok(None),
@@ -479,6 +486,9 @@ fn submit_command(
         }
     };
     if result.is_ok() {
+        if let Some(length) = state.cad_command.curve_length() {
+            state.cad_curves.set_length(length);
+        }
         if !was_active && !matches!(upper.as_str(), "UNDO" | "U" | "撤销" | "REDO" | "重做") {
             state.cad_command.last_command = command.to_string();
         }
@@ -1097,7 +1107,14 @@ fn selection_input(
     if space.mode == SpaceMode::Cad
         && !state.cad_command.is_active()
         && mouse.just_pressed(MouseButton::Left)
-        && !keys.any_pressed([KeyCode::ShiftLeft,KeyCode::ShiftRight,KeyCode::AltLeft,KeyCode::AltRight,KeyCode::ControlLeft,KeyCode::ControlRight])
+        && !keys.any_pressed([
+            KeyCode::ShiftLeft,
+            KeyCode::ShiftRight,
+            KeyCode::AltLeft,
+            KeyCode::AltRight,
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+        ])
     {
         if let Some((id, geometry, kind)) =
             pick_grip(&state, &selection, camera, camera_transform, cursor)
@@ -1118,6 +1135,63 @@ fn selection_input(
         }
     }
     let nearby = pick_entities(&mut state, camera, camera_transform, cursor);
+    if space.mode == SpaceMode::Cad && state.cad_command.picking_curve() {
+        let hits: Vec<_> = nearby
+            .into_iter()
+            .filter(|id| {
+                state
+                    .display
+                    .entities
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .is_some_and(|e| selection.filter.matches(e))
+            })
+            .collect();
+        if selection
+            .hover_cursor
+            .is_none_or(|p| p.distance(cursor) > 3.)
+            || selection.hover_hits != hits
+        {
+            selection.hover_index = 0;
+        }
+        selection.hover_cursor = Some(cursor);
+        selection.hover_hits = hits;
+        if !selection.hover_hits.is_empty() {
+            selection.hover_index %= selection.hover_hits.len();
+        }
+        let id = selection.hovered();
+        let result = {
+            let ViewerState {
+                cad_command,
+                drawing,
+                view,
+                ..
+            } = &mut *state;
+            if let (Some(doc), Some(ray)) = (
+                drawing.as_ref().map(|d| d.document()),
+                view.ray(camera, camera_transform, cursor),
+            ) {
+                cad_command.curve_viewport(doc, id, ray, mouse.just_pressed(MouseButton::Left))
+            } else {
+                Err("当前视图无法定位曲线".into())
+            }
+        };
+        match result {
+            Ok(accepted) => {
+                state.cad_command.error.clear();
+                if accepted {
+                    state.command_input.clear();
+                    state.dynamic_input.reset_fields();
+                    state.dynamic_input.request_focus();
+                    if state.cad_command.ready() {submit_command(&mut state,&mut selection,space.mode,"");}
+                }
+            }
+            Err(error) => state.cad_command.error = error,
+        }
+        selection.drag_start = None;
+        selection.drag_current = None;
+        return Ok(());
+    }
     if space.mode == SpaceMode::Cad
         && state.cad_command.is_active()
         && !state.cad_command.selecting()
@@ -2499,14 +2573,19 @@ fn drawing_ui(
             let can_cycle = if state.cad_command.takes_point() {
                 state.cad_command.aids.has_candidates()
             } else {
-                (!state.cad_command.is_active() || state.cad_command.selecting())
+                (!state.cad_command.is_active()
+                    || state.cad_command.selecting()
+                    || state.cad_command.picking_curve())
                     && !selection.hover_hits.is_empty()
             };
             let reverse = can_cycle && input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
             if can_cycle && (reverse || input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
                 if state.cad_command.takes_point() {
                     state.cad_command.cycle_snap(reverse);
-                } else if !state.cad_command.is_active() || state.cad_command.selecting() {
+                } else if !state.cad_command.is_active()
+                    || state.cad_command.selecting()
+                    || state.cad_command.picking_curve()
+                {
                     selection.cycle(reverse);
                 }
             }
@@ -3015,13 +3094,17 @@ fn drawing_ui(
         menu_rect = menu_rect.union(ribbon.response.rect);
         if let Some(command) = ribbon.inner.command {
             if let Some((tool, _)) = cad_curves::TOOLS.iter().find(|(_, name)| *name == command) {
-                state.cad_curves.tool = Some(*tool);
-                state.cad_curves.reveal = true;
-                state.cad_workspace.reveal(cad_workspace::Pane::Tools);
-                push_message(
-                    &mut state,
-                    "在工具面板设置曲线参数，预览后 Enter 提交；Esc 取消",
-                );
+                if cad_curve_command::interactive(*tool) {
+                    command_request = Some(command);
+                } else {
+                    state.cad_curves.tool = Some(*tool);
+                    state.cad_curves.reveal = true;
+                    state.cad_workspace.reveal(cad_workspace::Pane::Tools);
+                    push_message(
+                        &mut state,
+                        "在工具面板设置曲线参数，预览后 Enter 提交；Esc 取消",
+                    );
+                }
             } else {
                 command_request = Some(command);
             }

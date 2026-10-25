@@ -271,19 +271,7 @@ fn group(ui: &mut egui::Ui, width: f32, contents: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn available(command: &str, enabled: bool, selected: &BTreeSet<u32>) -> bool {
-    enabled
-        && (!matches!(
-            command,
-            "OFFSET"
-                | "TRIM"
-                | "EXTEND"
-                | "FILLET"
-                | "CHAMFER"
-                | "BREAK"
-                | "JOIN"
-                | "CLOSE"
-                | "REVERSE"
-        ) || !selected.is_empty())
+    enabled && (!matches!(command, "BREAK" | "JOIN" | "CLOSE" | "REVERSE") || !selected.is_empty())
 }
 fn issue(command: &str, output: &mut Output) {
     output.command = Some(command.into());
@@ -597,10 +585,15 @@ fn button(ui: &mut egui::Ui, command: &str, label: &str) -> egui::Response {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     response.on_hover_text(match command {
-        "TRIM" => "修剪 · TRIM\n当前使用参数区间，选择对象后在工具面板设置并预览。".into(),
-        "EXTEND" => "延伸 · EXTEND\n当前使用固定长度，选择对象后在工具面板设置并预览。".into(),
+        "TRIM" => "修剪 · TRIM\n选择边界并确认，再点击要去除的区间；预览后确认。".into(),
+        "EXTEND" => "延伸 · EXTEND\n选择边界并确认，再点击待延伸端；只延到有效边界。".into(),
+        "OFFSET" => {
+            "偏移 · OFFSET\n输入距离，选择对象，再点击偏移侧；预览后确认，保留原件。".into()
+        }
         "FILLET" | "CHAMFER" => {
-            format!("{label} · {command}\n当前支持两条端点相接直线，参数在工具面板设置。")
+            format!(
+                "{label} · {command}\n输入半径/距离，依次点击两条直线要保留的一侧；预览后确认。"
+            )
         }
         _ => format!("{label} · {command}"),
     })
