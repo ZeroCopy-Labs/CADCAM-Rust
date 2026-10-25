@@ -9,6 +9,7 @@ pub enum Kind {
     Coordinates,
     Polar,
     Radius,
+    Diameter,
     Angle,
     Scale,
     Distance,
@@ -41,6 +42,7 @@ impl Spec {
             Kind::Coordinates => &["X", "Y", "Z"],
             Kind::Polar => &["长度", "角度 °"],
             Kind::Radius => &["半径"],
+            Kind::Diameter => &["直径"],
             Kind::Angle => &["角度 °"],
             Kind::Scale => &["比例"],
             Kind::Distance => &["距离 mm"],
@@ -56,10 +58,10 @@ impl Spec {
         let point = self.point.unwrap_or(self.reference.unwrap_or([0.; 3]));
         let base = self.reference.unwrap_or([0.; 3]);
         match self.kind {
-            Kind::Radius if self.reference.is_none() => [self.value, 0., 0.],
+            Kind::Radius | Kind::Diameter if self.reference.is_none() => [self.value, 0., 0.],
             Kind::ArrayRect => [self.value, self.secondary, 0.],
             Kind::Coordinates => std::array::from_fn(|i| point[i] - base[i]),
-            Kind::Polar | Kind::Radius => {
+            Kind::Polar | Kind::Radius | Kind::Diameter => {
                 let a = self.plane.to_local(Point3::new(base[0], base[1], base[2]));
                 let b = self
                     .plane
@@ -109,6 +111,9 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("PLINE", "PL", "多段线"),
     ("RECTANGLE", "REC", "矩形"),
     ("CIRCLE", "C", "圆"),
+    ("CIRCLED", "", "圆心/直径圆"),
+    ("CIRCLE2P", "", "两点直径圆"),
+    ("CIRCLE3P", "", "三点圆"),
     ("ARC", "A", "圆弧"),
     ("ELLIPSE", "EL", "椭圆"),
     ("SPLINE", "SPL", "样条"),
@@ -306,6 +311,23 @@ impl DynamicInput {
         if let Some((typed, pasted)) = typed {
             if self.at_cursor && (owned || on_canvas && !other_text) {
                 let was_literal = self.literal;
+                // "2P" / "3P" can arrive after the digit locked a coordinate field.
+                if !self.literal
+                    && typed.eq_ignore_ascii_case("P")
+                    && command.circle_options().iter().any(|(key, _)| *key == "2P")
+                    && self.locked[0]
+                    && !self.locked[1]
+                    && !self.locked[2]
+                {
+                    if let Some(spec) = self.spec(command) {
+                        let fields = self.fields(spec, text);
+                        if matches!(fields[0].as_str(), "2" | "3") {
+                            *text = fields[0].clone();
+                            self.locked = [false; 3];
+                            self.literal = true;
+                        }
+                    }
+                }
                 if !command.is_active()
                     || self.spec(command).is_none()
                     || typed.starts_with(['@', '#'])
@@ -316,6 +338,8 @@ impl DynamicInput {
                     || command.curve_change_distance()
                         && matches!(typed.to_uppercase().as_str(), "D" | "N")
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
+                    || !command.circle_options().is_empty()
+                        && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
                     || command.copy_mode().is_some()
                         && !command.selecting()
                         && matches!(typed.to_uppercase().as_str(), "M" | "S")
@@ -474,8 +498,8 @@ impl DynamicInput {
         let base = spec.reference.unwrap_or([0.; 3]);
         let result = match spec.kind {
             Kind::Coordinates => std::array::from_fn(|i| base[i] + values[i]),
-            Kind::Polar | Kind::Radius => {
-                if spec.kind == Kind::Radius && values[0] <= 0. {
+            Kind::Polar | Kind::Radius | Kind::Diameter => {
+                if matches!(spec.kind, Kind::Radius | Kind::Diameter) && values[0] <= 0. {
                     return Err("半径必须大于零".into());
                 }
                 let angle = values[1].to_radians();
@@ -604,6 +628,7 @@ impl DynamicInput {
                             Kind::Coordinates => "相对基点的 WCS 位移 · Tab 切换字段",
                             Kind::Polar => "工作平面长度/角度 · Tab 切换字段",
                             Kind::Radius => "半径 mm · 输入值锁定预览",
+                            Kind::Diameter => "直径 mm · 半径为该长度的一半",
                             Kind::Angle => "旋转角度（度） · Enter 确认参数",
                             Kind::Scale => "缩放比例 · Enter 确认参数",
                             Kind::Distance => "输入距离后确认，随后在画布点选",

@@ -87,6 +87,16 @@ impl Workspace {
                             action = Some("DISCARD".into());
                         }
                     }
+                    if command.circle_drawing() {
+                        for &(option, label) in command.circle_options() {
+                            if ui.button(format!("{label}  {option}")).clicked() {
+                                action = Some(option.into());
+                            }
+                        }
+                        if ui.button("撤回上一取点  U").clicked() {
+                            action = Some("U".into());
+                        }
+                    }
                     if command.command_undo_active() {
                         if ui
                             .add_enabled(
@@ -186,6 +196,9 @@ const DRAW: &[(&str, &str)] = &[
     ("SPLINE", "样条曲线"),
     ("HOLE", "圆孔"),
     ("SLOT", "长圆孔"),
+    ("CIRCLED", "圆心 / 直径圆"),
+    ("CIRCLE2P", "两点直径圆"),
+    ("CIRCLE3P", "三点圆"),
 ];
 const MODIFY: &[(&str, &str)] = &[
     ("MOVE", "移动"),
@@ -674,7 +687,7 @@ fn icon(painter: &egui::Painter, rect: egui::Rect, command: &str, color: egui::C
             }
         }
         "PLINE" | "SPLINE" => path(&[(1., 14.), (5., 3.), (11., 11.), (16., 2.)]),
-        "CIRCLE" | "HOLE" => {
+        "CIRCLE" | "CIRCLED" | "CIRCLE2P" | "CIRCLE3P" | "HOLE" => {
             painter.circle_stroke(rect.center(), 7., stroke);
             painter.circle_filled(rect.center(), 1.3, color);
         }

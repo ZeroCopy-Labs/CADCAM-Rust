@@ -53,6 +53,9 @@ pub enum SketchKind {
     Polyline,
     Rectangle,
     Circle,
+    CircleDiameter,
+    Circle2P,
+    Circle3P,
     Arc,
     Ellipse,
     Spline,
@@ -64,6 +67,9 @@ impl SketchKind {
             Self::Polyline => "多段线",
             Self::Rectangle => "矩形",
             Self::Circle => "圆",
+            Self::CircleDiameter => "圆（圆心/直径）",
+            Self::Circle2P => "圆（两点直径）",
+            Self::Circle3P => "圆（三点）",
             Self::Arc => "三点圆弧",
             Self::Ellipse => "椭圆",
             Self::Spline => "控制点样条",
@@ -75,6 +81,9 @@ impl SketchKind {
             Self::Polyline => "PLINE",
             Self::Rectangle => "RECTANGLE",
             Self::Circle => "CIRCLE",
+            Self::CircleDiameter => "CIRCLED",
+            Self::Circle2P => "CIRCLE2P",
+            Self::Circle3P => "CIRCLE3P",
             Self::Arc => "ARC",
             Self::Ellipse => "ELLIPSE",
             Self::Spline => "SPLINE",
@@ -83,10 +92,21 @@ impl SketchKind {
     pub fn continuous(self) -> bool {
         matches!(self, Self::Line | Self::Polyline | Self::Spline)
     }
+    pub fn is_circle(self) -> bool {
+        matches!(
+            self,
+            Self::Circle | Self::CircleDiameter | Self::Circle2P | Self::Circle3P
+        )
+    }
     pub fn required(self) -> usize {
         match self {
-            Self::Line | Self::Polyline | Self::Rectangle | Self::Circle => 2,
-            Self::Arc | Self::Ellipse => 3,
+            Self::Line
+            | Self::Polyline
+            | Self::Rectangle
+            | Self::Circle
+            | Self::CircleDiameter
+            | Self::Circle2P => 2,
+            Self::Arc | Self::Ellipse | Self::Circle3P => 3,
             Self::Spline => 4,
         }
     }
@@ -187,12 +207,36 @@ impl Sketch {
                     true,
                 );
             }
-            SketchKind::Circle => vec![Geometry::Circle(Circle {
-                center: p[0],
-                radius: length(p[0], p[1]),
-                plane,
-            })],
-            SketchKind::Arc => {
+            SketchKind::Circle | SketchKind::CircleDiameter => {
+                let radius = length(p[0], p[1])
+                    * if self.kind == SketchKind::CircleDiameter {
+                        0.5
+                    } else {
+                        1.0
+                    };
+                if !radius.is_finite() || radius <= 1e-9 {
+                    return Err("圆的半径须有限且大于几何容差".into());
+                }
+                vec![Geometry::Circle(Circle {
+                    center: p[0],
+                    radius,
+                    plane,
+                })]
+            }
+            SketchKind::Circle2P => {
+                let d = delta(p[0], p[1]);
+                let center = add(p[0], d * 0.5);
+                let radius = d.length() * 0.5;
+                if !finite(array(center)) || !radius.is_finite() || radius <= 1e-9 {
+                    return Err("两点直径必须有限且非零".into());
+                }
+                vec![Geometry::Circle(Circle {
+                    center,
+                    radius,
+                    plane,
+                })]
+            }
+            SketchKind::Arc | SketchKind::Circle3P => {
                 let a = self.plane.to_local(p[0]);
                 let b = self.plane.to_local(p[1]);
                 let c = self.plane.to_local(p[2]);
@@ -202,11 +246,22 @@ impl Sketch {
                 let v = c[1] - a[1];
                 let den = 2.0 * (x * v - y * u);
                 if den.abs() <= 1e-12 * (x.hypot(y) * u.hypot(v)).max(1e-12) {
-                    return Err("三点共线，无法建立圆弧".into());
+                    return Err("三点共线或重合，无法建立圆/圆弧".into());
                 }
                 let cx = ((x * x + y * y) * v - (u * u + v * v) * y) / den;
                 let cy = (x * (u * u + v * v) - u * (x * x + y * y)) / den;
                 let center = self.plane.to_world([a[0] + cx, a[1] + cy, 0.0]);
+                if self.kind == SketchKind::Circle3P {
+                    let radius = cx.hypot(cy);
+                    if !finite(array(center)) || !radius.is_finite() || radius <= 1e-9 {
+                        return Err("三点圆超出有效数值范围".into());
+                    }
+                    return Ok(vec![Geometry::Circle(Circle {
+                        center,
+                        radius,
+                        plane,
+                    })]);
+                }
                 let start = (-cy).atan2(-cx);
                 let mid = (y - cy).atan2(x - cx);
                 let end = (v - cy).atan2(u - cx);

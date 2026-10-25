@@ -6,7 +6,7 @@ use super::cad_tools::{ToolOptions, TransformKind};
 use bevy::prelude::*;
 use bevy_egui::egui;
 use cad_core::geometry_edit::{AffineTransform, Sketch, SketchKind};
-use cad_core::model::{EntityId, Geometry, Plane, Point3, WorkPlane};
+use cad_core::model::{EntityId, Geometry, Plane, Point3, Vector3, WorkPlane};
 use cad_core::properties::{self, GripKind};
 
 enum Step {
@@ -159,6 +159,33 @@ impl CommandState {
     }
     pub fn copy_waiting_target(&self) -> bool {
         self.copying && matches!(self.step, Some(Step::Target { .. }))
+    }
+    pub fn circle_drawing(&self) -> bool {
+        matches!(&self.step, Some(Step::Draw {sketch,..}) if sketch.kind.is_circle())
+    }
+    pub fn circle_options(&self) -> &'static [(&'static str, &'static str)] {
+        if let Some(Step::Draw {
+            sketch,
+            confirmed: false,
+        }) = &self.step
+        {
+            if sketch.kind.is_circle() {
+                if sketch.points.is_empty() {
+                    return &[
+                        ("R", "圆心 / 半径"),
+                        ("D", "圆心 / 直径"),
+                        ("2P", "两点定直径"),
+                        ("3P", "三点定圆"),
+                    ];
+                }
+                if sketch.points.len() == 1
+                    && matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
+                {
+                    return &[("R", "按半径输入"), ("D", "按直径输入")];
+                }
+            }
+        }
+        &[]
     }
     pub fn curve_waiting_target(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.waiting_target())
@@ -385,10 +412,15 @@ impl CommandState {
             return None;
         }
         let reference = self.snap_reference().map(array);
-        let radius = matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind == SketchKind::Circle && !sketch.points.is_empty());
+        let radius = matches!(&self.step, Some(Step::Draw { sketch, .. }) if matches!(sketch.kind,SketchKind::Circle | SketchKind::CircleDiameter) && !sketch.points.is_empty());
         Some(Spec {
             kind: if radius {
-                Kind::Radius
+                if matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::CircleDiameter)
+                {
+                    Kind::Diameter
+                } else {
+                    Kind::Radius
+                }
             } else if reference.is_some() {
                 Kind::Polar
             } else {
@@ -426,6 +458,19 @@ impl CommandState {
         }
     }
     pub fn refresh_input_preview(&mut self, dynamic: &super::cad_input::DynamicInput, text: &str) {
+        if let Some(result) = self.circle_value_point(text) {
+            match result {
+                Ok(point) => {
+                    self.hover = Some(point);
+                    self.ray_error.clear();
+                }
+                Err(error) => {
+                    self.hover = None;
+                    self.ray_error = error;
+                }
+            }
+            return;
+        }
         if matches!(
             &self.step,
             Some(Step::Grip {
@@ -501,6 +546,46 @@ impl CommandState {
                 }
             }
         }
+    }
+    fn circle_value_point(&self, text: &str) -> Option<Result<[f64; 3], String>> {
+        if matches!(
+            text.trim().to_uppercase().as_str(),
+            "R" | "RADIUS" | "D" | "DIAMETER" | "U" | "UNDO"
+        ) {
+            return None;
+        }
+        let Some(Step::Draw {
+            sketch,
+            confirmed: false,
+        }) = &self.step
+        else {
+            return None;
+        };
+        if !matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
+            || sketch.points.len() != 1
+            || text.trim().is_empty()
+            || text.contains([',', '，', '<', ' '])
+            || text.starts_with(['@', '#'])
+        {
+            return None;
+        }
+        Some((|| {
+            let value = number(text)?;
+            if value <= 1e-9 {
+                return Err("半径/直径须大于几何容差".into());
+            }
+            let c = sketch.points[0];
+            let direction = self
+                .pointer_point
+                .map(as_point)
+                .map(|p| Vector3::new(p.x - c.x, p.y - c.y, p.z - c.z))
+                .map(|d| d - sketch.plane.normal() * d.dot(sketch.plane.normal()))
+                .filter(|d| d.length() > 1e-9)
+                .map(|d| d.normalize())
+                .unwrap_or(sketch.plane.x_axis);
+            let d = direction * value;
+            finite([c.x + d.x, c.y + d.y, c.z + d.z])
+        })())
     }
     fn radius_grip_point(&self, text: &str) -> Result<[f64; 3], String> {
         let Some(Step::Grip { geometry, base, .. }) = &self.step else {
@@ -650,6 +735,22 @@ impl CommandState {
                 }
             }
             Some(Step::Draw { sketch, confirmed }) => {
+                if sketch.kind.is_circle() && !confirmed {
+                    return format!(
+                        "{}：{}；U 撤回取点，Esc 取消",
+                        sketch.kind.label(),
+                        match (sketch.kind, sketch.points.len()) {
+                            (_, 0) => "指定圆心/首点；R 圆心半径 / D 圆心直径 / 2P 两点 / 3P 三点",
+                            (SketchKind::Circle, _) => "指定半径点或输入半径；D 改用直径",
+                            (SketchKind::CircleDiameter, _) =>
+                                "指定直径方向点或输入直径；R 改用半径",
+                            (SketchKind::Circle2P, _) =>
+                                "指定直径另一端点；数值为沿光标方向的直径长度",
+                            (_, 1) => "指定圆周第二点",
+                            _ => "指定圆周第三点（不能共线）",
+                        }
+                    );
+                }
                 return if *confirmed {
                     format!(
                         "{}：Enter 提交；输入坐标修改最后一点；Esc 取消",
@@ -666,7 +767,7 @@ impl CommandState {
                             "指定下一点；圆的半径/椭圆短半轴可输入长度"
                         }
                     )
-                }
+                };
             }
             Some(Step::TransformSelect { kind }) => {
                 return format!("{}：选择图元后 Enter；Esc 取消", kind.label())
@@ -844,6 +945,9 @@ impl CommandState {
             SketchKind::Polyline,
             SketchKind::Rectangle,
             SketchKind::Circle,
+            SketchKind::CircleDiameter,
+            SketchKind::Circle2P,
+            SketchKind::Circle3P,
             SketchKind::Arc,
             SketchKind::Ellipse,
             SketchKind::Spline,
@@ -1236,6 +1340,32 @@ impl CommandState {
         }
         if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
             let upper = text.trim().to_uppercase();
+            if sketch.kind.is_circle()
+                && matches!(
+                    upper.as_str(),
+                    "R" | "RADIUS" | "D" | "DIAMETER" | "2P" | "3P"
+                )
+            {
+                let kind = match upper.as_str() {
+                    "R" | "RADIUS" => SketchKind::Circle,
+                    "D" | "DIAMETER" => SketchKind::CircleDiameter,
+                    "2P" => SketchKind::Circle2P,
+                    _ => SketchKind::Circle3P,
+                };
+                if !sketch.points.is_empty()
+                    && (!matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
+                        || !matches!(kind, SketchKind::Circle | SketchKind::CircleDiameter)
+                        || *confirmed)
+                {
+                    return Err("两点/三点方式须在首点前选择；可用 U 撤回取点后切换".into());
+                }
+                sketch.kind = kind;
+                self.hover = None;
+                self.pointer_point = None;
+                self.aids.clear();
+                self.ray_error.clear();
+                return Ok(None);
+            }
             if matches!(upper.as_str(), "U" | "UNDO") {
                 sketch.points.pop().ok_or("没有可撤回的点")?;
                 sketch.closed = false;
@@ -1275,7 +1405,8 @@ impl CommandState {
             }
             if !text.contains([',', ' ', '<'])
                 && !text.starts_with(['@', '#'])
-                && ((sketch.kind == SketchKind::Circle && sketch.points.len() >= 1)
+                && ((matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
+                    && sketch.points.len() >= 1)
                     || (sketch.kind == SketchKind::Ellipse && sketch.points.len() >= 2))
             {
                 let radius = number(text)?;
@@ -1283,14 +1414,16 @@ impl CommandState {
                     return Err("半径/半轴长度必须大于零".into());
                 }
                 let c = sketch.points[0];
-                let direction = if sketch.kind == SketchKind::Circle {
-                    sketch.plane.x_axis
-                } else {
-                    let a = sketch.points[1];
-                    sketch.plane.normal().cross(
-                        cad_core::model::Vector3::new(a.x - c.x, a.y - c.y, a.z - c.z).normalize(),
-                    )
-                };
+                let direction =
+                    if matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter) {
+                        sketch.plane.x_axis
+                    } else {
+                        let a = sketch.points[1];
+                        sketch.plane.normal().cross(
+                            cad_core::model::Vector3::new(a.x - c.x, a.y - c.y, a.z - c.z)
+                                .normalize(),
+                        )
+                    };
                 let p = [
                     c.x + direction.x * radius,
                     c.y + direction.y * radius,
@@ -1543,6 +1676,7 @@ impl CommandState {
             .and_then(finite)
             .inspect(|point| self.pointer_point = Some(*point))
             .and_then(|point| dynamic.constrain(self, draft, point))
+            .and_then(|point| self.circle_value_point(draft).unwrap_or(Ok(point)))
             .and_then(finite);
         match point {
             Ok(point) => {
