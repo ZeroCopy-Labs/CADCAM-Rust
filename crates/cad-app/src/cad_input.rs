@@ -21,6 +21,7 @@ pub enum Kind {
     TargetLength,
     RectangleLength,
     RectangleWidth,
+    RectangleAngle,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -56,6 +57,7 @@ impl Spec {
             Kind::TargetLength => &["新长度 mm"],
             Kind::RectangleLength => &["矩形长度 mm"],
             Kind::RectangleWidth => &["矩形宽度 mm"],
+            Kind::RectangleAngle => &["矩形旋转 °"],
         }
     }
     fn values(self) -> [f64; 3] {
@@ -344,7 +346,8 @@ impl DynamicInput {
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
                     || !command.circle_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
-                    || command.rectangle_corner() && typed.eq_ignore_ascii_case("D")
+                    || command.rectangle_corner()
+                        && matches!(typed.to_uppercase().as_str(), "D" | "R")
                     || command.copy_mode().is_some()
                         && !command.selecting()
                         && matches!(typed.to_uppercase().as_str(), "M" | "S")
@@ -649,6 +652,7 @@ impl DynamicInput {
                             Kind::RectangleLength | Kind::RectangleWidth => {
                                 "输入正尺寸后确认；U 返回上一步"
                             }
+                            Kind::RectangleAngle => "相对工作平面 U 轴的角度；正角绕法向按右手方向",
                         });
                         let mut fields = self.fields(spec, text);
                         let target = self.field;

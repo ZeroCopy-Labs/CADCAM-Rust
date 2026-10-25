@@ -120,6 +120,8 @@ pub struct CommandState {
     copy_single: bool,
     copy_operations: Vec<u64>,
     rectangle_dimensions: Option<RectangleDimensions>,
+    rectangle_angle: f64,
+    rectangle_rotating: bool,
     pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
     step: Option<Step>,
@@ -368,6 +370,16 @@ impl CommandState {
     pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
         use super::cad_input::{Kind, Spec};
         if self.rectangle_corner() {
+            if self.rectangle_rotating {
+                return Some(Spec {
+                    kind: Kind::RectangleAngle,
+                    reference: None,
+                    plane: self.plane,
+                    point: None,
+                    value: self.rectangle_angle,
+                    secondary: 0.,
+                });
+            }
             let kind = match self.rectangle_dimensions {
                 Some(RectangleDimensions::Length) => Some(Kind::RectangleLength),
                 Some(RectangleDimensions::Width(_)) => Some(Kind::RectangleWidth),
@@ -690,6 +702,9 @@ impl CommandState {
         ) || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
     }
     pub fn takes_point(&self) -> bool {
+        if self.rectangle_corner() && self.rectangle_rotating {
+            return false;
+        }
         if self.rectangle_corner()
             && matches!(
                 self.rectangle_dimensions,
@@ -733,11 +748,18 @@ impl CommandState {
 
     pub fn prompt(&self) -> String {
         if self.rectangle_corner() {
+            if self.rectangle_rotating {
+                return format!(
+                    "矩形旋转：输入相对当前工作平面 U 轴的角度 <{:.4}°>；U 返回上一步，Esc 取消",
+                    self.rectangle_angle
+                );
+            }
+            let prefix = format!("矩形（旋转 {:.4}°）", self.rectangle_angle);
             return match self.rectangle_dimensions {
-                Some(RectangleDimensions::Length)=>"矩形尺寸：输入沿工作平面 U 的正长度；U 返回对角点方式，Esc 取消".into(),
-                Some(RectangleDimensions::Width(length))=>format!("矩形尺寸：长度 {length:.4} mm；输入沿工作平面 V 的正宽度；U 重输长度"),
-                Some(RectangleDimensions::Place([length,width]))=>format!("矩形 {length:.4} × {width:.4} mm：移动鼠标选择放置象限，点击/Enter 确认；D 重输尺寸，U 重输宽度，Esc 取消"),
-                None=>"矩形：指定对角点，或 D 输入长度和宽度；U 撤回首角点，Esc 取消".into(),
+                Some(RectangleDimensions::Length)=>format!("{prefix}：输入沿旋转后 U 的正长度；R 设置角度，U 返回对角点方式"),
+                Some(RectangleDimensions::Width(length))=>format!("{prefix}：长度 {length:.4} mm；输入沿旋转后 V 的正宽度；R 设置角度，U 重输长度"),
+                Some(RectangleDimensions::Place([length,width]))=>format!("{prefix} {length:.4} × {width:.4} mm：移动鼠标选择旋转后象限，点击/Enter 确认；D 重输尺寸，R 设置角度，U 重输宽度"),
+                None=>format!("{prefix}：指定对角点，或 D 输入长宽 / R 设置角度；U 撤回首角点，Esc 取消"),
             };
         }
         if let Some(multiple) = self.copy_mode() {
@@ -1085,6 +1107,8 @@ impl CommandState {
     }
     pub fn cancel(&mut self) {
         self.rectangle_dimensions = None;
+        self.rectangle_angle = 0.;
+        self.rectangle_rotating = false;
         self.copying = false;
         self.copy_single = false;
         self.copy_operations.clear();
@@ -1200,8 +1224,38 @@ impl CommandState {
     ) -> Result<Option<CommandCommit>, String> {
         if self.rectangle_corner() {
             let upper = text.trim().to_uppercase();
+            if matches!(upper.as_str(), "R" | "ROTATION") {
+                self.rectangle_rotating = true;
+                self.clear_hover();
+                self.ray_error.clear();
+                return Ok(None);
+            }
             if matches!(upper.as_str(), "D" | "DIMENSIONS") {
+                self.rectangle_rotating = false;
                 self.rectangle_dimensions = Some(RectangleDimensions::Length);
+                self.clear_hover();
+                self.ray_error.clear();
+                return Ok(None);
+            }
+            if self.rectangle_rotating {
+                if !matches!(upper.as_str(), "U" | "UNDO") {
+                    let angle = if text.trim().is_empty() {
+                        self.rectangle_angle
+                    } else {
+                        number(text)?
+                    }
+                    .rem_euclid(360.);
+                    let (s, c) = angle.to_radians().sin_cos();
+                    if let Some(Step::Draw { sketch, .. }) = &mut self.step {
+                        sketch.plane = WorkPlane {
+                            origin: self.plane.origin,
+                            x_axis: self.plane.x_axis * c + self.plane.y_axis * s,
+                            y_axis: self.plane.y_axis * c - self.plane.x_axis * s,
+                        };
+                    }
+                    self.rectangle_angle = angle;
+                }
+                self.rectangle_rotating = false;
                 self.clear_hover();
                 self.ray_error.clear();
                 return Ok(None);
@@ -1507,6 +1561,11 @@ impl CommandState {
             }
             if matches!(upper.as_str(), "U" | "UNDO") {
                 sketch.points.pop().ok_or("没有可撤回的点")?;
+                if sketch.kind == SketchKind::Rectangle && sketch.points.is_empty() {
+                    sketch.plane = self.plane;
+                    self.rectangle_angle = 0.;
+                    self.rectangle_rotating = false;
+                }
                 sketch.closed = false;
                 *confirmed = false;
                 return Ok(None);
@@ -2039,6 +2098,9 @@ impl CommandState {
         self.aids.controls(ui);
         if self.rectangle_corner() && ui.button("D 矩形长度 / 宽度").clicked() {
             command = Some("D".into());
+        }
+        if self.rectangle_corner() && ui.button("R 矩形旋转角度").clicked() {
+            command = Some("R".into());
         }
         if self.copy_mode().is_some() && !self.selecting() {
             ui.horizontal(|ui| {

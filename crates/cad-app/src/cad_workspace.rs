@@ -98,6 +98,10 @@ impl Workspace {
                         }
                     }
                     if command.rectangle_drawing() {
+                        if command.rectangle_corner() && ui.button("设置矩形旋转角度  R").clicked()
+                        {
+                            action = Some("R".into());
+                        }
                         if command.rectangle_corner()
                             && ui.button("输入矩形长度 / 宽度  D").clicked()
                         {
