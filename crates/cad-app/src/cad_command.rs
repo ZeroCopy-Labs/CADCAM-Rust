@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use cad_core::model::{Point3, Vector3, WorkPlane};
+use cad_core::model::{Point3, WorkPlane};
 
 enum Step {
     Select,
@@ -37,6 +37,7 @@ pub struct MoveCommit {
 
 #[derive(Default)]
 pub struct CommandState {
+    pub aids: super::cad_aids::DraftingAids,
     pub plane: WorkPlane,
     step: Option<Step>,
     hover: Option<[f64; 3]>,
@@ -90,6 +91,7 @@ impl CommandState {
     }
 
     pub fn cancel(&mut self) {
+        self.aids.clear();
         self.ray_error.clear();
         self.step = None;
         self.hover = None;
@@ -125,6 +127,24 @@ impl CommandState {
         }
     }
 
+    fn snap_reference(&self) -> Option<Point3> {
+        match self.step {
+            Some(
+                Step::Target { .. }
+                | Step::Confirm { .. }
+                | Step::PlaneAxis { .. }
+                | Step::PlaneThird { .. },
+            ) => Some(as_point(self.reference())),
+            _ => None,
+        }
+    }
+    pub fn cycle_snap(&mut self, reverse: bool) {
+        if self.takes_point() {
+            if let Some(point) = self.aids.cycle(reverse) {
+                self.hover = Some(array(point));
+            }
+        }
+    }
     pub fn input(
         &mut self,
         text: &str,
@@ -200,6 +220,7 @@ impl CommandState {
             Step::Select => return Err("请先确认选择".into()),
         };
         self.hover = None;
+        self.aids.clear();
         self.error.clear();
         self.ray_error.clear();
         Ok(())
@@ -210,29 +231,24 @@ impl CommandState {
         camera: &Camera,
         transform: &GlobalTransform,
         cursor: Vec2,
+        frame: super::cad_view::ViewFrame,
+        document: &cad_core::DrawingDocument,
         click: bool,
     ) -> bool {
         if !self.takes_point() {
             return false;
         }
-        let point = camera
-            .viewport_to_world(transform, cursor)
-            .map_err(|_| "当前相机无法取点".to_string())
+        let reference = self.snap_reference();
+        let point = frame
+            .ray(camera, transform, cursor)
+            .ok_or_else(|| "当前相机无法取点".to_string())
             .and_then(|ray| {
-                self.plane.intersect_ray(
-                    Point3::new(
-                        ray.origin.x as f64,
-                        -ray.origin.z as f64,
-                        ray.origin.y as f64,
-                    ),
-                    Vector3::new(
-                        ray.direction.x as f64,
-                        -ray.direction.z as f64,
-                        ray.direction.y as f64,
-                    ),
+                self.aids.resolve(
+                    document, frame, camera, transform, cursor, ray, self.plane, reference,
                 )
             })
-            .map(array);
+            .map(array)
+            .and_then(finite);
         match point {
             Ok(point) => {
                 self.hover = Some(point);
@@ -253,6 +269,7 @@ impl CommandState {
     }
 
     pub fn clear_hover(&mut self) {
+        self.aids.clear();
         self.hover = None;
     }
 
@@ -272,6 +289,7 @@ impl CommandState {
     pub fn controls_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let mut command = None;
         ui.strong("精确移动与工作平面");
+        self.aids.controls(ui);
         ui.label(self.prompt());
         if self.is_active() {
             if !self.error_message().is_empty() {
@@ -358,9 +376,10 @@ impl CommandState {
         command
     }
 
-    pub fn draw_plane(&self, gizmos: &mut Gizmos, extent: f64) {
+    pub fn draw_plane(&self, gizmos: &mut Gizmos, extent: f64, frame: super::cad_view::ViewFrame) {
+        self.aids.draw(gizmos, frame, self.plane);
         let length = (extent * 0.2).clamp(5.0, 1000.0);
-        let origin = super::to_render_point(array(self.plane.origin));
+        let origin = frame.point(array(self.plane.origin));
         if !origin.is_finite() {
             return;
         }
@@ -371,7 +390,7 @@ impl CommandState {
         ] {
             gizmos.line(
                 origin,
-                super::to_render_point(array(self.plane.to_world(local))),
+                frame.point(array(self.plane.to_world(local))),
                 color,
             );
         }
@@ -384,13 +403,13 @@ impl CommandState {
         ];
         for pair in corners.windows(2) {
             gizmos.line(
-                super::to_render_point(array(self.plane.to_world(pair[0]))),
-                super::to_render_point(array(self.plane.to_world(pair[1]))),
+                frame.point(array(self.plane.to_world(pair[0]))),
+                frame.point(array(self.plane.to_world(pair[1]))),
                 Color::srgb(0.2, 0.35, 0.45),
             );
         }
         if let Some(point) = self.hover {
-            let p = super::to_render_point(point);
+            let p = frame.point(point);
             if p.is_finite() {
                 for direction in [Vec3::X, Vec3::Y, Vec3::Z] {
                     gizmos.line(
@@ -406,8 +425,8 @@ impl CommandState {
             Some(Step::Confirm { base, target, .. }) => Some((*base, *target)),
             Some(Step::PlaneAxis { origin }) => self.hover.map(|target| (*origin, target)),
             Some(Step::PlaneThird { origin, x }) => {
-                let start = super::to_render_point(*origin);
-                let end = super::to_render_point(*x);
+                let start = frame.point(*origin);
+                let end = frame.point(*x);
                 if start.is_finite() && end.is_finite() {
                     gizmos.line(start, end, Color::srgb(1.0, 0.6, 0.2));
                 }
@@ -416,8 +435,8 @@ impl CommandState {
             _ => None,
         };
         if let Some((base, target)) = anchored {
-            let base = super::to_render_point(base);
-            let target = super::to_render_point(target);
+            let base = frame.point(base);
+            let target = frame.point(target);
             if base.is_finite() && target.is_finite() {
                 gizmos.line(base, target, Color::srgb(1.0, 0.6, 0.2));
                 for point in [base, target] {

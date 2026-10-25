@@ -18,6 +18,7 @@ mod file_io;
 mod import;
 
 pub mod model;
+pub mod snap;
 
 pub use convert::{aci_color_rgb, read_document, read_editable_document};
 pub use edit::{DrawingChange, DrawingEdit, EditableDrawing};

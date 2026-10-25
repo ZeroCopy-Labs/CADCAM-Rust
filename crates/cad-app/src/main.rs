@@ -22,9 +22,12 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use cad_core::{DrawingChange, DrawingEdit};
 use cad_file::open_drawing;
 
+mod cad_aids;
 mod cad_command;
 mod cad_edit;
 mod cad_file;
+mod cad_selection;
+mod cad_view;
 mod cam;
 mod cam_analysis;
 mod cam_trajectory;
@@ -57,6 +60,7 @@ struct ViewerState {
     layer_count: usize,
     warning_count: usize,
     display: display::DisplayData,
+    view: cad_view::ViewFrame,
     cam: cam::CamModel,
     analysis: cam_analysis::CamAnalysis,
     manual_tube: cam_analysis::TubeSection,
@@ -101,7 +105,7 @@ struct TransferExample {
 /// Orbit camera state, independent from the loaded drawing.
 #[derive(Resource)]
 struct CameraRig {
-    target: Vec3,
+    target: [f64; 3],
     yaw: f32,
     pitch: f32,
     distance: f32,
@@ -111,7 +115,7 @@ struct CameraRig {
 impl Default for CameraRig {
     fn default() -> Self {
         Self {
-            target: Vec3::ZERO,
+            target: [0.0; 3],
             yaw: -FRAC_PI_4,
             pitch: 0.55,
             distance: 100.0,
@@ -153,6 +157,21 @@ struct SelectionState {
     drag_current: Option<Vec2>,
     reorder_clicks: Option<ReorderClicks>,
     load_version: u64,
+    filter: cad_selection::SelectionFilter,
+    hover_hits: Vec<u32>,
+    hover_index: usize,
+    hover_cursor: Option<Vec2>,
+}
+impl SelectionState {
+    fn hovered(&self) -> Option<u32> {
+        self.hover_hits.get(self.hover_index).copied()
+    }
+    fn cycle(&mut self, reverse: bool) {
+        let n = self.hover_hits.len();
+        if n > 0 {
+            self.hover_index = (self.hover_index + if reverse { n - 1 } else { 1 }) % n;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -400,8 +419,10 @@ fn orbit_camera(
             if right.length_squared() > 0.0 {
                 let up = right.cross(forward).normalize();
                 let speed = rig.ortho_scale;
-                rig.target -= right * motion.delta.x * speed;
-                rig.target += up * motion.delta.y * speed;
+                let delta = -right * motion.delta.x * speed + up * motion.delta.y * speed;
+                rig.target[0] += delta.x as f64;
+                rig.target[1] -= delta.z as f64;
+                rig.target[2] += delta.y as f64;
             }
         }
     }
@@ -430,11 +451,15 @@ fn fit_camera(
     let width = (bounds.max_x - bounds.min_x).abs().max(1.0e-6);
     let depth = (bounds.max_y - bounds.min_y).abs().max(1.0e-6);
     let height = (bounds.max_z - bounds.min_z).abs().max(1.0e-6);
-    let center = Vec3::new(
-        ((bounds.min_x + bounds.max_x) * 0.5) as f32,
-        ((bounds.min_z + bounds.max_z) * 0.5) as f32,
-        -((bounds.min_y + bounds.max_y) * 0.5) as f32,
-    );
+    let center = [
+        bounds.min_x + (bounds.max_x - bounds.min_x) * 0.5,
+        bounds.min_y + (bounds.max_y - bounds.min_y) * 0.5,
+        bounds.min_z + (bounds.max_z - bounds.min_z) * 0.5,
+    ];
+    let frame = cad_view::ViewFrame {
+        origin: center,
+        pixel_size: 1.0,
+    };
     rig.target = center;
 
     // Fit the camera-aligned bounding box, so Z heights are included.
@@ -452,7 +477,7 @@ fn fit_camera(
     for x in [bounds.min_x, bounds.max_x] {
         for y in [bounds.min_y, bounds.max_y] {
             for z in [bounds.min_z, bounds.max_z] {
-                let corner = Vec3::new(x as f32, z as f32, -(y as f32)) - center;
+                let corner = frame.point([x, y, z]);
                 max_right = max_right.max(corner.dot(right).abs());
                 max_up = max_up.max(corner.dot(up).abs());
             }
@@ -470,12 +495,15 @@ fn fit_camera(
 }
 
 fn update_camera(
+    mut state: ResMut<ViewerState>,
     rig: Res<CameraRig>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
 ) {
-    let eye = rig.target + rig.direction() * rig.distance;
+    state.view.origin = rig.target;
+    state.view.pixel_size = rig.ortho_scale as f64;
+    let eye = rig.direction() * rig.distance;
     let (mut transform, mut projection) = camera.into_inner();
-    *transform = Transform::from_translation(eye).looking_at(rig.target, Vec3::Y);
+    *transform = Transform::from_translation(eye).looking_at(Vec3::ZERO, Vec3::Y);
     if let Projection::Orthographic(orthographic) = &mut *projection {
         orthographic.scale = rig.ortho_scale;
     }
@@ -590,7 +618,11 @@ fn draw_scene(
                 .map(|unit_id| selection.cam_selected.contains(&unit_id))
                 .unwrap_or(false),
         };
-        let color = if is_selected {
+        let is_hovered =
+            space.mode == SpaceMode::Cad && selection.hovered() == Some(path.entity_id);
+        let color = if is_hovered && !is_selected {
+            Color::srgb(1.0, 0.5, 0.12)
+        } else if is_selected {
             Color::srgb(1.0, 0.82, 0.22)
         } else {
             Color::srgb(path.color[0], path.color[1], path.color[2])
@@ -598,9 +630,9 @@ fn draw_scene(
         for pair in path.points.windows(2) {
             let [x0, y0, z0] = pair[0];
             let [x1, y1, z1] = pair[1];
-            let start = Vec3::new(x0 as f32, z0 as f32, -(y0 as f32));
-            let end = Vec3::new(x1 as f32, z1 as f32, -(y1 as f32));
-            if is_selected {
+            let start = state.view.point([x0, y0, z0]);
+            let end = state.view.point([x1, y1, z1]);
+            if is_selected || is_hovered {
                 selected_gizmos.line(start, end, color);
             } else {
                 gizmos.line(start, end, color);
@@ -611,9 +643,12 @@ fn draw_scene(
             .filter(|preview| preview.ids.contains(&path.entity_id))
         {
             for pair in path.points.windows(2) {
-                let start =
-                    to_render_point(std::array::from_fn(|i| pair[0][i] + preview.offset[i]));
-                let end = to_render_point(std::array::from_fn(|i| pair[1][i] + preview.offset[i]));
+                let start = state
+                    .view
+                    .point(std::array::from_fn(|i| pair[0][i] + preview.offset[i]));
+                let end = state
+                    .view
+                    .point(std::array::from_fn(|i| pair[1][i] + preview.offset[i]));
                 if start.is_finite() && end.is_finite() {
                     selected_gizmos.line(start, end, Color::srgb(0.15, 1.0, 1.0));
                 }
@@ -633,25 +668,27 @@ fn draw_scene(
         })
         .unwrap_or(100.0);
     if space.mode == SpaceMode::Cad {
-        state.cad_command.draw_plane(&mut gizmos, extent as f64);
+        state
+            .cad_command
+            .draw_plane(&mut gizmos, extent as f64, state.view);
     }
     let axis = extent * 0.6;
     let z_axis = axis * 0.5;
     let red = Color::srgb(0.85, 0.25, 0.25);
     let green = Color::srgb(0.30, 0.85, 0.35);
     let blue = Color::srgb(0.25, 0.45, 0.95);
-    let origin = Vec3::ZERO;
+    let origin = state.view.point([0.0; 3]);
 
     // CAD +X, +Y and +Z in Bevy coordinates: CAD Y maps to -Bevy Z.
     let positive_x = Vec3::X * axis;
     let positive_y = -Vec3::Z * axis;
     let positive_z = Vec3::Y * z_axis;
-    gizmos.line(origin, positive_x, red);
-    gizmos.line(origin, positive_y, blue);
-    gizmos.line(origin, positive_z, green);
-    negative_axes.line(origin, -positive_x, red);
-    negative_axes.line(origin, -positive_y, blue);
-    negative_axes.line(origin, -positive_z, green);
+    gizmos.line(origin, origin + positive_x, red);
+    gizmos.line(origin, origin + positive_y, blue);
+    gizmos.line(origin, origin + positive_z, green);
+    negative_axes.line(origin, origin - positive_x, red);
+    negative_axes.line(origin, origin - positive_y, blue);
+    negative_axes.line(origin, origin - positive_z, green);
 }
 
 /// Mouse selection: click picking, Shift+click add, and AutoCAD-style
@@ -680,6 +717,10 @@ fn selection_input(
         selection.drag_current = None;
         selection.reorder_clicks = None;
         selection.load_version = state.load_version;
+        selection.hover_hits.clear();
+        selection.hover_cursor = None;
+        selection.hover_index = 0;
+        selection.filter = Default::default();
     }
     selection.selected.retain(|id| valid.contains(id));
     let valid_units: BTreeSet<cam::UnitId> = state.cam.units.iter().map(|unit| unit.id).collect();
@@ -687,6 +728,9 @@ fn selection_input(
 
     let Some(cursor) = window.cursor_position() else {
         state.cad_command.clear_hover();
+        selection.hover_hits.clear();
+        selection.hover_cursor = None;
+        selection.hover_index = 0;
         return Ok(());
     };
     let context = contexts.ctx_mut()?;
@@ -694,6 +738,9 @@ fn selection_input(
         || context.egui_wants_pointer_input()
         || context.egui_is_using_pointer();
     if ui_active {
+        selection.hover_hits.clear();
+        selection.hover_cursor = None;
+        selection.hover_index = 0;
         state.cad_command.clear_hover();
         // A click that starts on the panel resize handle must be owned by the
         // panel, even if the first press frame already reached this system.
@@ -703,16 +750,36 @@ fn selection_input(
         return Ok(());
     }
     let (camera, camera_transform) = camera.into_inner();
+    let nearby = pick_entities(
+        &state.display,
+        &state.view,
+        camera,
+        camera_transform,
+        cursor,
+    );
     if space.mode == SpaceMode::Cad
         && state.cad_command.is_active()
         && !state.cad_command.selecting()
     {
-        let accepted = state.cad_command.viewport_point(
-            camera,
-            camera_transform,
-            cursor,
-            mouse.just_pressed(MouseButton::Left),
-        );
+        selection.hover_hits.clear();
+        let accepted = {
+            let ViewerState {
+                drawing,
+                cad_command,
+                view,
+                ..
+            } = &mut *state;
+            drawing.as_ref().is_some_and(|drawing| {
+                cad_command.viewport_point(
+                    camera,
+                    camera_transform,
+                    cursor,
+                    *view,
+                    drawing.document(),
+                    mouse.just_pressed(MouseButton::Left),
+                )
+            })
+        };
         if accepted {
             state.command_input.clear();
             if !state.cad_command.is_active() {
@@ -723,6 +790,35 @@ fn selection_input(
         selection.drag_current = None;
         return Ok(());
     }
+    if space.mode == SpaceMode::Cad {
+        let hits: Vec<_> = nearby
+            .into_iter()
+            .filter(|id| {
+                state
+                    .display
+                    .entities
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .is_some_and(|e| selection.filter.matches(e))
+            })
+            .collect();
+        if selection
+            .hover_cursor
+            .is_none_or(|p| p.distance(cursor) > 3.0)
+            || selection.hover_hits != hits
+        {
+            selection.hover_index = 0;
+        }
+        selection.hover_cursor = Some(cursor);
+        selection.hover_hits = hits;
+        if selection.hover_hits.is_empty() {
+            selection.hover_index = 0;
+        } else {
+            selection.hover_index %= selection.hover_hits.len();
+        }
+    } else {
+        selection.hover_hits.clear();
+    }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if !ctrl {
         selection.reorder_clicks = None;
@@ -730,8 +826,14 @@ fn selection_input(
 
     if mouse.just_pressed(MouseButton::Left) {
         if space.mode == SpaceMode::Cam && ctrl {
-            if let Some(unit_id) = pick_entity(&state.display, camera, camera_transform, cursor)
-                .and_then(|entity_id| state.cam.unit_for_entity(entity_id))
+            if let Some(unit_id) = pick_entity(
+                &state.display,
+                &state.view,
+                camera,
+                camera_transform,
+                cursor,
+            )
+            .and_then(|entity_id| state.cam.unit_for_entity(entity_id))
             {
                 let mut reorder = selection.reorder_clicks.take();
                 if reorder.is_none() && selection.cam_selected.contains(&unit_id) {
@@ -772,21 +874,22 @@ fn selection_input(
         if (end - start).length() < 4.0 {
             match space.mode {
                 SpaceMode::Cad => {
-                    let hit = pick_entity(&state.display, camera, camera_transform, cursor);
-                    if shift {
-                        if let Some(id) = hit {
-                            selection.selected.insert(id);
-                        }
-                    } else {
-                        selection.selected.clear();
-                        if let Some(id) = hit {
-                            selection.selected.insert(id);
-                        }
-                    }
+                    let chosen = selection.hovered().into_iter().collect();
+                    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+                    let SelectionState {
+                        filter, selected, ..
+                    } = &mut *selection;
+                    filter.apply(selected, chosen, shift, alt, ctrl);
                 }
                 SpaceMode::Cam => {
-                    let hit = pick_entity(&state.display, camera, camera_transform, cursor)
-                        .and_then(|entity_id| state.cam.unit_for_entity(entity_id));
+                    let hit = pick_entity(
+                        &state.display,
+                        &state.view,
+                        camera,
+                        camera_transform,
+                        cursor,
+                    )
+                    .and_then(|entity_id| state.cam.unit_for_entity(entity_id));
                     if shift {
                         if let Some(id) = hit {
                             selection.cam_selected.insert(id);
@@ -802,17 +905,35 @@ fn selection_input(
         } else {
             match space.mode {
                 SpaceMode::Cad => {
-                    let chosen = box_select(&state.display, camera, camera_transform, start, end);
-                    if shift {
-                        selection.selected.extend(chosen);
-                    } else {
-                        selection.selected = chosen;
-                    }
+                    let chosen = box_select(
+                        &state.display,
+                        &state.view,
+                        camera,
+                        camera_transform,
+                        start,
+                        end,
+                    )
+                    .into_iter()
+                    .filter(|id| {
+                        state
+                            .display
+                            .entities
+                            .iter()
+                            .find(|e| e.id == *id)
+                            .is_some_and(|e| selection.filter.matches(e))
+                    })
+                    .collect();
+                    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+                    let SelectionState {
+                        filter, selected, ..
+                    } = &mut *selection;
+                    filter.apply(selected, chosen, shift, alt, ctrl);
                 }
                 SpaceMode::Cam => {
                     let chosen = box_select_units(
                         &state.display,
                         &state.cam,
+                        &state.view,
                         camera,
                         camera_transform,
                         start,
@@ -830,49 +951,75 @@ fn selection_input(
     Ok(())
 }
 
-fn to_render_point(point: [f64; 3]) -> Vec3 {
-    Vec3::new(point[0] as f32, point[2] as f32, -(point[1] as f32))
-}
-
 fn project_entity_point(
     camera: &Camera,
     camera_transform: &GlobalTransform,
     point: [f64; 3],
+    frame: &cad_view::ViewFrame,
 ) -> Option<Vec2> {
-    camera
-        .world_to_viewport(camera_transform, to_render_point(point))
-        .ok()
+    frame.project(camera, camera_transform, point)
 }
 
-fn pick_entity(
+fn pick_entities(
     display: &display::DisplayData,
+    frame: &cad_view::ViewFrame,
     camera: &Camera,
-    camera_transform: &GlobalTransform,
+    transform: &GlobalTransform,
     cursor: Vec2,
-) -> Option<u32> {
-    let mut best: Option<(f32, u32)> = None;
+) -> Vec<u32> {
+    let mut hits: BTreeMap<u32, (f32, f32)> = BTreeMap::new();
     for path in &display.paths {
-        let projected: Vec<Vec2> = path
-            .points
-            .iter()
-            .filter_map(|point| project_entity_point(camera, camera_transform, *point))
-            .collect();
-        for pair in projected.windows(2) {
-            let distance = distance_to_segment(cursor, pair[0], pair[1]);
-            if distance <= PICK_TOLERANCE
-                && best
-                    .map(|(best_distance, _)| distance < best_distance)
-                    .unwrap_or(true)
-            {
-                best = Some((distance, path.entity_id));
+        for pair in path.points.windows(2) {
+            let (Some(a), Some(b)) = (
+                frame.project(camera, transform, pair[0]),
+                frame.project(camera, transform, pair[1]),
+            ) else {
+                continue;
+            };
+            let distance = distance_to_segment(cursor, a, b);
+            if distance > PICK_TOLERANCE {
+                continue;
+            }
+            let segment = b - a;
+            let t = if segment.length_squared() > 1e-12 {
+                ((cursor - a).dot(segment) / segment.length_squared()).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let point = frame.point(std::array::from_fn(|i| {
+                pair[0][i] + (pair[1][i] - pair[0][i]) * t as f64
+            }));
+            let depth = (point - transform.translation()).length_squared();
+            let hit = hits.entry(path.entity_id).or_insert((distance, depth));
+            if distance < hit.0 || distance == hit.0 && depth < hit.1 {
+                *hit = (distance, depth);
             }
         }
     }
-    best.map(|(_, id)| id)
+    let mut hits: Vec<_> = hits.into_iter().collect();
+    hits.sort_by(|a, b| {
+        a.1 .0
+            .total_cmp(&b.1 .0)
+            .then(a.1 .1.total_cmp(&b.1 .1))
+            .then(a.0.cmp(&b.0))
+    });
+    hits.into_iter().map(|(id, _)| id).collect()
+}
+fn pick_entity(
+    display: &display::DisplayData,
+    frame: &cad_view::ViewFrame,
+    camera: &Camera,
+    transform: &GlobalTransform,
+    cursor: Vec2,
+) -> Option<u32> {
+    pick_entities(display, frame, camera, transform, cursor)
+        .into_iter()
+        .next()
 }
 
 fn box_select(
     display: &display::DisplayData,
+    frame: &cad_view::ViewFrame,
     camera: &Camera,
     camera_transform: &GlobalTransform,
     start: Vec2,
@@ -886,23 +1033,30 @@ fn box_select(
         let projected: Vec<Vec2> = path
             .points
             .iter()
-            .filter_map(|point| project_entity_point(camera, camera_transform, *point))
+            .filter_map(|point| project_entity_point(camera, camera_transform, *point, frame))
             .collect();
         if projected.len() < 2 {
             continue;
         }
 
         let hit = if window_mode {
-            projected
-                .iter()
-                .all(|point| rect.contains(egui::pos2(point.x, point.y)))
+            projected.len() == path.points.len()
+                && projected
+                    .iter()
+                    .all(|point| rect.contains(egui::pos2(point.x, point.y)))
         } else {
             projected
                 .iter()
                 .any(|point| rect.contains(egui::pos2(point.x, point.y)))
-                || projected
-                    .windows(2)
-                    .any(|pair| segment_intersects_rect(pair[0], pair[1], rect))
+                || path.points.windows(2).any(|pair| {
+                    match (
+                        frame.project(camera, camera_transform, pair[0]),
+                        frame.project(camera, camera_transform, pair[1]),
+                    ) {
+                        (Some(a), Some(b)) => segment_intersects_rect(a, b, rect),
+                        _ => false,
+                    }
+                })
         };
         if hit {
             selected.insert(path.entity_id);
@@ -914,6 +1068,7 @@ fn box_select(
 fn box_select_units(
     display: &display::DisplayData,
     cam: &cam::CamModel,
+    frame: &cad_view::ViewFrame,
     camera: &Camera,
     camera_transform: &GlobalTransform,
     start: Vec2,
@@ -935,21 +1090,29 @@ fn box_select_units(
             let projected: Vec<Vec2> = path
                 .points
                 .iter()
-                .filter_map(|point| project_entity_point(camera, camera_transform, *point))
+                .filter_map(|point| project_entity_point(camera, camera_transform, *point, frame))
                 .collect();
             if projected.len() < 2 {
+                all_inside = false;
                 continue;
             }
             has_projection = true;
-            all_inside &= projected
-                .iter()
-                .all(|point| rect.contains(egui::pos2(point.x, point.y)));
+            all_inside &= projected.len() == path.points.len()
+                && projected
+                    .iter()
+                    .all(|point| rect.contains(egui::pos2(point.x, point.y)));
             intersects |= projected
                 .iter()
                 .any(|point| rect.contains(egui::pos2(point.x, point.y)))
-                || projected
-                    .windows(2)
-                    .any(|pair| segment_intersects_rect(pair[0], pair[1], rect));
+                || path.points.windows(2).any(|pair| {
+                    match (
+                        frame.project(camera, camera_transform, pair[0]),
+                        frame.project(camera, camera_transform, pair[1]),
+                    ) {
+                        (Some(a), Some(b)) => segment_intersects_rect(a, b, rect),
+                        _ => false,
+                    }
+                });
         }
 
         let hit = has_projection && if window_mode { all_inside } else { intersects };
@@ -1729,21 +1892,15 @@ fn draw_machining_order_labels(
                 Some(unit.start_point),
             ) {
                 if let Some(start_point) = path.first() {
-                    if let Ok(start_screen) = camera.world_to_viewport(
-                        camera_transform,
-                        Vec3::new(
-                            start_point[0] as f32,
-                            start_point[2] as f32,
-                            -(start_point[1] as f32),
-                        ),
-                    ) {
+                    if let Ok(start_screen) =
+                        camera.world_to_viewport(camera_transform, state.view.point(*start_point))
+                    {
                         let start = egui::pos2(start_screen.x, start_screen.y);
                         let mut direction = None;
                         for point in path.iter().skip(1) {
-                            if let Ok(next_screen) = camera.world_to_viewport(
-                                camera_transform,
-                                Vec3::new(point[0] as f32, point[2] as f32, -(point[1] as f32)),
-                            ) {
+                            if let Ok(next_screen) =
+                                camera.world_to_viewport(camera_transform, state.view.point(*point))
+                            {
                                 let delta = egui::vec2(
                                     next_screen.x - start_screen.x,
                                     next_screen.y - start_screen.y,
@@ -1781,7 +1938,7 @@ fn draw_machining_order_labels(
             let Some(center) = unit_center(&state.display, &state.cam, unit.unit_id) else {
                 continue;
             };
-            let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
+            let world = state.view.point(center);
             let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
                 continue;
             };
@@ -1843,7 +2000,7 @@ fn draw_machining_section_labels(
         let Some(center) = unit_center(&state.display, &state.cam, section.unit_id) else {
             continue;
         };
-        let world = Vec3::new(center[0] as f32, center[2] as f32, -(center[1] as f32));
+        let world = state.view.point(center);
         let Ok(screen) = camera.world_to_viewport(camera_transform, world) else {
             continue;
         };
@@ -1921,6 +2078,7 @@ fn drawing_ui(
     mut fonts_loaded: Local<bool>,
     mut ui_state: ResMut<UiState>,
 ) -> Result {
+    let (view_camera, view_transform) = view_camera.into_inner();
     let context = contexts.ctx_mut()?;
     install_cjk_font(context, &mut fonts_loaded);
     context.set_visuals(egui::Visuals::dark());
@@ -1943,6 +2101,53 @@ fn drawing_ui(
                     && input.consume_key(egui::Modifiers::CTRL, egui::Key::M)
                 {
                     command_request = Some("MOVE".to_string());
+                }
+            }
+        });
+    }
+    let command_field =
+        context.memory(|memory| memory.has_focus(egui::Id::new("cad_command_input")));
+    if space.mode == SpaceMode::Cad
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && (!context.egui_wants_keyboard_input() || command_field && state.command_input.is_empty())
+    {
+        context.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
+                state.cad_command.aids.enabled = !state.cad_command.aids.enabled;
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F7) {
+                state.cad_command.aids.grid = !state.cad_command.aids.grid;
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
+                state.cad_command.aids.grid_snap = !state.cad_command.aids.grid_snap;
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
+                let aids = &mut state.cad_command.aids;
+                aids.ortho = !aids.ortho;
+                if aids.ortho {
+                    aids.polar = false;
+                }
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
+                let aids = &mut state.cad_command.aids;
+                aids.polar = !aids.polar;
+                if aids.polar {
+                    aids.ortho = false;
+                }
+            }
+            let can_cycle = if state.cad_command.takes_point() {
+                state.cad_command.aids.has_candidates()
+            } else {
+                (!state.cad_command.is_active() || state.cad_command.selecting())
+                    && !selection.hover_hits.is_empty()
+            };
+            let reverse = can_cycle && input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+            if can_cycle && (reverse || input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+                if state.cad_command.takes_point() {
+                    state.cad_command.cycle_snap(reverse);
+                } else if !state.cad_command.is_active() || state.cad_command.selecting() {
+                    selection.cycle(reverse);
                 }
             }
         });
@@ -2239,6 +2444,7 @@ fn drawing_ui(
             .display
             .entities
             .iter()
+            .filter(|entity| selection.filter.matches(entity))
             .map(|entity| entity.id)
             .collect();
     }
@@ -2364,6 +2570,24 @@ fn drawing_ui(
                     egui::ScrollArea::vertical()
                         .id_salt("cad_features")
                         .show(ui, |ui| {
+                            let selection_enabled =
+                                !state.cad_command.is_active() || state.cad_command.selecting();
+                            ui.add_enabled_ui(selection_enabled, |ui| {
+                                if selection.filter.ui(ui, &state.display) {
+                                    let ids: Vec<_> = state
+                                        .display
+                                        .entities
+                                        .iter()
+                                        .filter(|e| selection.filter.matches(e))
+                                        .map(|e| e.id)
+                                        .collect();
+                                    for id in ids {
+                                        if !selection.selected.remove(&id) {
+                                            selection.selected.insert(id);
+                                        }
+                                    }
+                                }
+                            });
                             if state.drawing.is_some() {
                                 if let Some(command) = state.cad_command.controls_ui(ui) {
                                     command_request = Some(command);
@@ -2609,12 +2833,25 @@ fn drawing_ui(
                 egui::Order::Foreground,
                 egui::Id::new("selection_rectangle"),
             ));
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(80, 140, 255, 28),
+            let crossing = current.x < start.x;
+            let color = if crossing {
+                egui::Color32::from_rgb(80, 220, 140)
+            } else {
+                egui::Color32::from_rgb(120, 180, 255)
+            };
+            painter.rect_filled(rect, 0.0, color.gamma_multiply(0.12));
+            painter.text(
+                rect.left_top() + egui::vec2(6.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                if crossing {
+                    "交叉：相交即选"
+                } else {
+                    "窗口：全部包含"
+                },
+                egui::FontId::proportional(13.0),
+                color,
             );
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 180, 255));
+            let stroke = egui::Stroke::new(1.0, color);
             painter.line_segment([rect.left_top(), rect.right_top()], stroke);
             painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
             painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
@@ -2694,7 +2931,6 @@ fn drawing_ui(
     }
 
     if space.mode == SpaceMode::Cam && !state.gcode_settings_open {
-        let (view_camera, view_transform) = view_camera.into_inner();
         draw_machining_order_labels(
             context,
             &state,
@@ -2711,6 +2947,36 @@ fn drawing_ui(
         );
     }
 
+    if space.mode == SpaceMode::Cad && !state.gcode_settings_open && !state.file_ui.report_open {
+        state
+            .cad_command
+            .aids
+            .marker_ui(context, state.view, view_camera, view_transform);
+        if let Some(entity) = selection
+            .hovered()
+            .and_then(|id| state.display.entities.iter().find(|e| e.id == id))
+        {
+            if let Some(cursor) = context.input(|input| input.pointer.hover_pos()) {
+                let painter = context.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("selection_hover"),
+                ));
+                painter.text(
+                    cursor + egui::vec2(18.0, 18.0),
+                    egui::Align2::LEFT_TOP,
+                    format!(
+                        "{} · {} · {}/{} Tab切换",
+                        entity.kind,
+                        entity.layer,
+                        selection.hover_index + 1,
+                        selection.hover_hits.len()
+                    ),
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::LIGHT_YELLOW,
+                );
+            }
+        }
+    }
     view_cube_ui(context, &mut camera);
 
     if state.gcode_settings_open {
@@ -3925,6 +4191,9 @@ fn apply_cad_action(
     selection.drag_start = None;
     selection.drag_current = None;
     selection.reorder_clicks = None;
+    selection.hover_hits.clear();
+    selection.hover_cursor = None;
+    selection.hover_index = 0;
     state.cad_controls = cad_edit::EditControls::default();
     true
 }
