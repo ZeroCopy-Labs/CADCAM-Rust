@@ -14,7 +14,7 @@ pub struct LayerControls {
 impl LayerControls {
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &DrawingDocument) -> Option<LayerEdit> {
         let mut action = None;
-        egui::CollapsingHeader::new("图层管理").show(ui,|ui|{
+        egui::CollapsingHeader::new("图层管理").default_open(true).show(ui,|ui|{
             let previous=self.selected;
             if self.selected.and_then(|id|doc.layer(id)).is_none(){self.selected=doc.current_layer.or_else(||doc.layers.first().map(|l|l.id));}
             egui::ComboBox::from_id_salt("layer_manager_list")

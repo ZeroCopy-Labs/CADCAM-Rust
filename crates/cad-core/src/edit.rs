@@ -125,6 +125,7 @@ impl DrawingEdit {
 }
 
 pub struct EditableDrawing {
+    pub import_timings: ImportTimings,
     document: DrawingDocument,
     native: CadDocument,
     ids: BTreeMap<Handle, EntityId>,
@@ -134,6 +135,12 @@ pub struct EditableDrawing {
     serial: u64,
     revision: u64,
     saved_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImportTimings {
+    pub parse_ms: f64,
+    pub convert_ms: f64,
 }
 
 impl EditableDrawing {
@@ -467,6 +474,7 @@ impl EditableDrawing {
         layer_ids: BTreeMap<String, LayerId>,
     ) -> Self {
         Self {
+            import_timings: ImportTimings::default(),
             document,
             native,
             ids,

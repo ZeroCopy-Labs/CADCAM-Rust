@@ -37,12 +37,7 @@ impl DerivedState {
     pub fn geometry_ready(&mut self) {
         self.topology = Some((self.inputs.geometry, self.inputs.scope));
         self.analysis = Some((self.inputs.geometry, self.inputs.scope));
-        self.properties_ready();
-    }
-
-    pub fn properties_ready(&mut self) {
-        let version = (self.inputs.geometry, self.inputs.properties);
-        self.display = Some(version);
+        self.display_ready();
         self.machining = Some((
             self.inputs.geometry,
             self.inputs.properties,
@@ -50,8 +45,31 @@ impl DerivedState {
         ));
     }
 
+    pub fn display_ready(&mut self) {
+        self.display = Some((self.inputs.geometry, self.inputs.properties));
+    }
+
+    pub fn properties_ready(&mut self) {
+        let version = (self.inputs.geometry, self.inputs.properties);
+        self.display = Some(version);
+        if self.topology == Some((self.inputs.geometry, self.inputs.scope))
+            && self.analysis == Some((self.inputs.geometry, self.inputs.scope))
+        {
+            self.machining = Some((
+                self.inputs.geometry,
+                self.inputs.properties,
+                self.inputs.scope,
+            ));
+        }
+    }
+
     pub fn observe_profile(&mut self, profile: &GCodeProfile) {
-        if self.profile.as_ref() != Some(profile) {
+        let unchanged = self.profile.as_ref().is_some_and(|old| {
+            old == profile
+                || (profile.validation_error().is_some()
+                    && format!("{old:?}") == format!("{profile:?}"))
+        });
+        if !unchanged {
             self.inputs.config += 1;
             self.profile = Some(profile.clone());
             self.trajectory = None;

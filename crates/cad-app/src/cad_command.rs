@@ -125,6 +125,10 @@ impl CommandState {
     pub fn is_active(&self) -> bool {
         self.step.is_some()
     }
+    pub fn needs_options(&self) -> bool {
+        matches!(self.step, Some(Step::Transform { .. } | Step::Curves(_)))
+            || matches!(self.step, Some(Step::Utility { kind, .. }) if !kind.measuring())
+    }
     pub fn selecting(&self) -> bool {
         matches!(self.step, Some(Step::Select | Step::TransformSelect { .. }))
             || matches!(&self.step,Some(Step::Utility{kind:super::cad_util::Kind::CopyBase,ids,..}) if ids.is_empty())
@@ -1079,7 +1083,7 @@ impl CommandState {
         document: &cad_core::DrawingDocument,
     ) -> Option<String> {
         let mut command = None;
-        ui.strong("绘图、变换与工作平面");
+        ui.strong("命令参数与工作平面");
         self.aids.controls(ui);
         ui.add_enabled_ui(!self.is_active(), |ui| self.tools.style_ui(ui, document));
         if let Some(Step::Transform { kind, ids, base }) = &self.step {
@@ -1187,53 +1191,6 @@ impl CommandState {
             });
             ui.small("x,y,z：WCS；u,v：平面；@：相对；@长度<角度：平面极坐标");
         } else {
-            egui::CollapsingHeader::new("绘图与变换工具")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for kind in [
-                            SketchKind::Line,
-                            SketchKind::Polyline,
-                            SketchKind::Rectangle,
-                            SketchKind::Circle,
-                            SketchKind::Arc,
-                            SketchKind::Ellipse,
-                            SketchKind::Spline,
-                        ] {
-                            if ui.button(kind.label()).clicked() {
-                                command = Some(kind.command().into());
-                            }
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("复制").clicked() {
-                            command = Some("COPY".into());
-                        }
-                        for kind in [
-                            TransformKind::Rotate,
-                            TransformKind::Scale,
-                            TransformKind::Mirror,
-                            TransformKind::RectArray,
-                            TransformKind::PolarArray,
-                        ] {
-                            if ui.button(kind.label()).clicked() {
-                                command = Some(kind.command().into());
-                            }
-                        }
-                    });
-                });
-            egui::CollapsingHeader::new("测量、标注与孔模板").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for kind in super::cad_util::Kind::ALL {
-                        if ui.button(kind.label()).clicked() {
-                            command = Some(kind.command().into());
-                        }
-                    }
-                });
-            });
-            if ui.button("基点 → 目标点移动  Ctrl+M").clicked() {
-                command = Some("MOVE".into());
-            }
             ui.horizontal(|ui| {
                 for name in ["XY", "YZ", "ZX", "3P"] {
                     if ui

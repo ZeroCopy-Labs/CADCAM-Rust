@@ -262,8 +262,26 @@ pub fn build_machining(
     document: &DrawingDocument,
     excluded: &BTreeSet<u32>,
 ) -> Result<DisplayData, String> {
-    let mut data = build_display(document);
-    data.paths.clear();
+    let metadata = build_display(document);
+    build_machining_from_metadata(document, excluded, &metadata)
+}
+
+pub fn metadata(data: &DisplayData) -> DisplayData {
+    DisplayData {
+        entities: data.entities.clone(),
+        layers: data.layers.clone(),
+        arcs: data.arcs.clone(),
+        ..Default::default()
+    }
+}
+
+/// Reuse entity metadata without repeating viewport tessellation.
+pub fn build_machining_from_metadata(
+    document: &DrawingDocument,
+    excluded: &BTreeSet<u32>,
+    source: &DisplayData,
+) -> Result<DisplayData, String> {
+    let mut data = metadata(source);
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let mut total = 0;

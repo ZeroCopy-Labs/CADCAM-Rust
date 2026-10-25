@@ -10,6 +10,7 @@ pub struct CurveControls {
     pub tool: Option<CurveTool>,
     options: CurveOptions,
     pub copy_offset: bool,
+    pub reveal: bool,
 }
 impl Default for CurveControls {
     fn default() -> Self {
@@ -17,6 +18,7 @@ impl Default for CurveControls {
             tool: None,
             options: CurveOptions::default(),
             copy_offset: true,
+            reveal: false,
         }
     }
 }
@@ -89,7 +91,8 @@ impl CurveControls {
     }
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         let mut preview = false;
-        egui::CollapsingHeader::new("曲线整理").default_open(false).show(ui,|ui|{
+        let open = std::mem::take(&mut self.reveal).then_some(true);
+        egui::CollapsingHeader::new("曲线整理").default_open(false).open(open).show(ui,|ui|{
             let tool=self.tool.get_or_insert(CurveTool::Break);
             egui::ComboBox::from_id_salt("curve_tool").selected_text(tool.label()).show_ui(ui,|ui|{
                 for (value,_) in TOOLS{ui.selectable_value(tool,value,value.label());}

@@ -207,7 +207,7 @@ impl Measurements {
             }
             self.key = Some((revision, ids.clone()));
         }
-        egui::CollapsingHeader::new("所选图元测量").show(ui, |ui| {
+        egui::CollapsingHeader::new("所选图元测量").default_open(true).show(ui, |ui| {
             for row in &self.rows {
                 ui.label(row);
             }

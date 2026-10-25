@@ -1,10 +1,6 @@
 //! Versioned, self-contained CAD/CAM project files. Derived geometry is never serialized.
 
-use crate::{
-    cam_analysis::{CamAnalysis, MachiningSetup},
-    gcode::GCodeProfile,
-    ViewerState,
-};
+use crate::{cam_analysis::MachiningSetup, gcode::GCodeProfile, ViewerState};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -74,6 +70,10 @@ pub fn modified(state: &ViewerState) -> bool {
 }
 
 pub fn save(state: &mut ViewerState, save_as: bool) -> bool {
+    if state.drawing.is_some() && !state.derived.sources_current() {
+        crate::cad_jobs::ensure(state, crate::cad_jobs::Follow::SaveProject(save_as));
+        return false;
+    }
     let Some(drawing) = state.drawing.as_ref() else {
         return false;
     };
@@ -138,74 +138,54 @@ pub fn save(state: &mut ViewerState, save_as: bool) -> bool {
     }
 }
 
-pub fn open(state: &mut ViewerState, path: &Path) {
-    let prepared = (|| {
-        let project: Project =
-            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        if project.format != "CADCAM-Rust" || project.version != 1 {
-            return Err("不支持此项目格式或版本，当前工作已保留".to_string());
-        }
-        let known: BTreeSet<_> = project.drawing.ids.iter().map(|(_, id)| *id).collect();
-        if project.excluded.iter().any(|id| !known.contains(id)) {
-            return Err("项目参考对象包含未知图元 ID".to_string());
-        }
-        let source = project.drawing.source.file_path.clone();
-        let previous_count = project.drawing.entities.len();
-        let drawing = cad_core::EditableDrawing::from_project(project.drawing)?;
-        let migrated = drawing.document().entities.len() != previous_count;
-        let mut excluded = project.excluded;
-        excluded.extend(
-            drawing
-                .document()
-                .entities
-                .iter()
-                .filter(|e| matches!(e.geometry, cad_core::Geometry::Text(_)))
-                .map(|e| e.id.0),
-        );
-        let sampled = crate::display::build_machining(drawing.document(), &excluded);
-        // Unsupported machining geometry may still be opened and edited; NC remains blocked.
-        let (machining, error) = match sampled {
-            Ok(data) => (data, None),
-            Err(e) => (Default::default(), Some(e)),
-        };
-        let cam = crate::cam::build_cam_model(drawing.document(), &excluded);
-        let analysis = CamAnalysis::restore_setup(project.machining, &machining, &cam)?;
-        Ok((
-            drawing,
-            machining,
-            error,
-            cam,
-            analysis,
-            project.profile,
-            excluded,
-            source,
-            migrated,
-        ))
-    })();
-    let (drawing, machining, error, cam, analysis, profile, excluded, source, migrated) =
-        match prepared {
-            Ok(data) => data,
-            Err(error) => {
-                crate::push_message(state, format!("项目打开失败：{error}"));
-                return;
-            }
-        };
-    if !crate::cad_file::confirm_replace(state) {
-        return;
+pub struct ProjectCandidate {
+    pub drawing: cad_core::EditableDrawing,
+    pub profile: GCodeProfile,
+    pub excluded: BTreeSet<u32>,
+    pub setup: MachiningSetup,
+    pub source: Option<PathBuf>,
+    pub migrated: bool,
+}
+pub fn read(path: &Path) -> Result<ProjectCandidate, String> {
+    let project: Project = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if project.format != "CADCAM-Rust" || project.version != 1 {
+        return Err("不支持此项目格式或版本，当前工作已保留".to_string());
     }
-    let different_profile = state.gcode_profile != profile;
-    crate::cad_file::install_drawing(state, Some(drawing));
-    state.excluded = excluded;
-    state.derived.scope_changed();
-    state.machining = machining;
-    state.machining_error = error;
-    state.cam = cam;
-    state.analysis = analysis;
-    state.gcode_profile = profile;
-    state.derived.geometry_ready();
-    state.derived.plan_changed();
-    crate::rebuild_state_trajectory(state);
+    let known: BTreeSet<_> = project.drawing.ids.iter().map(|(_, id)| *id).collect();
+    if project.excluded.iter().any(|id| !known.contains(id)) {
+        return Err("项目参考对象包含未知图元 ID".to_string());
+    }
+    let source = project.drawing.source.file_path.clone();
+    let previous_count = project.drawing.entities.len();
+    let drawing = cad_core::EditableDrawing::from_project(project.drawing)?;
+    let migrated = drawing.document().entities.len() != previous_count;
+    let mut excluded = project.excluded;
+    excluded.extend(
+        drawing
+            .document()
+            .entities
+            .iter()
+            .filter(|e| matches!(e.geometry, cad_core::Geometry::Text(_)))
+            .map(|e| e.id.0),
+    );
+    Ok(ProjectCandidate {
+        drawing,
+        profile: project.profile,
+        excluded,
+        setup: project.machining,
+        source,
+        migrated,
+    })
+}
+
+pub fn finish_open(
+    state: &mut ViewerState,
+    path: &Path,
+    source: Option<PathBuf>,
+    migrated: bool,
+    different_profile: bool,
+) {
     let normal = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cadcam"));

@@ -76,6 +76,14 @@ impl Default for ToolOptions {
     }
 }
 impl ToolOptions {
+    pub fn set_color(&mut self, color: Color) {
+        self.color = color;
+        match color {
+            Color::Rgb { r, g, b } => self.rgb = [r, g, b],
+            Color::Aci(index) => self.aci = index,
+            _ => {}
+        }
+    }
     pub fn style_ui(&mut self, ui: &mut egui::Ui, document: &DrawingDocument) {
         self.layer = document.current_layer;
         egui::CollapsingHeader::new("新图元属性").show(ui, |ui| {

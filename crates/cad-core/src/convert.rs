@@ -46,7 +46,10 @@ pub fn read_document<P: AsRef<Path>>(path: P) -> Result<DrawingDocument, ImportE
 /// Read an editable drawing while retaining the native records for DXF export.
 pub fn read_editable_document<P: AsRef<Path>>(path: P) -> Result<EditableDrawing, ImportError> {
     let path = path.as_ref();
+    let started = std::time::Instant::now();
     let mut native = read_native(path)?;
+    let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let converting = std::time::Instant::now();
     let blocks = crate::blocks::materialize(&mut native.document);
     let mut ids = BTreeMap::new();
     let mut layer_identities = BTreeMap::new();
@@ -93,6 +96,10 @@ pub fn read_editable_document<P: AsRef<Path>>(path: P) -> Result<EditableDrawing
     deduplicate(&mut document.import_report.warnings);
     let materialized = document.import_report.blocks.instances > 0;
     let mut drawing = EditableDrawing::new(document, native.document, ids, layer_identities);
+    drawing.import_timings = crate::edit::ImportTimings {
+        parse_ms,
+        convert_ms: converting.elapsed().as_secs_f64() * 1000.0,
+    };
     if materialized {
         drawing.mark_import_materialized();
     }

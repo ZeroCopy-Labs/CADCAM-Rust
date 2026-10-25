@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::{app::AppExit, prelude::*, window::WindowCloseRequested};
 use bevy_egui::egui;
-use cad_core::{read_editable_document, EditableDrawing, ImportReport, LengthUnit};
+use cad_core::{EditableDrawing, ImportReport};
 
 use super::{cam, cam_analysis, display, push_message, remember_recent, ViewerState};
 
@@ -23,78 +23,60 @@ pub(super) struct FileState {
 
 pub(super) fn open_drawing(state: &mut ViewerState, raw_path: &str) {
     let path = PathBuf::from(super::normalize_path(raw_path));
-    if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("cadcam"))
-        || path.file_name().is_some_and(|n| {
-            n.to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(".cadcam.bak")
-        })
-    {
-        super::cad_project::open(state, &path);
-        return;
+    if !path.as_os_str().is_empty() {
+        super::cad_jobs::open(state, path);
     }
-    let backup = path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("bak"));
-    load_drawing(state, &path, backup);
 }
 
-fn load_drawing(state: &mut ViewerState, path: &Path, recovered: bool) {
-    if path.as_os_str().is_empty() || !confirm_replace(state) {
-        return;
-    }
-    push_message(state, format!("正在读取 {}", path.display()));
-    let mut drawing = match read_editable_document(path) {
-        Ok(drawing) => drawing,
-        Err(error) => {
-            push_message(state, format!("读取失败：{error}"));
-            return;
-        }
-    };
-    if drawing.document().source_units.is_none() {
-        let choice = rfd::MessageDialog::new()
-            .set_title("请选择无单位图纸的实际单位")
-            .set_description("图纸未声明有效单位。是：按毫米(mm)解释；否：按英寸(in)解释；取消：停止打开并保留当前图纸。工作区和加工尺寸统一为毫米。")
-            .set_buttons(rfd::MessageButtons::YesNoCancel).show();
-        let unit = match choice {
-            rfd::MessageDialogResult::Yes => LengthUnit::Millimeters,
-            rfd::MessageDialogResult::No => LengthUnit::Inches,
-            _ => return,
-        };
-        if let Err(error) = drawing.resolve_units(unit) {
-            push_message(state, error);
-            return;
-        }
-    }
-    if recovered {
-        drawing.mark_recovered();
-    }
-    install_drawing(state, Some(drawing));
-    if !recovered {
-        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        remember_recent(state, &absolute);
-    }
-    push_message(
+pub(super) fn install_prepared(state: &mut ViewerState, prepared: super::cad_jobs::Prepared) {
+    let c = prepared.candidate;
+    let different = state.gcode_profile != c.profile;
+    state.gcode_profile = c.profile;
+    let origin = c.project;
+    let path = c.path;
+    let recovered = c.recovered;
+    install_data(
         state,
-        format!(
-            "已加载 {} 个图元、{} 个加工单元；{}。详情见“文件 → 导入报告”。",
-            state.entity_count,
-            state.cam.units.len(),
-            state.unit
-        ),
+        Some(c.drawing),
+        Some((prepared.display, prepared.calculated, c.excluded)),
     );
-    if recovered {
+    if let Some((source, migrated)) = origin {
+        super::cad_project::finish_open(state, &path, source, migrated, different);
+    } else {
+        if !recovered {
+            remember_recent(state, &std::fs::canonicalize(&path).unwrap_or(path));
+        }
         push_message(
             state,
-            "已恢复备份或快照，请另存为 DXF；恢复不包含加工安排或撤销历史",
+            format!(
+                "已加载 {} 个图元、{} 个加工单元；{}",
+                state.entity_count,
+                state.cam.units.len(),
+                state.unit
+            ),
         );
+        if recovered {
+            push_message(state, "已恢复图纸备份，请另存 DXF；不包含加工安排或历史");
+        }
     }
 }
 
 pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableDrawing>) {
+    install_data(state, drawing, None);
+}
+fn install_data(
+    state: &mut ViewerState,
+    drawing: Option<EditableDrawing>,
+    ready: Option<(
+        display::DisplayData,
+        super::cad_jobs::Calculated,
+        std::collections::BTreeSet<u32>,
+    )>,
+) {
+    state.tasks.cancel();
     clear_recovery(state);
+    let prepared = ready.is_some();
+    let mut ready = ready;
     state.excluded = drawing
         .as_ref()
         .map(|d| {
@@ -130,18 +112,28 @@ pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableD
         state.entity_count = document.entity_count();
         state.layer_count = document.layers.len();
         state.warning_count = document.import_report.warnings.len();
-        state.display = display::build_display(document);
-        match display::build_machining(document, &state.excluded) {
-            Ok(data) => {
-                state.machining = data;
-                state.machining_error = None;
+        if let Some((display, calculated, excluded)) = ready.take() {
+            state.display = display;
+            state.machining = calculated.machining;
+            state.machining_error = calculated.error;
+            state.cam = calculated.cam;
+            state.analysis = calculated.analysis;
+            state.trajectory = Some(calculated.trajectory);
+            state.excluded = excluded;
+        } else {
+            state.display = display::build_display(document);
+            match display::build_machining(document, &state.excluded) {
+                Ok(data) => {
+                    state.machining = data;
+                    state.machining_error = None;
+                }
+                Err(error) => {
+                    state.machining = Default::default();
+                    state.machining_error = Some(error);
+                }
             }
-            Err(error) => {
-                state.machining = Default::default();
-                state.machining_error = Some(error);
-            }
+            state.cam = cam::build_cam_model(document, &state.excluded);
         }
-        state.cam = cam::build_cam_model(document, &state.excluded);
     } else {
         state.file_name.clear();
         state.format.clear();
@@ -155,28 +147,39 @@ pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableD
         state.machining_error = None;
         state.cam = Default::default();
     }
-    state.analysis = cam_analysis::CamAnalysis::build(&state.machining, &state.cam);
-    state.analysis.set_machine_start(
-        &state.machining,
-        &state.cam,
-        [
-            state.gcode_profile.initial_x,
-            state.gcode_profile.initial_y,
-            state.gcode_profile.initial_z,
-        ],
-    );
-    state.manual_tube = Default::default();
+    if !prepared {
+        state.analysis = cam_analysis::CamAnalysis::build(&state.machining, &state.cam);
+        state.analysis.set_machine_start(
+            &state.machining,
+            &state.cam,
+            [
+                state.gcode_profile.initial_x,
+                state.gcode_profile.initial_y,
+                state.gcode_profile.initial_z,
+            ],
+        );
+    }
+    state.manual_tube = state.analysis.tube_section.clone().unwrap_or_default();
     state.manual_pair = [None, None];
-    state.trajectory = None;
+    if !prepared {
+        state.trajectory = None;
+    }
     state.drawing = drawing;
     state.derived = Default::default();
     if let Some(drawing) = &state.drawing {
         state.derived.document_changed(drawing.revision(), true);
         state.derived.geometry_ready();
     }
+    state.load_version += 1;
     if state.drawing.is_some() {
-        super::rebuild_state_trajectory(state);
+        state.derived.observe_profile(&state.gcode_profile);
+        if prepared {
+            state.derived.trajectory = Some(state.derived.inputs);
+        } else {
+            super::rebuild_state_trajectory(state);
+        }
     }
+    state.performance.paths(&state.display, &state.machining);
     state.cad_controls = Default::default();
     state.cad_curves = Default::default();
     state.cad_diagnostics = Default::default();
@@ -188,21 +191,31 @@ pub(super) fn install_drawing(state: &mut ViewerState, drawing: Option<EditableD
     state.trajectory_view = Default::default();
     state.command_input.clear();
     state.cad_history.clear();
-    state.load_version += 1;
+
     state.fit_dirty = true;
     super::cad_project::reset(state);
 }
 
 pub(super) fn new_drawing(state: &mut ViewerState) {
+    state.tasks.cancel();
     if confirm_replace(state) {
         install_drawing(state, Some(EditableDrawing::blank()));
         push_message(state, "已新建毫米图纸");
+    } else {
+        state
+            .tasks
+            .defer_after_save(super::cad_jobs::AfterSave::New);
     }
 }
 
 pub(super) fn close_drawing(state: &mut ViewerState) {
+    state.tasks.cancel();
     if confirm_replace(state) {
         install_drawing(state, None);
+    } else {
+        state
+            .tasks
+            .defer_after_save(super::cad_jobs::AfterSave::Close);
     }
 }
 
@@ -297,6 +310,10 @@ pub(super) fn close_requested(
     if requested && confirm_replace(&mut state) {
         clear_recovery(&mut state);
         exit.write(AppExit::Success);
+    } else if requested {
+        state
+            .tasks
+            .defer_after_save(super::cad_jobs::AfterSave::Exit);
     }
 }
 
@@ -391,7 +408,7 @@ pub(super) fn recover_drawing(state: &mut ViewerState) {
             push_message(state, "该快照属于当前会话，请先保存或另存为当前图纸");
             return;
         }
-        load_drawing(state, &path, true);
+        open_drawing(state, &path.to_string_lossy());
     }
 }
 
