@@ -305,6 +305,8 @@ impl DynamicInput {
                         && (typed.contains([',', '，', '<'])
                             || typed.split_whitespace().count() > 1)
                     || matches!(typed.to_uppercase().as_str(), "U" | "C")
+                    || command.curve_change_distance()
+                        && matches!(typed.to_uppercase().as_str(), "D" | "N")
                     || !self.locked.iter().any(|v| *v) && typed.chars().any(char::is_alphabetic)
                 {
                     if !self.literal {

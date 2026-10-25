@@ -63,7 +63,9 @@ impl Workspace {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(175.);
                     if ui
-                        .button(if command.is_active() {
+                        .button(if command.curve_waiting_target() {
+                            "确认 / 结束连续修改  Enter"
+                        } else if command.is_active() {
                             "确认 / 结束  Enter"
                         } else {
                             "重复上一命令  Enter / 空格"
@@ -81,6 +83,30 @@ impl Workspace {
                         }
                         if ui.button("放弃整次未提交绘图").clicked() {
                             action = Some("DISCARD".into());
+                        }
+                    }
+                    if command.continuous_curve() {
+                        if ui
+                            .add_enabled(
+                                can_undo && command.curve_undo_id().is_some(),
+                                egui::Button::new("撤回本命令上次修改  U"),
+                            )
+                            .clicked()
+                        {
+                            action = Some("U".into());
+                        }
+                        if command.curve_change_distance() && ui.button("更改偏移距离  D").clicked()
+                        {
+                            action = Some("D".into());
+                        }
+                        if command.continuous_curve()
+                            && command.takes_point()
+                            && ui.button("丢弃当前预览，重新选对象  N").clicked()
+                        {
+                            action = Some("N".into());
+                        }
+                        if ui.button("结束连续修改，保留已完成结果").clicked() {
+                            action = Some("CANCEL".into());
                         }
                     }
                     if command.is_active() {

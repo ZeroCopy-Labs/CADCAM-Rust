@@ -137,6 +137,56 @@ impl CommandState {
             None
         }
     }
+    pub fn continuous_curve(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.continuous())
+    }
+    pub fn curve_waiting_target(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.waiting_target())
+    }
+    pub fn curve_change_distance(&self) -> bool {
+        matches!(&self.step,Some(Step::CurvePick(s)) if s.can_change_distance())
+    }
+    pub fn curve_undo_id(&self) -> Option<u64> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            s.undo_id()
+        } else {
+            None
+        }
+    }
+    pub fn curve_boundaries(&self) -> Option<&BTreeSet<u32>> {
+        if let Some(Step::CurvePick(s)) = &self.step {
+            Some(s.boundaries())
+        } else {
+            None
+        }
+    }
+    pub fn record_curve_change(
+        &mut self,
+        change: &cad_core::DrawingChange,
+        doc: &cad_core::DrawingDocument,
+    ) {
+        if let Some(Step::CurvePick(s)) = &mut self.step {
+            if s.continuous() {
+                s.committed(change, doc);
+            }
+        }
+    }
+    pub fn undo_curve_change(&mut self, id: u64, doc: &cad_core::DrawingDocument) {
+        if let Some(Step::CurvePick(s)) = &mut self.step {
+            s.undone(id, doc);
+        }
+        self.resume_curve();
+    }
+    pub fn resume_curve(&mut self) {
+        if let Some(Step::CurvePick(s)) = &mut self.step {
+            s.resume();
+        }
+        self.hover = None;
+        self.pointer_point = None;
+        self.aids.clear();
+        self.ray_error.clear();
+        self.error.clear();
+    }
     pub fn picking_curve(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.picking())
     }
@@ -147,11 +197,17 @@ impl CommandState {
         ray: (Point3, cad_core::model::Vector3),
         click: bool,
     ) -> Result<bool, String> {
-        if let Some(Step::CurvePick(s)) = &mut self.step {
+        let result = if let Some(Step::CurvePick(s)) = &mut self.step {
             s.viewport(doc, id, ray, click)
         } else {
             Ok(false)
+        };
+        if matches!(result, Ok(true)) {
+            self.hover = None;
+            self.pointer_point = None;
+            self.ray_error.clear();
         }
+        result
     }
     pub fn begin_erase(&mut self) {
         self.cancel();
@@ -860,9 +916,30 @@ impl CommandState {
     ) -> Result<Option<CommandCommit>, String> {
         if let Some(Step::CurvePick(s)) = &mut self.step {
             if !s.side() {
-                return s
+                let result = s
                     .input(text, selected)
                     .map(|edit| edit.map(CommandCommit::Curves));
+                if s.finished() {
+                    self.cancel();
+                }
+                return result;
+            }
+            if s.can_change_distance()
+                && matches!(
+                    text.trim().to_uppercase().as_str(),
+                    "D" | "DISTANCE" | "N" | "NEXT"
+                )
+            {
+                let result = s
+                    .input(text, selected)
+                    .map(|edit| edit.map(CommandCommit::Curves));
+                if result.is_ok() {
+                    self.hover = None;
+                    self.pointer_point = None;
+                    self.aids.clear();
+                    self.ray_error.clear();
+                }
+                return result;
             }
         }
         if matches!(

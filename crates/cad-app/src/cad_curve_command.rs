@@ -4,7 +4,7 @@ use cad_core::{
     curve_pick, curves,
     model::{EntityId, Geometry, Point3, Vector3, WorkPlane},
     snap::{self, SnapKind},
-    CurveEdit, DrawingDocument,
+    CurveEdit, DrawingChange, DrawingDocument,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,11 +17,17 @@ enum Phase {
     SecondLine,
     Side,
     Confirm,
+    Finished,
 }
 struct Source {
     id: EntityId,
     geometry: Geometry,
     pick: Point3,
+}
+struct UndoRecord {
+    transaction_id: u64,
+    added_boundaries: Vec<u32>,
+    removed_boundaries: Vec<u32>,
 }
 pub struct Session {
     tool: CurveTool,
@@ -31,6 +37,7 @@ pub struct Session {
     source: Option<Source>,
     preview: Option<CurveEdit>,
     affected: BTreeSet<EntityId>,
+    operations: Vec<UndoRecord>,
 }
 pub fn interactive(tool: CurveTool) -> bool {
     matches!(
@@ -56,7 +63,76 @@ impl Session {
             source: None,
             preview: None,
             affected: BTreeSet::new(),
+            operations: Vec::new(),
         }
+    }
+    pub fn continuous(&self) -> bool {
+        matches!(
+            self.tool,
+            CurveTool::Trim | CurveTool::Extend | CurveTool::Offset
+        )
+    }
+    pub fn waiting_target(&self) -> bool {
+        self.continuous() && self.phase == Phase::Object
+    }
+    pub fn finished(&self) -> bool {
+        self.phase == Phase::Finished
+    }
+    pub fn can_change_distance(&self) -> bool {
+        self.tool == CurveTool::Offset
+    }
+    pub fn undo_id(&self) -> Option<u64> {
+        self.operations.last().map(|op| op.transaction_id)
+    }
+    pub fn boundaries(&self) -> &BTreeSet<u32> {
+        &self.boundaries
+    }
+    pub fn resume(&mut self) {
+        self.source = None;
+        self.preview = None;
+        self.affected.clear();
+        self.phase = Phase::Object;
+    }
+    pub fn committed(&mut self, change: &DrawingChange, doc: &DrawingDocument) {
+        let added: Vec<_> = change
+            .created_sources
+            .iter()
+            .filter(|(_, source)| self.boundaries.contains(&source.0))
+            .map(|(id, _)| id.0)
+            .filter(|id| !self.boundaries.contains(id))
+            .collect();
+        let removed: Vec<_> = self
+            .boundaries
+            .iter()
+            .copied()
+            .filter(|id| doc.entity(EntityId(*id)).is_none())
+            .collect();
+        self.boundaries
+            .retain(|id| doc.entity(EntityId(*id)).is_some());
+        self.boundaries.extend(&added);
+        self.operations.push(UndoRecord {
+            transaction_id: change.transaction_id,
+            added_boundaries: added,
+            removed_boundaries: removed,
+        });
+        self.resume();
+    }
+    pub fn undone(&mut self, id: u64, doc: &DrawingDocument) {
+        if self.undo_id() != Some(id) {
+            return;
+        }
+        let op = self.operations.pop().unwrap();
+        for id in op.added_boundaries {
+            self.boundaries.remove(&id);
+        }
+        self.boundaries.extend(
+            op.removed_boundaries
+                .into_iter()
+                .filter(|id| doc.entity(EntityId(*id)).is_some()),
+        );
+        self.boundaries
+            .retain(|id| doc.entity(EntityId(*id)).is_some());
+        self.resume();
     }
     pub fn selecting(&self) -> bool {
         self.phase == Phase::Boundary
@@ -98,7 +174,7 @@ impl Session {
             CurveTool::Fillet => "圆角",
             _ => "倒角",
         };
-        format!(
+        let mut prompt = format!(
             "{tool}：{}",
             match self.phase {
                 Phase::Boundary => "选择边界对象后确认；Shift 移除",
@@ -117,14 +193,49 @@ impl Session {
                 Phase::SecondLine => "悬停第二条直线的保留侧预览，点击提交",
                 Phase::Side => "悬停选侧预览，点击或输入坐标确认提交",
                 Phase::Confirm => "Enter/空格提交预览；Esc 取消",
+                Phase::Finished => "命令已结束",
             }
-        )
+        );
+        if self.continuous() {
+            prompt.push_str(&format!(
+                "；已完成 {} 次，U 撤回本命令上一次；Enter 在等待目标时结束，Esc 保留已完成结果{}",
+                self.operations.len(),
+                if self.can_change_distance() {
+                    "；D 更改距离"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if self.side() {
+            prompt.push_str("；N 丢弃当前预览并重新选择对象");
+        }
+        prompt
     }
     pub fn input(
         &mut self,
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CurveEdit>, String> {
+        if self.side() && matches!(text.trim().to_uppercase().as_str(), "N" | "NEXT") {
+            self.resume();
+            return Ok(None);
+        }
+        if self.can_change_distance()
+            && matches!(text.trim().to_uppercase().as_str(), "D" | "DISTANCE")
+        {
+            self.source = None;
+            self.preview = None;
+            self.affected.clear();
+            self.phase = Phase::Parameter;
+            return Ok(None);
+        }
+        if self.waiting_target() && text.trim().is_empty() {
+            self.preview = None;
+            self.affected.clear();
+            self.phase = Phase::Finished;
+            return Ok(None);
+        }
         match self.phase {
             Phase::Boundary => {
                 if !text.trim().is_empty() || selected.is_empty() {

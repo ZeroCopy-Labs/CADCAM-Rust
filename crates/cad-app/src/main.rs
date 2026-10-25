@@ -394,6 +394,7 @@ fn submit_command(
         matches!(upper.as_str(), "CANCEL" | "取消") && state.cad_command.finish_on_cancel();
     if matches!(upper.as_str(), "CANCEL" | "取消" | "DISCARD") && !keep_drawing {
         let active = state.cad_command.is_active();
+        let continuous_curve = state.cad_command.continuous_curve();
         let had_input = !state.command_input.is_empty();
         state.cad_command.cancel();
         state.dynamic_input.reset_fields();
@@ -407,7 +408,9 @@ fn submit_command(
         selection.reorder_clicks = None;
         push_message(
             state,
-            if active || had_input {
+            if continuous_curve {
+                "已结束连续修改；已完成结果保留"
+            } else if active || had_input {
                 "已取消未确认操作"
             } else {
                 "已清除选择"
@@ -424,6 +427,38 @@ fn submit_command(
         return;
     }
     let was_active = state.cad_command.is_active();
+    if state.cad_command.continuous_curve() && matches!(upper.as_str(), "U" | "UNDO" | "撤销") {
+        let owned = state.cad_command.curve_undo_id();
+        let top = state.drawing.as_ref().and_then(|d| d.undo_transaction_id());
+        let error = if let Some(id) = owned {
+            if top != Some(id) {
+                Some("撤销历史已变化或超出历史预算；请先结束当前命令")
+            } else if apply_cad_action(state, selection, cad_edit::EditAction::Undo) {
+                let ViewerState {
+                    drawing,
+                    cad_command,
+                    ..
+                } = state;
+                cad_command.undo_curve_change(id, drawing.as_ref().unwrap().document());
+                None
+            } else {
+                Some("本次撤回未完成，已保留当前结果")
+            }
+        } else {
+            Some("本命令尚无可撤回的修改；不会撤销更早的操作")
+        };
+        state.command_input.clear();
+        state.dynamic_input.reset_fields();
+        state.command_focus = true;
+        if let Some(error) = error {
+            state.cad_command.error = error.into();
+            push_message(state, error);
+        } else {
+            let prompt = state.cad_command.prompt();
+            push_message(state, prompt);
+        }
+        return;
+    }
     let result = if keep_drawing {
         state.cad_command.input("", &selection.selected)
     } else if was_active {
@@ -558,15 +593,33 @@ fn submit_command(
                     cad_edit::EditAction::Transform { transforms, copies }
                 }
             };
+            let continuous_curve = state.cad_command.continuous_curve();
             if apply_cad_action(state, selection, action) {
-                state.cad_command.cancel();
-            } else {
-                state.cad_command.error = if state.cad_command.continuous_drawing() {
-                    "操作未提交；可重试，或右键放弃整次绘图"
+                if continuous_curve {
+                    state.cad_command.resume_curve();
+                    state.command_focus = true;
                 } else {
-                    "操作未提交，请调整参数或取消"
+                    state.cad_command.cancel();
                 }
-                .into();
+            } else {
+                if continuous_curve {
+                    let detail = state
+                        .messages
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "本次修改未提交".into());
+                    state.cad_command.resume_curve();
+                    state.command_focus = true;
+                    state.cad_command.error =
+                        format!("{detail}；可重新点选，或 Esc 结束并保留已完成结果");
+                } else {
+                    state.cad_command.error = if state.cad_command.continuous_drawing() {
+                        "操作未提交；可重试，或右键放弃整次绘图"
+                    } else {
+                        "操作未提交，请调整参数或取消"
+                    }
+                    .into();
+                }
             }
         }
         Ok(None) => {
@@ -897,6 +950,10 @@ fn draw_scene(
             Color::srgb(1.0, 0.5, 0.12)
         } else if is_selected {
             Color::srgb(1.0, 0.82, 0.22)
+        } else if space.mode == SpaceMode::Cad
+            && state.cad_command.curve_boundaries().is_some_and(|ids| ids.contains(&path.entity_id))
+        {
+            Color::srgb(0.35, 0.6, 1.0)
         } else {
             if state.excluded.contains(&path.entity_id) {
                 Color::srgb(0.35, 0.40, 0.46)
@@ -2541,6 +2598,20 @@ fn drawing_ui(
     let command_field = context
         .memory(|memory| memory.has_focus(egui::Id::new("cad_command_input")))
         || cad_input::owns_focus(context);
+    if command_request.is_none()
+        && space.mode == SpaceMode::Cad
+        && state.cad_command.continuous_curve()
+        && state.command_input.is_empty()
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !state.performance.open
+        && !state.trajectory_view.open
+        && (!context.egui_wants_keyboard_input() || command_field)
+        && !context.input(|i| i.modifiers.shift)
+        && context.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
+    {
+        command_request = Some("U".into());
+    }
     if space.mode == SpaceMode::Cad
         && !state.gcode_settings_open
         && !state.file_ui.report_open
@@ -5434,6 +5505,8 @@ fn apply_cad_action(
         | cad_edit::EditAction::Layer(_)
         | cad_edit::EditAction::Annotation(_)
         | cad_edit::EditAction::Paste { .. }) => {
+            let curve_session = matches!(&action, cad_edit::EditAction::Curves(_))
+                && state.cad_command.continuous_curve();
             let paste_roles = if let cad_edit::EditAction::Paste { items, .. } = &action {
                 Some(items.iter().map(|i| i.reference).collect::<Vec<_>>())
             } else {
@@ -5579,6 +5652,15 @@ fn apply_cad_action(
                         }
                     }
                     state.cad_history.insert(change.transaction_id, before);
+                    if curve_session {
+                        let ViewerState {
+                            drawing,
+                            cad_command,
+                            ..
+                        } = state;
+                        cad_command
+                            .record_curve_change(&change, drawing.as_ref().unwrap().document());
+                    }
                     refresh_edited_drawing(state, &change, None);
                     selection.cam_selected.clear();
                     if !change.created.is_empty() {

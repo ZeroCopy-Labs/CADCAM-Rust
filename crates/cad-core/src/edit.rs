@@ -498,6 +498,10 @@ impl EditableDrawing {
     pub fn can_undo(&self) -> bool {
         !self.history.is_empty()
     }
+    /// The exact transaction an undo would restore; callers can enforce command ownership.
+    pub fn undo_transaction_id(&self) -> Option<u64> {
+        self.history.back().map(|entry| entry.change.transaction_id)
+    }
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
