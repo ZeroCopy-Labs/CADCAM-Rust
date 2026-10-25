@@ -188,6 +188,7 @@ fn install_data(
     state.measurements = Default::default();
     state.pending_copy = None;
     state.cad_command = Default::default();
+    state.dynamic_input.reset_fields();
     state.trajectory_view = Default::default();
     state.command_input.clear();
     state.cad_history.clear();

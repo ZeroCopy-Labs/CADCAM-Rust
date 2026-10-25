@@ -109,6 +109,7 @@ pub struct CommandState {
     pub plane: WorkPlane,
     step: Option<Step>,
     hover: Option<[f64; 3]>,
+    pointer_point: Option<[f64; 3]>,
     pub error: String,
     ray_error: String,
     origin_input: [f64; 3],
@@ -128,6 +129,103 @@ impl CommandState {
     pub fn needs_options(&self) -> bool {
         matches!(self.step, Some(Step::Transform { .. } | Step::Curves(_)))
             || matches!(self.step, Some(Step::Utility { kind, .. }) if !kind.measuring())
+    }
+    pub fn input_spec(&self) -> Option<super::cad_input::Spec> {
+        use super::cad_input::{Kind, Spec};
+        if let Some(Step::Transform {
+            kind,
+            base: Some(_),
+            ..
+        }) = self.step
+        {
+            let (kind, value) = match kind {
+                TransformKind::Rotate => (Kind::Angle, self.tools.angle),
+                TransformKind::Scale => (Kind::Scale, self.tools.scale),
+                _ => return None,
+            };
+            return Some(Spec {
+                kind,
+                reference: None,
+                plane: self.point_plane(),
+                point: None,
+                value,
+            });
+        }
+        if !self.takes_point() {
+            return None;
+        }
+        let reference = self.snap_reference().map(array);
+        let radius = matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind == SketchKind::Circle && !sketch.points.is_empty());
+        Some(Spec {
+            kind: if radius {
+                Kind::Radius
+            } else if reference.is_some() {
+                Kind::Polar
+            } else {
+                Kind::Coordinates
+            },
+            reference,
+            plane: self.point_plane(),
+            point: self.hover,
+            value: 0.,
+        })
+    }
+    pub fn preview_scalar(&mut self, text: &str) {
+        let Some(Step::Transform {
+            kind,
+            ids,
+            base: Some(base),
+        }) = &self.step
+        else {
+            return;
+        };
+        let Ok(value) = number(text) else {
+            return;
+        };
+        let mut tools = self.tools.clone();
+        match kind {
+            TransformKind::Rotate => tools.angle = value,
+            TransformKind::Scale => tools.scale = value,
+            _ => return,
+        }
+        if tools
+            .transforms(*kind, *base, self.plane, ids.len())
+            .is_ok()
+        {
+            self.tools = tools;
+        }
+    }
+    pub fn refresh_input_preview(&mut self, dynamic: &super::cad_input::DynamicInput, text: &str) {
+        if !self.takes_point() {
+            return;
+        }
+        if let Ok(point) = parse_point(
+            &dynamic.submission(self, text),
+            self.point_plane(),
+            self.reference(),
+        ) {
+            if dynamic.is_literal() {
+                self.hover = Some(point);
+                self.ray_error.clear();
+                return;
+            }
+        }
+        if let Some(point) = self.pointer_point {
+            match dynamic.constrain(self, text, point) {
+                Ok(point) => {
+                    self.hover = Some(point);
+                    self.ray_error.clear();
+                }
+                Err(error) => {
+                    self.hover = None;
+                    self.ray_error = error;
+                }
+            }
+        }
+    }
+    pub fn pause_pointer(&mut self) {
+        // Keep the last geometric point while the user edits a numeric field.
+        self.aids.clear();
     }
     pub fn selecting(&self) -> bool {
         matches!(self.step, Some(Step::Select | Step::TransformSelect { .. }))
@@ -379,6 +477,7 @@ impl CommandState {
         });
         self.hover = None;
         self.error.clear();
+        self.pointer_point = None;
     }
 
     pub fn begin_named(&mut self, name: &str, ids: &BTreeSet<u32>) -> bool {
@@ -453,6 +552,7 @@ impl CommandState {
         self.ray_error.clear();
         self.step = None;
         self.hover = None;
+        self.pointer_point = None;
         self.error.clear();
     }
 
@@ -524,6 +624,7 @@ impl CommandState {
         if self.takes_point() {
             if let Some(point) = self.aids.cycle(reverse) {
                 self.hover = Some(array(point));
+                self.pointer_point = self.hover;
             }
         }
     }
@@ -673,7 +774,7 @@ impl CommandState {
                 *confirmed = true;
                 return Ok(None);
             }
-            if !text.contains([',', ' '])
+            if !text.contains([',', ' ', '<']) && !text.starts_with(['@', '#'])
                 && ((sketch.kind == SketchKind::Circle && sketch.points.len() >= 1)
                     || (sketch.kind == SketchKind::Ellipse && sketch.points.len() >= 2))
             {
@@ -865,6 +966,7 @@ impl CommandState {
         };
         self.hover = None;
         self.aids.clear();
+        self.pointer_point = None;
         self.error.clear();
         self.ray_error.clear();
         Ok(())
@@ -877,6 +979,8 @@ impl CommandState {
         cursor: Vec2,
         frame: super::cad_view::ViewFrame,
         document: &cad_core::DrawingDocument,
+        dynamic: &super::cad_input::DynamicInput,
+        draft: &str,
         click: bool,
     ) -> bool {
         if !self.takes_point() {
@@ -884,6 +988,7 @@ impl CommandState {
         }
         let reference = self.snap_reference();
         let plane = self.point_plane();
+        self.pointer_point = None;
         let point = frame
             .ray(camera, transform, cursor)
             .ok_or_else(|| "当前相机无法取点".to_string())
@@ -893,6 +998,9 @@ impl CommandState {
                 )
             })
             .map(array)
+            .and_then(finite)
+            .inspect(|point| self.pointer_point = Some(*point))
+            .and_then(|point| dynamic.constrain(self, draft, point))
             .and_then(finite);
         match point {
             Ok(point) => {
@@ -921,6 +1029,7 @@ impl CommandState {
     pub fn clear_hover(&mut self) {
         self.aids.clear();
         self.hover = None;
+        self.pointer_point = None;
     }
 
     pub fn preview(&self) -> Option<MoveCommit> {
@@ -1323,19 +1432,17 @@ fn array(p: Point3) -> [f64; 3] {
 fn parse_point(text: &str, plane: WorkPlane, reference: [f64; 3]) -> Result<[f64; 3], String> {
     let text = text.trim();
     let relative = text.starts_with('@');
-    let text = text.strip_prefix('@').unwrap_or(text);
+    let text = text.strip_prefix('@').or_else(|| text.strip_prefix('#')).unwrap_or(text);
     if let Some((distance, angle)) = text.split_once('<') {
-        if !relative {
-            return Err("极坐标请使用 @长度<角度（角度为度）".into());
-        }
         let distance = number(distance)?;
         let angle = number(angle)?.to_radians();
         let offset =
             plane.x_axis * (distance * angle.cos()) + plane.y_axis * (distance * angle.sin());
+        let origin = if relative { reference } else { array(plane.origin) };
         return finite([
-            reference[0] + offset.x,
-            reference[1] + offset.y,
-            reference[2] + offset.z,
+            origin[0] + offset.x,
+            origin[1] + offset.y,
+            origin[2] + offset.z,
         ]);
     }
     let world = text.starts_with("W:") || text.starts_with("w:");

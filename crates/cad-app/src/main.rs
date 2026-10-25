@@ -29,6 +29,7 @@ mod cad_curves;
 mod cad_diagnostics;
 mod cad_edit;
 mod cad_file;
+mod cad_input;
 mod cad_jobs;
 mod cad_layers;
 mod cad_performance;
@@ -73,6 +74,7 @@ struct ViewerState {
     text_edit: cad_text::Controls,
     measurements: cad_util::Measurements,
     cad_command: cad_command::CommandState,
+    dynamic_input: cad_input::DynamicInput,
     cad_workspace: cad_workspace::Workspace,
     cad_history: BTreeMap<u64, CadUndoState>,
     project: cad_project::ProjectState,
@@ -382,8 +384,14 @@ fn submit_command(
     };
     let command = repeated.trim();
     let upper = command.to_uppercase();
+    let upper = if state.cad_command.is_active() {
+        upper
+    } else {
+        cad_input::canonical(&upper).to_string()
+    };
     if matches!(upper.as_str(), "CANCEL" | "取消") {
         state.cad_command.cancel();
+        state.dynamic_input.reset_fields();
         state.command_input.clear();
         push_message(state, "已取消命令，图纸未改动");
         return;
@@ -449,6 +457,10 @@ fn submit_command(
             _ => Err("可用命令见顶部默认功能区及绘图/编辑菜单：LINE、PLINE、RECTANGLE、CIRCLE、ARC、ELLIPSE、SPLINE、COPY、ROTATE、SCALE、MIRROR、ARRAYRECT、ARRAYPOLAR".into()),
         }
     };
+    if result.is_ok() {
+        state.dynamic_input.reset_fields();
+        state.command_input.clear();
+    }
     match result {
         Ok(Some(commit)) => {
             let action = match commit {
@@ -995,7 +1007,11 @@ fn selection_input(
         if mouse.just_released(MouseButton::Left) {
             state.cad_command.stop_grip_drag();
         }
-        state.cad_command.clear_hover();
+        if state.dynamic_input.enabled && state.cad_command.is_active() {
+            state.cad_command.pause_pointer();
+        } else {
+            state.cad_command.clear_hover();
+        }
         selection.hover_hits.clear();
         selection.hover_cursor = None;
         selection.hover_index = 0;
@@ -1012,7 +1028,11 @@ fn selection_input(
         selection.hover_hits.clear();
         selection.hover_cursor = None;
         selection.hover_index = 0;
-        state.cad_command.clear_hover();
+        if state.dynamic_input.enabled && state.cad_command.is_active() {
+            state.cad_command.pause_pointer();
+        } else {
+            state.cad_command.clear_hover();
+        }
         // A click that starts on the panel resize handle must be owned by the
         // panel, even if the first press frame already reached this system.
         selection.drag_start = None;
@@ -1035,6 +1055,8 @@ fn selection_input(
             {
                 state.command_open = true;
                 state.command_input.clear();
+                state.dynamic_input.reset_fields();
+                state.dynamic_input.request_focus();
                 selection.drag_start = None;
                 selection.drag_current = None;
                 return Ok(());
@@ -1051,6 +1073,8 @@ fn selection_input(
             let ViewerState {
                 drawing,
                 cad_command,
+                dynamic_input,
+                command_input,
                 view,
                 ..
             } = &mut *state;
@@ -1061,6 +1085,8 @@ fn selection_input(
                     cursor,
                     *view,
                     drawing.document(),
+                    dynamic_input,
+                    command_input,
                     if cad_command.grip_dragging() {
                         mouse.just_released(MouseButton::Left)
                     } else {
@@ -1074,6 +1100,8 @@ fn selection_input(
         }
         if accepted {
             state.command_input.clear();
+            state.dynamic_input.reset_fields();
+            state.dynamic_input.request_focus();
             if !state.cad_command.is_active() {
                 push_message(&mut state, "工作平面已按三点设置，图元坐标保持不变");
             }
@@ -1271,6 +1299,7 @@ fn update_picking(state: &mut ViewerState, camera: &Camera, transform: &GlobalTr
         state.performance.record("拾取投影与索引", start);
     }
 }
+
 fn pick_entities(
     state: &mut ViewerState,
     camera: &Camera,
@@ -2315,10 +2344,25 @@ fn drawing_ui(
     context.set_visuals(egui::Visuals::dark());
 
     let mut command_request = None;
+    if space.mode == SpaceMode::Cad
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !state.performance.open
+        && !state.trajectory_view.open
+    {
+        let ViewerState {
+            dynamic_input,
+            cad_command,
+            command_input,
+            ..
+        } = &mut *state;
+        dynamic_input.prepare(context, ui_state.canvas_rect, cad_command, command_input);
+    }
     if !state.gcode_settings_open && !state.file_ui.report_open {
         let wants_keyboard = context.egui_wants_keyboard_input();
+        let cursor_focus = cad_input::owns_focus(context);
         context.input_mut(|input| {
-            if state.cad_command.is_active()
+            if (state.cad_command.is_active() || !state.command_input.is_empty() || cursor_focus)
                 && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
             {
                 command_request = Some("CANCEL".to_string());
@@ -2336,12 +2380,13 @@ fn drawing_ui(
             }
         });
     }
-    let command_field =
-        context.memory(|memory| memory.has_focus(egui::Id::new("cad_command_input")));
+    let command_field = context
+        .memory(|memory| memory.has_focus(egui::Id::new("cad_command_input")))
+        || cad_input::owns_focus(context);
     if space.mode == SpaceMode::Cad
         && !state.gcode_settings_open
         && !state.file_ui.report_open
-        && (!context.egui_wants_keyboard_input() || command_field && state.command_input.is_empty())
+        && (!context.egui_wants_keyboard_input() || command_field)
     {
         context.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
@@ -2855,6 +2900,7 @@ fn drawing_ui(
             space_switch_ui(ui, &mut space, &mut selection, &state.cam);
             if old_mode != space.mode {
                 state.cad_command.cancel();
+                state.dynamic_input.reset_fields();
                 state.command_input.clear();
             }
             ui.separator();
@@ -2929,6 +2975,15 @@ fn drawing_ui(
             state.command_focus = true;
         }
     }
+    {
+        let ViewerState {
+            dynamic_input,
+            cad_command,
+            command_input,
+            ..
+        } = &mut *state;
+        dynamic_input.sync(cad_command, command_input);
+    }
     let command_dimensions = state.command_open.then(|| {
         let history_lines = if state.cad_workspace.history {
             state.messages.len().min(COMMAND_MAX_HISTORY_LINES)
@@ -2966,7 +3021,15 @@ fn drawing_ui(
                     });
             }
 
-            let focus_input = std::mem::take(&mut state.command_focus);
+            let focus_input =
+                std::mem::take(&mut state.command_focus) || state.dynamic_input.bottom_focus();
+            let focus_input =
+                if focus_input && state.dynamic_input.enabled && state.dynamic_input.at_cursor {
+                    state.dynamic_input.request_focus();
+                    false
+                } else {
+                    focus_input
+                };
             ui.horizontal(|ui| {
                 if ui
                     .small_button(if state.cad_workspace.history {
@@ -3006,6 +3069,15 @@ fn drawing_ui(
                         .id(input_id)
                         .hint_text("MOVE / UCS；坐标 x,y,z / u,v；相对 @；极坐标 @长度<角度"),
                 );
+                if response.clicked() || response.changed() {
+                    let ViewerState {
+                        dynamic_input,
+                        cad_command,
+                        command_input,
+                        ..
+                    } = &mut *state;
+                    dynamic_input.to_bottom(cad_command, command_input);
+                }
                 if focus_input {
                     response.request_focus();
                 }
@@ -3082,6 +3154,17 @@ fn drawing_ui(
                         });
                         if ui.button("绘图设置").clicked() {
                             state.cad_workspace.reveal(cad_workspace::Pane::Tools);
+                        }
+                        let enabled = state.dynamic_input.enabled;
+                        if ui.selectable_label(enabled, "动态输入 F12").clicked() {
+                            let ViewerState {
+                                dynamic_input,
+                                cad_command,
+                                command_input,
+                                ..
+                            } = &mut *state;
+                            dynamic_input.toggle(cad_command, command_input);
+                            state.command_focus = true;
                         }
                     });
                 })
@@ -3967,6 +4050,37 @@ fn drawing_ui(
     cad_file::import_report_ui(context, &mut state);
     if !state.gcode_settings_open && !state.file_ui.report_open {
         state.performance.ui(context);
+    }
+    if space.mode == SpaceMode::Cad
+        && !state.gcode_settings_open
+        && !state.file_ui.report_open
+        && !state.performance.open
+        && !state.trajectory_view.open
+    {
+        let submission = {
+            let ViewerState {
+                dynamic_input,
+                cad_command,
+                command_input,
+                ..
+            } = &mut *state;
+            let submission = dynamic_input.ui(context, canvas_rect, cad_command, command_input);
+            cad_command.refresh_input_preview(dynamic_input, command_input);
+            dynamic_input.sync(cad_command, command_input);
+            if dynamic_input.at_cursor {
+                cad_command.preview_scalar(command_input);
+            }
+            submission
+        };
+        if let Some(command) = submission {
+            if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
+                submit_command(&mut state, &mut selection, space.mode, &command);
+            }
+            state.command_focus = state.cad_command.is_active();
+            if state.cad_command.needs_options() {
+                state.cad_workspace.reveal(cad_workspace::Pane::Tools);
+            }
+        }
     }
 
     let pointer = context.input(|input| input.pointer.hover_pos());
