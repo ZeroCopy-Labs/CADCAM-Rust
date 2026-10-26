@@ -66,6 +66,8 @@ impl Workspace {
                     if ui
                         .button(if has_input {
                             "提交当前输入  Enter / 空格"
+                        } else if let Some(label) = command.grip_confirmation_label() {
+                            label
                         } else if command.curve_waiting_target() || command.copy_waiting_target() {
                             "结束连续修改  Enter / 空格"
                         } else if command.is_active() {
@@ -76,6 +78,30 @@ impl Workspace {
                         .clicked()
                     {
                         action = Some(String::new());
+                    }
+                    if command.active_grip().is_some() {
+                        ui.separator();
+                        for (option, label) in [
+                            ("S", "拉伸  S"),
+                            ("M", "移动整个对象  M"),
+                            ("C", "切换创建副本  C"),
+                            ("B", "重新指定基点  B"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                action = Some(option.into());
+                            }
+                        }
+                        if command.grip_can_length() {
+                            if ui.button("直线最终长度  L").clicked() {
+                                action = Some("L".into());
+                            }
+                            if ui.button("端点位移输入  D").clicked() {
+                                action = Some("D".into());
+                            }
+                        }
+                        if ui.button("提交当前目标").clicked() {
+                            action = Some("GRIPAPPLY".into());
+                        }
                     }
                     if command.continuous_drawing() {
                         if ui.button("撤回上一点  U").clicked() {

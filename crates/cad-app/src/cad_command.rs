@@ -6,8 +6,11 @@ use super::cad_tools::{ToolOptions, TransformKind};
 use bevy::prelude::*;
 use bevy_egui::egui;
 use cad_core::geometry_edit::{AffineTransform, Sketch, SketchKind};
-use cad_core::model::{EntityId, Geometry, Plane, Point3, Vector3, WorkPlane};
-use cad_core::properties::{self, GripKind};
+use cad_core::model::{EntityId, Geometry, Point3, Vector3, WorkPlane};
+use cad_core::properties::GripKind;
+
+#[path = "cad_grip_command.rs"]
+mod grip;
 
 enum Step {
     TransformPick(super::cad_transform_command::Session),
@@ -30,14 +33,7 @@ enum Step {
         base: [f64; 3],
     },
     Curves(cad_core::CurveEdit),
-    Grip {
-        id: EntityId,
-        geometry: Geometry,
-        kind: GripKind,
-        label: String,
-        base: Point3,
-        target: Option<Point3>,
-    },
+    Grip(grip::Session),
     Draw {
         sketch: Sketch,
         confirmed: bool,
@@ -365,6 +361,9 @@ impl CommandState {
         if let Some(Step::CurvePick(s)) = &self.step {
             return s.confirmed();
         }
+        if let Some(Step::Grip(s)) = &self.step {
+            return s.ready();
+        }
         matches!(
             &self.step,
             Some(
@@ -374,10 +373,6 @@ impl CommandState {
                         ..
                     }
                     | Step::Paste {
-                        target: Some(_),
-                        ..
-                    }
-                    | Step::Grip {
                         target: Some(_),
                         ..
                     }
@@ -465,34 +460,8 @@ impl CommandState {
                 return s.parameter_spec(self.point_plane());
             }
         }
-        if let Some(Step::Grip {
-            base,
-            geometry,
-            kind,
-            target,
-            ..
-        }) = &self.step
-        {
-            let center = if matches!(kind, GripKind::Radius(_)) {
-                match geometry {
-                    Geometry::Circle(c) => Some(c.center),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            return Some(Spec {
-                kind: if center.is_some() {
-                    Kind::Radius
-                } else {
-                    Kind::Polar
-                },
-                reference: Some(array(center.unwrap_or(*base))),
-                plane: self.point_plane(),
-                point: target.map(array).or(self.hover).or(Some(array(*base))),
-                value: 0.,
-                secondary: 0.,
-            });
+        if let Some(Step::Grip(s)) = &self.step {
+            return Some(s.spec(self.hover));
         }
         if let Some(Step::Transform {
             kind,
@@ -587,44 +556,34 @@ impl CommandState {
             }
             return;
         }
-        if matches!(
-            &self.step,
-            Some(Step::Grip {
-                target: Some(_),
-                ..
-            })
-        ) && !text.trim().is_empty()
-        {
-            let point = if matches!(
-                &self.step,
-                Some(Step::Grip {
-                    kind: GripKind::Radius(_),
-                    ..
+        if let Some(Step::Grip(s)) = &self.step {
+            if grip::Session::option(text) {
+                return;
+            }
+            let point = self
+                .pointer_point
+                .or(self.hover)
+                .unwrap_or(s.spec(None).point.unwrap());
+            let result = self.constrained_point(dynamic, text, point);
+            let result = if let Some(Step::Grip(s)) = &mut self.step {
+                result.and_then(|point| {
+                    s.preview_point(as_point(point))?;
+                    Ok(point)
                 })
-            ) && !text.contains([',', ' ', '<'])
-                && !text.starts_with(['@', '#'])
-            {
-                self.radius_grip_point(text)
             } else {
-                parse_point(
-                    &dynamic.submission(self, text),
-                    self.point_plane(),
-                    self.reference(),
-                )
+                unreachable!()
             };
-            if let Ok(point) = point {
-                if let Some(Step::Grip {
-                    geometry,
-                    kind,
-                    target,
-                    ..
-                }) = &mut self.step
-                {
-                    if properties::move_grip(geometry, *kind, as_point(point)).is_ok() {
-                        *target = Some(as_point(point));
-                    }
+            match result {
+                Ok(point) => {
+                    self.hover = Some(point);
+                    self.ray_error.clear();
+                }
+                Err(error) => {
+                    self.hover = None;
+                    self.ray_error = error;
                 }
             }
+            return;
         }
         if !self.takes_point() {
             return;
@@ -729,23 +688,27 @@ impl CommandState {
             0.,
         ])))
     }
-    fn radius_grip_point(&self, text: &str) -> Result<[f64; 3], String> {
-        let Some(Step::Grip { geometry, base, .. }) = &self.step else {
-            return Err("当前不是半径夹点".into());
-        };
-        let center = match geometry {
-            Geometry::Circle(c) => c.center,
-            _ => return Err("当前不是圆半径夹点".into()),
-        };
-        let radius = number(text)?;
-        if radius <= cad_core::curves::DISTANCE_TOLERANCE {
-            return Err("半径须大于几何容差".into());
+    fn constrained_point(
+        &self,
+        dynamic: &super::cad_input::DynamicInput,
+        text: &str,
+        point: [f64; 3],
+    ) -> Result<[f64; 3], String> {
+        if let Some(Step::Grip(s)) = &self.step {
+            return s.resolve(
+                &dynamic.submission(self, text),
+                dynamic.constrain(self, text, point)?,
+            );
         }
-        let d =
-            cad_core::model::Vector3::new(base.x - center.x, base.y - center.y, base.z - center.z)
-                .normalize()
-                * radius;
-        finite([center.x + d.x, center.y + d.y, center.z + d.z])
+        if dynamic.is_literal() && is_point_expression(text) {
+            parse_point(
+                &dynamic.submission(self, text),
+                self.point_plane(),
+                self.reference(),
+            )
+        } else {
+            dynamic.constrain(self, text, point)
+        }
     }
     pub fn pause_pointer(&mut self) {
         // Keep the last geometric point while the user edits a numeric field.
@@ -784,6 +747,9 @@ impl CommandState {
         if let Some(Step::CurvePick(s)) = &self.step {
             return s.side();
         }
+        if let Some(Step::Grip(s)) = &self.step {
+            return s.takes_point();
+        }
         self.is_active()
             && !self.selecting()
             && !matches!(
@@ -797,10 +763,6 @@ impl CommandState {
                         ..
                     } | Step::Curves(_)
                         | Step::PlaneSelect
-                        | Step::Grip {
-                            target: Some(_),
-                            ..
-                        }
                         | Step::Confirm { .. }
                         | Step::Draw {
                             confirmed: true,
@@ -893,13 +855,7 @@ impl CommandState {
                     }
                 )
             }
-            Some(Step::Grip { target, label, .. }) => {
-                return if target.is_some() {
-                    format!("{label}；Enter 提交预览，或点击重新指定目标；可输入坐标；Esc 取消")
-                } else {
-                    format!("{label}；移动鼠标预览，点击目标或输入坐标后 Enter 提交；Esc 取消")
-                }
-            }
+            Some(Step::Grip(s)) => return s.prompt(),
             Some(Step::Draw { sketch, confirmed }) => {
                 if sketch.kind.is_arc() && !confirmed {
                     return format!(
@@ -1020,38 +976,35 @@ impl CommandState {
         kind: GripKind,
         target: Option<Point3>,
     ) -> Result<(), String> {
-        let grip = properties::grips(&geometry)
-            .into_iter()
-            .find(|g| g.kind == kind)
-            .ok_or("夹点已失效")?;
-        if let Some(p) = target {
-            properties::move_grip(&geometry, kind, p)?;
-        }
+        let session = grip::Session::new(id, geometry, kind, target, self.plane)?;
         self.cancel();
-        self.step = Some(Step::Grip {
-            id,
-            geometry,
-            kind,
-            label: grip.label,
-            base: grip.point,
-            target,
-        });
+        self.pointer_point = target.map(array);
+        self.step = Some(Step::Grip(session));
         Ok(())
     }
     pub fn active_grip(&self) -> Option<(EntityId, GripKind, [f64; 3])> {
-        if let Some(Step::Grip {
-            id,
-            kind,
-            base,
-            target,
-            ..
-        }) = &self.step
-        {
-            Some((
-                *id,
-                *kind,
-                target.map(array).or(self.hover).unwrap_or(array(*base)),
-            ))
+        if let Some(Step::Grip(s)) = &self.step {
+            Some((s.id, s.kind, s.marker(self.hover)))
+        } else {
+            None
+        }
+    }
+    pub fn grip_geometry(&self) -> Option<Geometry> {
+        if let Some(Step::Grip(s)) = &self.step {
+            s.preview(self.hover)
+        } else {
+            None
+        }
+    }
+    pub fn grip_option(&self, text: &str) -> bool {
+        matches!(self.step, Some(Step::Grip(_))) && grip::Session::option(text)
+    }
+    pub fn grip_can_length(&self) -> bool {
+        matches!(&self.step, Some(Step::Grip(s)) if s.can_length())
+    }
+    pub fn grip_confirmation_label(&self) -> Option<&'static str> {
+        if let Some(Step::Grip(s)) = &self.step {
+            Some(s.confirmation_label())
         } else {
             None
         }
@@ -1071,21 +1024,8 @@ impl CommandState {
                 ..self.plane
             };
         }
-        if let Some(Step::Grip { geometry, base, .. }) = &self.step {
-            let plane = match geometry {
-                Geometry::Circle(c) => Some(c.plane),
-                Geometry::Arc(a) => Some(a.plane),
-                Geometry::Polyline(p) => p.plane,
-                Geometry::Ellipse(e) => {
-                    Some(Plane::new(e.major_axis.cross(e.minor_axis), e.major_axis))
-                }
-                _ => None,
-            };
-            return WorkPlane {
-                origin: *base,
-                x_axis: plane.map_or(self.plane.x_axis, |p| p.x_axis),
-                y_axis: plane.map_or(self.plane.y_axis, |p| p.y_axis()),
-            };
+        if let Some(Step::Grip(s)) = &self.step {
+            return s.plane();
         }
         self.plane
     }
@@ -1240,16 +1180,7 @@ impl CommandState {
                 .map(array)
                 .unwrap_or(array(self.plane.origin)),
             Some(Step::Paste { base, .. } | Step::ArraySpacing { base, .. }) => *base,
-            Some(Step::Grip {
-                base,
-                kind: GripKind::Radius(_),
-                geometry,
-                ..
-            }) => array(match geometry {
-                Geometry::Circle(c) => c.center,
-                _ => *base,
-            }),
-            Some(Step::Grip { base, .. }) => array(*base),
+            Some(Step::Grip(s)) => array(s.reference()),
             Some(Step::Draw { sketch, .. })
                 if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
             {
@@ -1277,7 +1208,7 @@ impl CommandState {
             Some(Step::ArraySpacing { base, .. } | Step::Paste { base, .. }) => {
                 Some(as_point(*base))
             }
-            Some(Step::Grip { .. }) => Some(as_point(self.reference())),
+            Some(Step::Grip(_)) => Some(as_point(self.reference())),
             Some(Step::Draw { sketch, .. })
                 if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
             {
@@ -1317,6 +1248,19 @@ impl CommandState {
         text: &str,
         selected: &BTreeSet<u32>,
     ) -> Result<Option<CommandCommit>, String> {
+        let grip_point = if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("GRIPAPPLY") {
+            self.hover
+        } else {
+            self.pointer_point.or(self.hover)
+        };
+        if let Some(Step::Grip(s)) = &mut self.step {
+            let result = s.input(text, grip_point);
+            if result.is_ok() {
+                self.clear_hover();
+                self.ray_error.clear();
+            }
+            return result;
+        }
         if self.rectangle_corner() {
             let upper = text.trim().to_uppercase();
             if matches!(upper.as_str(), "R" | "ROTATION") {
@@ -1479,20 +1423,6 @@ impl CommandState {
                 return result;
             }
         }
-        if matches!(
-            &self.step,
-            Some(Step::Grip {
-                kind: GripKind::Radius(_),
-                ..
-            })
-        ) && !text.trim().is_empty()
-            && !text.contains([',', ' ', '<'])
-            && !text.starts_with(['@', '#'])
-        {
-            let point = self.radius_grip_point(text)?;
-            self.accept_point(point)?;
-            return self.finish_ready(selected);
-        }
         if matches!(self.step, Some(Step::PlaneSelect)) {
             let name = text.trim().to_uppercase();
             let name = if name.is_empty() { "XY" } else { name.as_str() };
@@ -1565,21 +1495,6 @@ impl CommandState {
                 return Ok(Some(CommandCommit::Curves(edit.clone())));
             }
             return Err("曲线预览只接受 Enter 提交或 Esc 取消".into());
-        }
-        if let Some(Step::Grip {
-            id,
-            geometry,
-            kind,
-            target: Some(target),
-            ..
-        }) = &self.step
-        {
-            if text.trim().is_empty() {
-                return Ok(Some(CommandCommit::Geometry(BTreeMap::from([(
-                    *id,
-                    properties::move_grip(geometry, *kind, *target)?,
-                )]))));
-            }
         }
         if let Some(Step::TransformSelect { kind }) = self.step {
             if !text.trim().is_empty() || selected.is_empty() {
@@ -1884,23 +1799,14 @@ impl CommandState {
                 })
             }
             Step::Curves(_) => return Err("当前为曲线整理确认步骤".into()),
-            Step::Grip {
-                id,
-                geometry,
-                kind,
-                label,
-                base,
-                ..
-            } => {
-                properties::move_grip(geometry, *kind, as_point(point))?;
-                Some(Step::Grip {
-                    id: *id,
-                    geometry: geometry.clone(),
-                    kind: *kind,
-                    label: label.clone(),
-                    base: *base,
-                    target: Some(as_point(point)),
-                })
+            Step::Grip(_) => {
+                if let Some(Step::Grip(s)) = &mut self.step {
+                    s.accept(as_point(point))?;
+                }
+                self.clear_hover();
+                self.error.clear();
+                self.ray_error.clear();
+                return Ok(());
             }
             Step::Draw { sketch, confirmed } => {
                 let mut next = sketch.clone();
@@ -1989,7 +1895,7 @@ impl CommandState {
     ) -> bool {
         // A fixed target from the properties panel stays in preview until
         // confirmed, but a canvas click can replace it and commit once.
-        if !self.takes_point() && !(click && matches!(self.step, Some(Step::Grip { .. }))) {
+        if !self.takes_point() && !(click && matches!(self.step, Some(Step::Grip(_)))) {
             return false;
         }
         if let Some(Step::TransformPick(s)) = &mut self.step {
@@ -2009,13 +1915,7 @@ impl CommandState {
             .map(array)
             .and_then(finite)
             .inspect(|point| self.pointer_point = Some(*point))
-            .and_then(|point| {
-                if dynamic.is_literal() && is_point_expression(draft) {
-                    parse_point(&dynamic.submission(self, draft), plane, self.reference())
-                } else {
-                    dynamic.constrain(self, draft, point)
-                }
-            })
+            .and_then(|point| self.constrained_point(dynamic, draft, point))
             .and_then(|point| self.circle_value_point(draft).unwrap_or(Ok(point)))
             .and_then(|point| self.rectangle_target(point))
             .and_then(finite);
@@ -2130,18 +2030,8 @@ impl CommandState {
                 .collect();
         }
 
-        if let Some(Step::Grip {
-            geometry,
-            kind,
-            target,
-            ..
-        }) = &self.step
-        {
-            return target
-                .or(self.hover.map(as_point))
-                .and_then(|p| properties::move_grip(geometry, *kind, p).ok())
-                .map(|g| super::display::tessellate_geometry(&g))
-                .unwrap_or_default();
+        if let Some(geometry) = self.grip_geometry() {
+            return super::display::tessellate_geometry(&geometry);
         }
         let Some(Step::Draw { sketch, confirmed }) = &self.step else {
             return Vec::new();
@@ -2306,11 +2196,30 @@ impl CommandState {
             ui.label(&self.last_measurement);
         }
         ui.label(self.prompt());
-        if let Some(Step::Grip { base, .. }) = &self.step {
+        if let Some(Step::Grip(s)) = &self.step {
+            let origin = s.plane().origin;
             ui.small(format!(
-                "夹点临时平面原点：{:.4}, {:.4}, {:.4}；U/V 沿图元平面，三维输入仍为 WCS。",
-                base.x, base.y, base.z
+                "夹点基点：{:.4}, {:.4}, {:.4}；三维输入为 WCS。",
+                origin.x, origin.y, origin.z
             ));
+            ui.horizontal_wrapped(|ui| {
+                for (option, label) in [
+                    ("S", "拉伸"),
+                    ("M", "移动"),
+                    ("C", "复制开关"),
+                    ("B", "重新指定基点"),
+                ] {
+                    if ui.button(label).clicked() {
+                        command = Some(option.into());
+                    }
+                }
+                if s.can_length() && ui.button("最终长度").clicked() {
+                    command = Some("L".into());
+                }
+                if s.can_length() && ui.button("位移输入").clicked() {
+                    command = Some("D".into());
+                }
+            });
         }
         if let Some(Step::Transform {
             kind: TransformKind::RectArray,
@@ -2344,13 +2253,18 @@ impl CommandState {
                 ui.label(format!("预览 Δ：{x:.4}, {y:.4}, {z:.4} mm"));
             }
             ui.horizontal(|ui| {
+                if matches!(self.step, Some(Step::Grip(_)))
+                    && ui.button("提交当前目标").clicked()
+                {
+                    command = Some("GRIPAPPLY".into());
+                }
                 if self.selecting() && ui.button("确认选择").clicked() {
                     command = Some(String::new());
                 }
                 if matches!(
                     self.step,
                     Some(
-                        Step::Utility{confirmed:true,..} | Step::Paste{target:Some(_),..} | Step::Curves(_) | Step::Grip { target: Some(_), .. } | Step::Confirm { .. }
+                        Step::Utility{confirmed:true,..} | Step::Paste{target:Some(_),..} | Step::Curves(_) | Step::Confirm { .. }
                             | Step::Draw {
                                 confirmed: true,
                                 ..

@@ -8,6 +8,7 @@ use super::cad_command::CommandState;
 pub enum Kind {
     Coordinates,
     Polar,
+    GripPolar,
     Radius,
     Diameter,
     Angle,
@@ -37,7 +38,7 @@ impl Spec {
     fn count(self) -> usize {
         match self.kind {
             Kind::Coordinates => 3,
-            Kind::Polar | Kind::ArrayRect => 2,
+            Kind::Polar | Kind::GripPolar | Kind::ArrayRect => 2,
             _ => 1,
         }
     }
@@ -45,6 +46,7 @@ impl Spec {
         match self.kind {
             Kind::Coordinates => &["X", "Y", "Z"],
             Kind::Polar => &["长度", "角度 °"],
+            Kind::GripPolar => &["位移 mm", "方向 °"],
             Kind::Radius => &["半径"],
             Kind::Diameter => &["直径"],
             Kind::Angle => &["角度 °"],
@@ -69,7 +71,7 @@ impl Spec {
             Kind::Radius | Kind::Diameter if self.reference.is_none() => [self.value, 0., 0.],
             Kind::ArrayRect => [self.value, self.secondary, 0.],
             Kind::Coordinates => std::array::from_fn(|i| point[i] - base[i]),
-            Kind::Polar | Kind::Radius | Kind::Diameter => {
+            Kind::Polar | Kind::GripPolar | Kind::Radius | Kind::Diameter => {
                 let a = self.plane.to_local(Point3::new(base[0], base[1], base[2]));
                 let b = self
                     .plane
@@ -242,7 +244,9 @@ impl DynamicInput {
     }
     fn spec(&self, command: &CommandState) -> Option<Spec> {
         command.input_spec().map(|mut spec| {
-            if self.coordinate_mode && matches!(spec.kind, Kind::Coordinates | Kind::Polar) {
+            if self.coordinate_mode
+                && matches!(spec.kind, Kind::Coordinates | Kind::Polar | Kind::GripPolar)
+            {
                 spec.kind = Kind::Coordinates;
             }
             spec
@@ -371,6 +375,7 @@ impl DynamicInput {
                         .is_some_and(|(key, _)| typed.eq_ignore_ascii_case(key))
                     || command.curve_reselect() && typed.eq_ignore_ascii_case("N")
                     || command.transform_reference() && typed.eq_ignore_ascii_case("R")
+                    || command.grip_option(&typed)
                     || !command.circle_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
                     || !command.arc_options().is_empty()
@@ -503,7 +508,7 @@ impl DynamicInput {
                 fields[1],
                 fields[2]
             ),
-            Kind::Polar => format!("@{}<{}", fields[0], fields[1]),
+            Kind::Polar | Kind::GripPolar => format!("@{}<{}", fields[0], fields[1]),
             Kind::ArrayRect => format!("{},{}", fields[0], fields[1]),
             _ => fields[0].clone(),
         }
@@ -542,7 +547,7 @@ impl DynamicInput {
         let base = spec.reference.unwrap_or([0.; 3]);
         let result = match spec.kind {
             Kind::Coordinates => std::array::from_fn(|i| base[i] + values[i]),
-            Kind::Polar | Kind::Radius | Kind::Diameter => {
+            Kind::Polar | Kind::GripPolar | Kind::Radius | Kind::Diameter => {
                 if matches!(spec.kind, Kind::Radius | Kind::Diameter) && values[0] <= 0. {
                     return Err("半径必须大于零".into());
                 }
@@ -647,7 +652,7 @@ impl DynamicInput {
                         return;
                     }
                     if let Some(spec) = spec.filter(|_| !self.literal) {
-                        if matches!(spec.kind, Kind::Polar | Kind::Coordinates)
+                        if matches!(spec.kind, Kind::Polar | Kind::GripPolar | Kind::Coordinates)
                             && spec.reference.is_some()
                         {
                             if ui
@@ -671,6 +676,7 @@ impl DynamicInput {
                             }
                             Kind::Coordinates => "相对基点的 WCS 位移 · Tab 切换字段",
                             Kind::Polar => "工作平面长度/角度 · Tab 切换字段",
+                            Kind::GripPolar => "工作平面位移/方向 · 三维位移可切换坐标输入",
                             Kind::Radius => "半径 mm · 输入值锁定预览",
                             Kind::Diameter => "直径 mm · 半径为该长度的一半",
                             Kind::Angle => "旋转角度（度） · Enter 确认参数",

@@ -383,7 +383,11 @@ fn cad_command_input_suspended(state: &ViewerState) -> bool {
 }
 
 fn cad_command_submission(state: &ViewerState, raw: &str) -> String {
-    let draft = if raw.trim().is_empty() {
+    let draft = if raw.trim().is_empty()
+        || raw.trim().eq_ignore_ascii_case("GRIPAPPLY")
+            && state.cad_command.active_grip().is_some()
+            && !state.command_input.trim().is_empty()
+    {
         state
             .dynamic_input
             .submission(&state.cad_command, &state.command_input)
@@ -4408,14 +4412,7 @@ fn draw_cad_grips(
     {
         return;
     }
-    let preview = active.and_then(|(_, kind, point)| {
-        cad_core::properties::move_grip(
-            &entity.geometry,
-            kind,
-            cad_core::model::Point3::new(point[0], point[1], point[2]),
-        )
-        .ok()
-    });
+    let preview = state.cad_command.grip_geometry();
     let projected: Vec<_> =
         cad_core::properties::grips(preview.as_ref().unwrap_or(&entity.geometry))
             .into_iter()
