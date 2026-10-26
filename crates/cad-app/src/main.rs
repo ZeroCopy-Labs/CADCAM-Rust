@@ -373,30 +373,42 @@ fn push_message(state: &mut ViewerState, message: impl Into<String>) {
     }
 }
 
+fn cad_command_input_suspended(state: &ViewerState) -> bool {
+    state.gcode_settings_open
+        || state.file_ui.report_open
+        || state.performance.open
+        || state.trajectory_view.open
+}
+
+fn cad_command_submission(state: &ViewerState, raw: &str) -> String {
+    let draft = if raw.trim().is_empty() {
+        state
+            .dynamic_input
+            .submission(&state.cad_command, &state.command_input)
+    } else {
+        raw.trim().to_string()
+    };
+    let repeated = if draft.trim().is_empty() && !state.cad_command.is_active() {
+        state.cad_command.last_command.clone()
+    } else {
+        draft
+    };
+    if state.cad_command.is_active() {
+        repeated.trim().to_string()
+    } else {
+        cad_input::canonical(&repeated.trim().to_uppercase()).to_string()
+    }
+}
+
 fn submit_command(
     state: &mut ViewerState,
     selection: &mut SelectionState,
     mode: SpaceMode,
     raw: &str,
 ) {
-    let repeated = if raw.trim().is_empty()
-        && (state.cad_command.rectangle_corner() && !state.cad_command.takes_point()
-            || state.cad_command.arc_sweep_input()
-            || state.cad_command.curve_parameter_input())
-    {
-        state.command_input.trim().to_string()
-    } else if raw.trim().is_empty() && !state.cad_command.is_active() {
-        state.cad_command.last_command.clone()
-    } else {
-        raw.trim().to_string()
-    };
-    let command = repeated.trim();
+    let submission = cad_command_submission(state, raw);
+    let command = submission.as_str();
     let upper = command.to_uppercase();
-    let upper = if state.cad_command.is_active() {
-        upper
-    } else {
-        cad_input::canonical(&upper).to_string()
-    };
     let keep_drawing =
         matches!(upper.as_str(), "CANCEL" | "取消") && state.cad_command.finish_on_cancel();
     if matches!(upper.as_str(), "CANCEL" | "取消" | "DISCARD") && !keep_drawing {
@@ -1131,9 +1143,6 @@ fn selection_input(
         return Ok(());
     }
     let Some(cursor) = window.cursor_position() else {
-        if mouse.just_released(MouseButton::Left) {
-            state.cad_command.stop_grip_drag();
-        }
         if state.dynamic_input.enabled && state.cad_command.is_active() {
             state.cad_command.pause_pointer();
         } else {
@@ -1149,9 +1158,6 @@ fn selection_input(
         || context.egui_wants_pointer_input()
         || context.egui_is_using_pointer();
     if ui_active {
-        if mouse.just_released(MouseButton::Left) {
-            state.cad_command.stop_grip_drag();
-        }
         selection.hover_hits.clear();
         selection.hover_cursor = None;
         selection.hover_index = 0;
@@ -1185,7 +1191,7 @@ fn selection_input(
         {
             if state
                 .cad_command
-                .begin_grip(id, geometry, kind, None, true)
+                .begin_grip(id, geometry, kind, None)
                 .is_ok()
             {
                 state.command_open = true;
@@ -1279,17 +1285,10 @@ fn selection_input(
                     drawing.document(),
                     dynamic_input,
                     command_input,
-                    if cad_command.grip_dragging() {
-                        mouse.just_released(MouseButton::Left)
-                    } else {
-                        mouse.just_pressed(MouseButton::Left)
-                    },
+                    mouse.just_pressed(MouseButton::Left),
                 )
             })
         };
-        if mouse.just_released(MouseButton::Left) {
-            state.cad_command.stop_grip_drag();
-        }
         if accepted {
             state.command_input.clear();
             state.dynamic_input.reset_fields();
@@ -2538,7 +2537,13 @@ fn drawing_ui(
     context.set_visuals(egui::Visuals::dark());
 
     let mut command_request = None;
-    if state.cad_workspace.context.is_some() {
+    if cad_command_input_suspended(&state) {
+        state.cad_workspace.context = None;
+    }
+    if space.mode == SpaceMode::Cad
+        && !cad_command_input_suspended(&state)
+        && state.cad_workspace.context.is_some()
+    {
         if context.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             state.cad_workspace.context = None;
         } else if context.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
@@ -2552,13 +2557,10 @@ fn drawing_ui(
             state.cad_workspace.context = None;
         }
     }
-    if space.mode == SpaceMode::Cad
-        && !state.gcode_settings_open
-        && !state.file_ui.report_open
-        && !state.performance.open
-        && !state.trajectory_view.open
-        && state.cad_workspace.context.is_none()
-    {
+    let cad_keyboard = space.mode == SpaceMode::Cad
+        && !cad_command_input_suspended(&state)
+        && state.cad_workspace.context.is_none();
+    if cad_keyboard && command_request.is_none() {
         let ViewerState {
             dynamic_input,
             cad_command,
@@ -2567,16 +2569,14 @@ fn drawing_ui(
         } = &mut *state;
         dynamic_input.prepare(context, ui_state.canvas_rect, cad_command, command_input);
     }
-    if !state.gcode_settings_open && !state.file_ui.report_open {
+    if !cad_command_input_suspended(&state)
+        && state.cad_workspace.context.is_none()
+        && command_request.is_none()
+    {
         let wants_keyboard = context.egui_wants_keyboard_input();
         let cursor_focus = cad_input::owns_focus(context);
         let bottom_focus = context.memory(|m| m.has_focus(egui::Id::new("cad_command_input")));
-        if space.mode == SpaceMode::Cad
-            && !state.performance.open
-            && !state.trajectory_view.open
-            && (!wants_keyboard || bottom_focus)
-            && cad_input::confirm_space(context)
-        {
+        if cad_keyboard && (!wants_keyboard || bottom_focus) && cad_input::confirm_space(context) {
             command_request = Some(std::mem::take(&mut state.command_input));
         }
         context.input_mut(|input| {
@@ -2606,24 +2606,16 @@ fn drawing_ui(
         .memory(|memory| memory.has_focus(egui::Id::new("cad_command_input")))
         || cad_input::owns_focus(context);
     if command_request.is_none()
-        && space.mode == SpaceMode::Cad
+        && cad_keyboard
         && state.cad_command.command_undo_active()
         && state.command_input.is_empty()
-        && !state.gcode_settings_open
-        && !state.file_ui.report_open
-        && !state.performance.open
-        && !state.trajectory_view.open
         && (!context.egui_wants_keyboard_input() || command_field)
         && !context.input(|i| i.modifiers.shift)
         && context.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
     {
         command_request = Some("U".into());
     }
-    if space.mode == SpaceMode::Cad
-        && !state.gcode_settings_open
-        && !state.file_ui.report_open
-        && (!context.egui_wants_keyboard_input() || command_field)
-    {
+    if cad_keyboard && (!context.egui_wants_keyboard_input() || command_field) {
         context.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
                 state.cad_command.aids.enabled = !state.cad_command.aids.enabled;
@@ -2671,10 +2663,9 @@ fn drawing_ui(
     }
     let mut copy_requested = false;
     let mut paste_text = None;
-    if space.mode == SpaceMode::Cad
+    if cad_keyboard
+        && command_request.is_none()
         && !state.cad_command.is_active()
-        && !state.gcode_settings_open
-        && !state.file_ui.report_open
         && !context.egui_wants_keyboard_input()
     {
         context.input_mut(|input| {
@@ -2743,9 +2734,8 @@ fn drawing_ui(
     }
     let mut cad_action = None;
     let mut select_all = false;
-    if space.mode == SpaceMode::Cad
-        && !state.gcode_settings_open
-        && !state.file_ui.report_open
+    if cad_keyboard
+        && command_request.is_none()
         && (!context.egui_wants_keyboard_input()
             || state.cad_command.selecting() && command_field && state.command_input.is_empty())
     {
@@ -3216,7 +3206,9 @@ fn drawing_ui(
     }
     if state.cad_command.is_active() {
         state.command_open = true;
-        if !context.egui_wants_keyboard_input()
+        if !cad_command_input_suspended(&state)
+            && state.cad_workspace.context.is_none()
+            && !context.egui_wants_keyboard_input()
             && context.input(|input| {
                 input
                     .events
@@ -3273,8 +3265,11 @@ fn drawing_ui(
                     });
             }
 
-            let focus_input =
-                std::mem::take(&mut state.command_focus) || state.dynamic_input.bottom_focus();
+            let input_enabled = space.mode == SpaceMode::Cad
+                && !cad_command_input_suspended(&state)
+                && state.cad_workspace.context.is_none();
+            let focus_input = input_enabled
+                && (std::mem::take(&mut state.command_focus) || state.dynamic_input.bottom_focus());
             let focus_input =
                 if focus_input && state.dynamic_input.enabled && state.dynamic_input.at_cursor {
                     state.dynamic_input.request_focus();
@@ -3318,9 +3313,13 @@ fn drawing_ui(
                 let response = ui.add_sized(
                     egui::Vec2::new(ui.available_width(), COMMAND_ROW_HEIGHT - 2.0),
                     egui::TextEdit::singleline(&mut state.command_input)
+                        .interactive(input_enabled)
                         .id(input_id)
                         .hint_text("MOVE / UCS；坐标 x,y,z / u,v；相对 @；极坐标 @长度<角度"),
                 );
+                if !input_enabled {
+                    response.surrender_focus();
+                }
                 if response.clicked() || response.changed() {
                     let ViewerState {
                         dynamic_input,
@@ -3334,7 +3333,7 @@ fn drawing_ui(
                     response.request_focus();
                 }
                 let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if enter && (response.has_focus() || response.lost_focus()) {
+                if input_enabled && enter && (response.has_focus() || response.lost_focus()) {
                     let command = std::mem::take(&mut state.command_input);
                     if prepare_clipboard(&mut state, &mut system_clipboard, &command) {
                         submit_command(&mut state, &mut selection, space.mode, &command);
@@ -4311,13 +4310,16 @@ fn drawing_ui(
     {
         let can_undo = state.drawing.as_ref().is_some_and(|d| d.can_undo());
         let can_redo = state.drawing.as_ref().is_some_and(|d| d.can_redo());
+        let has_input = !state.command_input.trim().is_empty();
         let action = {
             let ViewerState {
                 cad_workspace,
                 cad_command,
                 ..
             } = &mut *state;
-            cad_workspace.context_ui(context, canvas_rect, cad_command, can_undo, can_redo)
+            cad_workspace.context_ui(
+                context, canvas_rect, cad_command, can_undo, can_redo, has_input,
+            )
         };
         if let Some(action) = action {
             let command = if action.is_empty() {
@@ -4353,12 +4355,7 @@ fn drawing_ui(
             let submission = dynamic_input.ui(context, canvas_rect, cad_command, command_input);
             cad_command.refresh_input_preview(dynamic_input, command_input);
             dynamic_input.sync(cad_command, command_input);
-            if dynamic_input.at_cursor
-                || cad_command.transform_reference()
-                || cad_command.arc_sweep_input()
-            {
-                cad_command.preview_scalar(command_input);
-            }
+            cad_command.preview_scalar(command_input);
             submission
         };
         if let Some(command) = submission {
@@ -4370,6 +4367,13 @@ fn drawing_ui(
                 state.cad_workspace.reveal(cad_workspace::Pane::Tools);
             }
         }
+    }
+
+    if space.mode != SpaceMode::Cad
+        || cad_command_input_suspended(&state)
+        || state.cad_workspace.context.is_some()
+    {
+        state.dynamic_input.suspend();
     }
 
     let pointer = context.input(|input| input.pointer.hover_pos());
@@ -5499,11 +5503,12 @@ fn apply_cad_action(
                 Some(cad_core::model::Point3::new(
                     target[0], target[1], target[2],
                 )),
-                false,
             ) {
                 Ok(()) => {
                     state.command_open = true;
                     state.command_input.clear();
+                    state.dynamic_input.reset_fields();
+                    state.dynamic_input.request_focus();
                     return true;
                 }
                 Err(error) => {
@@ -5877,11 +5882,7 @@ fn prepare_clipboard(
     clipboard: &mut bevy_egui::EguiClipboard,
     command: &str,
 ) -> bool {
-    if !command.trim().eq_ignore_ascii_case("PASTE")
-        && !(command.trim().is_empty()
-            && !state.cad_command.is_active()
-            && state.cad_command.last_command.eq_ignore_ascii_case("PASTE"))
-    {
+    if state.cad_command.is_active() || cad_command_submission(state, command) != "PASTE" {
         return true;
     }
     match clipboard

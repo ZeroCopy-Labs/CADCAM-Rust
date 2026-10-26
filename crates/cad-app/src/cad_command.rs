@@ -36,7 +36,6 @@ enum Step {
         kind: GripKind,
         base: Point3,
         target: Option<Point3>,
-        dragging: bool,
     },
     Draw {
         sketch: Sketch,
@@ -253,8 +252,14 @@ impl CommandState {
     pub fn curve_reselect(&self) -> bool {
         matches!(&self.step,Some(Step::CurvePick(s)) if s.can_reselect())
     }
-    pub fn curve_parameter_input(&self) -> bool {
-        matches!(&self.step,Some(Step::CurvePick(s)) if s.parameter_input())
+    pub fn cancel_label(&self) -> &'static str {
+        if self.continuous_drawing() {
+            "结束绘制，保留有效已取点  Esc"
+        } else if self.command_undo_active() {
+            "结束命令，保留已完成结果  Esc"
+        } else {
+            "取消当前未提交操作  Esc"
+        }
     }
     pub fn transform_reference(&self) -> bool {
         matches!(&self.step,Some(Step::TransformPick(s)) if s.can_reference())
@@ -373,7 +378,6 @@ impl CommandState {
                     }
                     | Step::Grip {
                         target: Some(_),
-                        dragging: false,
                         ..
                     }
             )
@@ -587,7 +591,6 @@ impl CommandState {
             &self.step,
             Some(Step::Grip {
                 target: Some(_),
-                dragging: false,
                 ..
             })
         ) && !text.trim().is_empty()
@@ -626,21 +629,20 @@ impl CommandState {
         if !self.takes_point() {
             return;
         }
-        let literal = if dynamic.is_literal() {
-            parse_point(
+        let literal = if dynamic.is_literal() && is_point_expression(text) {
+            Some(parse_point(
                 &dynamic.submission(self, text),
                 self.point_plane(),
                 self.reference(),
-            )
-            .ok()
+            ))
         } else {
             None
         };
-        if let Some(point) = literal.or(self.pointer_point) {
-            let result = if literal.is_some() {
-                Ok(point)
+        if literal.is_some() || self.pointer_point.is_some() {
+            let result = if let Some(point) = literal {
+                point
             } else {
-                dynamic.constrain(self, text, point)
+                dynamic.constrain(self, text, self.pointer_point.unwrap())
             };
             match result.and_then(|point| self.rectangle_target(point)) {
                 Ok(point) => {
@@ -892,15 +894,11 @@ impl CommandState {
                     }
                 )
             }
-            Some(Step::Grip {
-                target, dragging, ..
-            }) => {
-                return if *dragging {
-                    "夹点：拖动预览，松开提交；Esc 取消".into()
-                } else if target.is_some() {
-                    "夹点：Enter 提交；可输入坐标改目标；Esc 取消".into()
+            Some(Step::Grip { target, .. }) => {
+                return if target.is_some() {
+                    "夹点：Enter 提交预览，或点击重新指定目标；可输入坐标；Esc 取消".into()
                 } else {
-                    "夹点：指定目标坐标或点选；Esc 取消".into()
+                    "夹点：移动鼠标预览，点击目标或输入坐标后 Enter 提交；Esc 取消".into()
                 }
             }
             Some(Step::Draw { sketch, confirmed }) => {
@@ -1022,7 +1020,6 @@ impl CommandState {
         geometry: Geometry,
         kind: GripKind,
         target: Option<Point3>,
-        dragging: bool,
     ) -> Result<(), String> {
         let base = properties::grips(&geometry)
             .into_iter()
@@ -1039,17 +1036,8 @@ impl CommandState {
             kind,
             base,
             target,
-            dragging,
         });
         Ok(())
-    }
-    pub fn grip_dragging(&self) -> bool {
-        matches!(self.step, Some(Step::Grip { dragging: true, .. }))
-    }
-    pub fn stop_grip_drag(&mut self) {
-        if let Some(Step::Grip { dragging, .. }) = &mut self.step {
-            *dragging = false;
-        }
     }
     fn point_plane(&self) -> WorkPlane {
         if let Some(Step::TransformPick(s)) = &self.step {
@@ -1407,9 +1395,7 @@ impl CommandState {
             }
         }
         if let Some(Step::TransformPick(s)) = &mut self.step {
-            let point_expression = text.starts_with(['@', '#'])
-                || text.contains([',', '，', '<'])
-                || text.split_whitespace().count() > 1;
+            let point_expression = is_point_expression(text);
             if s.takes_point() && point_expression {
                 s.preview_value("", &mut self.tools);
             }
@@ -1896,7 +1882,6 @@ impl CommandState {
                     kind: *kind,
                     base: *base,
                     target: Some(as_point(point)),
-                    dragging: false,
                 })
             }
             Step::Draw { sketch, confirmed } => {
@@ -1984,7 +1969,9 @@ impl CommandState {
         draft: &str,
         click: bool,
     ) -> bool {
-        if !self.takes_point() {
+        // A fixed target from the properties panel stays in preview until
+        // confirmed, but a canvas click can replace it and commit once.
+        if !self.takes_point() && !(click && matches!(self.step, Some(Step::Grip { .. }))) {
             return false;
         }
         if let Some(Step::TransformPick(s)) = &mut self.step {
@@ -2004,7 +1991,13 @@ impl CommandState {
             .map(array)
             .and_then(finite)
             .inspect(|point| self.pointer_point = Some(*point))
-            .and_then(|point| dynamic.constrain(self, draft, point))
+            .and_then(|point| {
+                if dynamic.is_literal() && is_point_expression(draft) {
+                    parse_point(&dynamic.submission(self, draft), plane, self.reference())
+                } else {
+                    dynamic.constrain(self, draft, point)
+                }
+            })
             .and_then(|point| self.circle_value_point(draft).unwrap_or(Ok(point)))
             .and_then(|point| self.rectangle_target(point))
             .and_then(finite);
@@ -2026,9 +2019,6 @@ impl CommandState {
                         Ok(()) => return true,
                         Err(error) => {
                             self.error = error;
-                            if let Some(Step::Grip { dragging, .. }) = &mut self.step {
-                                *dragging = false;
-                            }
                         }
                     }
                 }
@@ -2362,7 +2352,7 @@ impl CommandState {
                 ) {
                     let continuous = matches!(&self.step, Some(Step::Draw { sketch, .. }) if sketch.kind.continuous());
                     if continuous && ui.button("结束取点").clicked() {
-                        command = Some(String::new());
+                        command = Some("CANCEL".into());
                     }
                     if ui.button("撤回一点").clicked() {
                         command = Some("U".into());
@@ -2371,7 +2361,7 @@ impl CommandState {
                         command = Some("C".into());
                     }
                 }
-                if ui.button("取消  Esc").clicked() {
+                if ui.button(self.cancel_label()).clicked() {
                     command = Some("CANCEL".into());
                 }
             });
@@ -2540,6 +2530,15 @@ fn update_transform(
 
 fn array(p: Point3) -> [f64; 3] {
     [p.x, p.y, p.z]
+}
+
+fn is_point_expression(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with(['@', '#'])
+        || text.starts_with("W:")
+        || text.starts_with("w:")
+        || text.contains([',', '，', '<'])
+        || text.split_whitespace().count() > 1
 }
 
 fn parse_point(text: &str, plane: WorkPlane, reference: [f64; 3]) -> Result<[f64; 3], String> {

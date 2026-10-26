@@ -42,6 +42,7 @@ impl Workspace {
         command: &super::cad_command::CommandState,
         can_undo: bool,
         can_redo: bool,
+        has_input: bool,
     ) -> Option<String> {
         let mut opened = false;
         if let Some(pos) = ctx
@@ -63,15 +64,15 @@ impl Workspace {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(175.);
                     if ui
-                        .button(
-                            if command.curve_waiting_target() || command.copy_waiting_target() {
-                                "确认 / 结束连续修改  Enter"
-                            } else if command.is_active() {
-                                "确认 / 结束  Enter"
-                            } else {
-                                "重复上一命令  Enter / 空格"
-                            },
-                        )
+                        .button(if has_input {
+                            "提交当前输入  Enter / 空格"
+                        } else if command.curve_waiting_target() || command.copy_waiting_target() {
+                            "结束连续修改  Enter / 空格"
+                        } else if command.is_active() {
+                            "确认 / 结束  Enter"
+                        } else {
+                            "重复上一命令  Enter / 空格"
+                        })
                         .clicked()
                     {
                         action = Some(String::new());
@@ -170,7 +171,7 @@ impl Workspace {
                         }
                     }
                     if command.is_active() {
-                        if ui.button("取消当前操作  Esc").clicked() {
+                        if ui.button(command.cancel_label()).clicked() {
                             action = Some("CANCEL".into());
                         }
                     } else {

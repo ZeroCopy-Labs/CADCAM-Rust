@@ -292,7 +292,7 @@ pub fn editing_ui(
                         target: controls.point,
                     });
                 }
-                ui.small("也可拖动画布上的方形夹点；松开后确认，Esc 取消。");
+                ui.small("也可点击画布夹点，移动或输入后再次点击 / Enter 提交；Esc 取消。");
             } else {
                 ui.weak("此样条暂无可编辑控制点（周期 / 仅拟合点）。");
             }

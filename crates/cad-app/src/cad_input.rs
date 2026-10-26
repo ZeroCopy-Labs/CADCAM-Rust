@@ -161,6 +161,9 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("DIMALIGNED", "", "对齐标注"),
 ];
 pub fn canonical(name: &str) -> &str {
+    if name.is_empty() {
+        return name;
+    }
     if name == "CP" {
         return "COPY";
     }
@@ -170,6 +173,11 @@ pub fn canonical(name: &str) -> &str {
     COMMANDS
         .iter()
         .find(|(full, alias, _)| *full == name || !alias.is_empty() && *alias == name)
+        .or_else(|| {
+            COMMANDS.iter().find(|(full, alias, _)| {
+                full.starts_with(name) || !alias.is_empty() && alias.starts_with(name)
+            })
+        })
         .map(|(full, _, _)| *full)
         .unwrap_or(name)
 }
@@ -209,6 +217,11 @@ pub fn confirm_space(ctx: &egui::Context) -> bool {
     true
 }
 impl DynamicInput {
+    pub fn suspend(&mut self) {
+        self.enter = false;
+        self.focus = false;
+        self.rect = None;
+    }
     pub fn reset_fields(&mut self) {
         self.locked = [false; 3];
         self.field = 0;
@@ -321,6 +334,9 @@ impl DynamicInput {
         if let Some((typed, pasted)) = typed {
             if self.at_cursor && (owned || on_canvas && !other_text) {
                 let was_literal = self.literal;
+                if !command.is_active() {
+                    self.candidate = 0;
+                }
                 // "2P" / "3P" can arrive after the digit locked a coordinate field.
                 if !self.literal
                     && typed.eq_ignore_ascii_case("P")
@@ -443,6 +459,12 @@ impl DynamicInput {
     }
     pub fn submission(&self, command: &CommandState, text: &str) -> String {
         let trimmed = text.trim();
+        if !command.is_active() {
+            return candidates(trimmed)
+                .get(self.candidate)
+                .map(|(full, _, _)| (*full).to_string())
+                .unwrap_or_else(|| canonical(&trimmed.to_uppercase()).to_string());
+        }
         if self.at_cursor
             && self.literal
             && command.takes_point()
@@ -736,12 +758,15 @@ impl DynamicInput {
                         if self.focus {
                             ui.memory_mut(|m| m.request_focus(id));
                         }
-                        ui.add(
+                        let edited = ui.add(
                             egui::TextEdit::singleline(text)
                                 .id(id)
                                 .desired_width(f32::INFINITY)
                                 .hint_text("输入命令、选项、#绝对 / @相对坐标"),
                         );
+                        if edited.changed() && !command.is_active() {
+                            self.candidate = 0;
+                        }
                         if !command.is_active() {
                             let matches = candidates(text);
                             self.candidate = self.candidate.min(matches.len().saturating_sub(1));

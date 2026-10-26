@@ -97,9 +97,6 @@ impl Session {
     pub fn can_reselect(&self) -> bool {
         matches!(self.phase, Phase::Side | Phase::SecondLine)
     }
-    pub fn parameter_input(&self) -> bool {
-        self.phase == Phase::Parameter
-    }
     pub fn undo_id(&self) -> Option<u64> {
         self.operations.last().map(|op| op.transaction_id)
     }
