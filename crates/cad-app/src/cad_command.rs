@@ -34,6 +34,7 @@ enum Step {
         id: EntityId,
         geometry: Geometry,
         kind: GripKind,
+        label: String,
         base: Point3,
         target: Option<Point3>,
     },
@@ -472,10 +473,9 @@ impl CommandState {
             ..
         }) = &self.step
         {
-            let center = if *kind == GripKind::Radius {
+            let center = if matches!(kind, GripKind::Radius(_)) {
                 match geometry {
                     Geometry::Circle(c) => Some(c.center),
-                    Geometry::Arc(a) => Some(a.center),
                     _ => None,
                 }
             } else {
@@ -598,7 +598,7 @@ impl CommandState {
             let point = if matches!(
                 &self.step,
                 Some(Step::Grip {
-                    kind: GripKind::Radius,
+                    kind: GripKind::Radius(_),
                     ..
                 })
             ) && !text.contains([',', ' ', '<'])
@@ -735,8 +735,7 @@ impl CommandState {
         };
         let center = match geometry {
             Geometry::Circle(c) => c.center,
-            Geometry::Arc(a) => a.center,
-            _ => return Err("当前不是圆/圆弧半径夹点".into()),
+            _ => return Err("当前不是圆半径夹点".into()),
         };
         let radius = number(text)?;
         if radius <= cad_core::curves::DISTANCE_TOLERANCE {
@@ -894,11 +893,11 @@ impl CommandState {
                     }
                 )
             }
-            Some(Step::Grip { target, .. }) => {
+            Some(Step::Grip { target, label, .. }) => {
                 return if target.is_some() {
-                    "夹点：Enter 提交预览，或点击重新指定目标；可输入坐标；Esc 取消".into()
+                    format!("{label}；Enter 提交预览，或点击重新指定目标；可输入坐标；Esc 取消")
                 } else {
-                    "夹点：移动鼠标预览，点击目标或输入坐标后 Enter 提交；Esc 取消".into()
+                    format!("{label}；移动鼠标预览，点击目标或输入坐标后 Enter 提交；Esc 取消")
                 }
             }
             Some(Step::Draw { sketch, confirmed }) => {
@@ -1021,11 +1020,10 @@ impl CommandState {
         kind: GripKind,
         target: Option<Point3>,
     ) -> Result<(), String> {
-        let base = properties::grips(&geometry)
+        let grip = properties::grips(&geometry)
             .into_iter()
             .find(|g| g.kind == kind)
-            .ok_or("夹点已失效")?
-            .point;
+            .ok_or("夹点已失效")?;
         if let Some(p) = target {
             properties::move_grip(&geometry, kind, p)?;
         }
@@ -1034,10 +1032,29 @@ impl CommandState {
             id,
             geometry,
             kind,
-            base,
+            label: grip.label,
+            base: grip.point,
             target,
         });
         Ok(())
+    }
+    pub fn active_grip(&self) -> Option<(EntityId, GripKind, [f64; 3])> {
+        if let Some(Step::Grip {
+            id,
+            kind,
+            base,
+            target,
+            ..
+        }) = &self.step
+        {
+            Some((
+                *id,
+                *kind,
+                target.map(array).or(self.hover).unwrap_or(array(*base)),
+            ))
+        } else {
+            None
+        }
     }
     fn point_plane(&self) -> WorkPlane {
         if let Some(Step::TransformPick(s)) = &self.step {
@@ -1225,12 +1242,11 @@ impl CommandState {
             Some(Step::Paste { base, .. } | Step::ArraySpacing { base, .. }) => *base,
             Some(Step::Grip {
                 base,
-                kind: GripKind::Radius,
+                kind: GripKind::Radius(_),
                 geometry,
                 ..
             }) => array(match geometry {
                 Geometry::Circle(c) => c.center,
-                Geometry::Arc(a) => a.center,
                 _ => *base,
             }),
             Some(Step::Grip { base, .. }) => array(*base),
@@ -1466,7 +1482,7 @@ impl CommandState {
         if matches!(
             &self.step,
             Some(Step::Grip {
-                kind: GripKind::Radius,
+                kind: GripKind::Radius(_),
                 ..
             })
         ) && !text.trim().is_empty()
@@ -1872,6 +1888,7 @@ impl CommandState {
                 id,
                 geometry,
                 kind,
+                label,
                 base,
                 ..
             } => {
@@ -1880,6 +1897,7 @@ impl CommandState {
                     id: *id,
                     geometry: geometry.clone(),
                     kind: *kind,
+                    label: label.clone(),
                     base: *base,
                     target: Some(as_point(point)),
                 })

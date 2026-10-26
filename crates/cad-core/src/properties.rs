@@ -7,8 +7,9 @@ use acadrust::{types::Vector3 as NV, EntityType};
 pub enum GripKind {
     Start,
     End,
+    Midpoint,
     Center,
-    Radius,
+    Radius(u8),
     Major,
     Minor,
     Vertex(usize),
@@ -26,6 +27,13 @@ fn v(a: Point3, b: Point3) -> Vector3 {
 fn add(p: Point3, d: Vector3) -> Point3 {
     Point3::new(p.x + d.x, p.y + d.y, p.z + d.z)
 }
+fn midpoint(a: Point3, b: Point3) -> Point3 {
+    Point3::new(
+        a.x * 0.5 + b.x * 0.5,
+        a.y * 0.5 + b.y * 0.5,
+        a.z * 0.5 + b.z * 0.5,
+    )
+}
 fn arc_point(c: Point3, r: f64, plane: Plane, a: f64) -> Point3 {
     add(
         c,
@@ -36,34 +44,46 @@ pub fn grips(g: &Geometry) -> Vec<Grip> {
     let mut out = Vec::new();
     let mut push = |kind, label: String, point| out.push(Grip { kind, label, point });
     match g {
-        Geometry::Text(t) => push(GripKind::Center, "文字插入点".into(), t.position),
+        Geometry::Text(t) => push(GripKind::Center, "插入点：移动文字".into(), t.position),
         Geometry::Line(l) => {
-            push(GripKind::Start, "起点".into(), l.start);
-            push(GripKind::End, "终点".into(), l.end);
-        }
-        Geometry::Circle(c) => {
-            push(GripKind::Center, "圆心".into(), c.center);
+            push(GripKind::Start, "起点：拉伸端点".into(), l.start);
+            push(GripKind::End, "终点：拉伸端点".into(), l.end);
             push(
-                GripKind::Radius,
-                "半径".into(),
-                arc_point(c.center, c.radius, c.plane, 0.0),
+                GripKind::Midpoint,
+                "中点：移动整条直线".into(),
+                midpoint(l.start, l.end),
             );
         }
+        Geometry::Circle(c) => {
+            push(GripKind::Center, "圆心：移动整个圆".into(), c.center);
+            for (index, direction) in ["+U", "+V", "−U", "−V"].into_iter().enumerate() {
+                push(
+                    GripKind::Radius(index as u8),
+                    format!("象限 {direction}：修改半径"),
+                    arc_point(
+                        c.center,
+                        c.radius,
+                        c.plane,
+                        index as f64 * std::f64::consts::FRAC_PI_2,
+                    ),
+                );
+            }
+        }
         Geometry::Arc(a) => {
-            push(GripKind::Center, "圆心".into(), a.center);
+            push(GripKind::Center, "圆心：移动整条圆弧".into(), a.center);
             push(
                 GripKind::Start,
-                "弧起点".into(),
+                "弧起点：保留另一端与弧中点".into(),
                 arc_point(a.center, a.radius, a.plane, a.start_angle),
             );
             push(
                 GripKind::End,
-                "弧终点".into(),
+                "弧终点：保留另一端与弧中点".into(),
                 arc_point(a.center, a.radius, a.plane, a.start_angle + a.sweep_angle),
             );
             push(
-                GripKind::Radius,
-                "半径".into(),
+                GripKind::Midpoint,
+                "弧中点：固定两端调整形状".into(),
                 arc_point(
                     a.center,
                     a.radius,
@@ -73,35 +93,47 @@ pub fn grips(g: &Geometry) -> Vec<Grip> {
             );
         }
         Geometry::Ellipse(e) => {
-            push(GripKind::Center, "中心".into(), e.center);
+            push(GripKind::Center, "中心：移动整个椭圆".into(), e.center);
             push(
                 GripKind::Major,
-                "长半轴端点".into(),
+                "长半轴：调整长度和方向".into(),
                 add(e.center, e.major_axis),
             );
             push(
                 GripKind::Minor,
-                "短半轴端点".into(),
+                "短半轴：保持正交调整长度".into(),
                 add(e.center, e.minor_axis),
             );
         }
         Geometry::Polyline(p) => {
             for (i, s) in p.segments.iter().enumerate() {
                 let (PolylineSegment::Line { start, .. } | PolylineSegment::Arc { start, .. }) = s;
-                push(GripKind::Vertex(i), format!("顶点 {}", i + 1), *start);
+                push(
+                    GripKind::Vertex(i),
+                    format!("顶点 {}：调整相邻线段", i + 1),
+                    *start,
+                );
             }
             if !p.closed {
                 if let Some(PolylineSegment::Line { end, .. } | PolylineSegment::Arc { end, .. }) =
                     p.segments.last()
                 {
-                    push(GripKind::Vertex(p.segments.len()), "末顶点".into(), *end);
+                    push(
+                        GripKind::Vertex(p.segments.len()),
+                        "末顶点：调整末段".into(),
+                        *end,
+                    );
                 }
             }
         }
         Geometry::Spline(s) => {
             if !s.periodic {
                 for (i, p) in s.control_points.iter().enumerate() {
-                    push(GripKind::Control(i), format!("控制点 {}", i + 1), *p);
+                    push(
+                        GripKind::Control(i),
+                        format!("控制点 {}：调整样条形状", i + 1),
+                        *p,
+                    );
                 }
             }
         }
@@ -154,23 +186,27 @@ pub fn move_grip(g: &Geometry, kind: GripKind, p: Point3) -> Result<Geometry, St
             positive(v(l.start, p).length())?;
             l.end = p;
         }
+        (Geometry::Line(l), GripKind::Midpoint) => {
+            let offset = v(midpoint(l.start, l.end), p);
+            l.start = add(l.start, offset);
+            l.end = add(l.end, offset);
+        }
         (Geometry::Circle(c), GripKind::Center) => c.center = p,
-        (Geometry::Circle(c), GripKind::Radius) => {
+        (Geometry::Circle(c), GripKind::Radius(_)) => {
             c.radius = positive(in_plane(c.center, c.plane, p)?.length())?;
         }
         (Geometry::Arc(a), GripKind::Center) => a.center = p,
-        (Geometry::Arc(a), GripKind::Radius) => {
-            a.radius = positive(in_plane(a.center, a.plane, p)?.length())?;
-        }
-        (Geometry::Arc(a), GripKind::Start | GripKind::End) => {
+        (Geometry::Arc(a), GripKind::Start | GripKind::End | GripKind::Midpoint) => {
             let old = arc_point(
                 a.center,
                 a.radius,
                 a.plane,
                 if kind == GripKind::Start {
                     a.start_angle
-                } else {
+                } else if kind == GripKind::End {
                     a.start_angle + a.sweep_angle
+                } else {
+                    a.start_angle + a.sweep_angle / 2.0
                 },
             );
             if old == p {
@@ -182,12 +218,16 @@ pub fn move_grip(g: &Geometry, kind: GripKind, p: Point3) -> Result<Geometry, St
             } else {
                 arc_point(a.center, a.radius, a.plane, a.start_angle)
             };
-            let middle = arc_point(
-                a.center,
-                a.radius,
-                a.plane,
-                a.start_angle + a.sweep_angle / 2.0,
-            );
+            let middle = if kind == GripKind::Midpoint {
+                p
+            } else {
+                arc_point(
+                    a.center,
+                    a.radius,
+                    a.plane,
+                    a.start_angle + a.sweep_angle / 2.0,
+                )
+            };
             let end = if kind == GripKind::End {
                 p
             } else {

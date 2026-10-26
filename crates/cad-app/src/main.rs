@@ -60,6 +60,8 @@ const COMMAND_MAX_HISTORY_LINES: usize = 4;
 const COMMAND_ROW_HEIGHT: f32 = 21.0;
 const COMMAND_VERTICAL_PADDING: f32 = 12.0;
 const PICK_TOLERANCE: f32 = 12.0;
+const GRIP_SIZE: f32 = 7.0;
+const GRIP_PICK_RADIUS: f32 = 8.0;
 
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
@@ -1012,32 +1014,6 @@ fn draw_scene(
         }
     }
 
-    if space.mode == SpaceMode::Cad
-        && !state.cad_command.is_active()
-        && selection.selected.len() == 1
-    {
-        if let Some(doc) = state.drawing.as_ref().map(|d| d.document()) {
-            if let Some(entity) =
-                doc.entity(cad_core::EntityId(*selection.selected.first().unwrap()))
-            {
-                if entity.visible
-                    && doc
-                        .layer(entity.layer_id)
-                        .is_none_or(|l| l.visible && !l.locked)
-                {
-                    for grip in cad_core::properties::grips(&entity.geometry) {
-                        let position = state.view.point([grip.point.x, grip.point.y, grip.point.z]);
-                        selected_gizmos.cube(
-                            Transform::from_translation(position)
-                                .with_scale(Vec3::splat((state.view.pixel_size * 6.0) as f32)),
-                            Color::srgb(0.2, 1.0, 0.5),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     if space.mode == SpaceMode::Cad {
         for path in state.cad_command.drawing_preview() {
             for pair in path.windows(2) {
@@ -1471,7 +1447,7 @@ fn pick_grip(
                 .project(camera, transform, [g.point.x, g.point.y, g.point.z])
                 .map(|screen| (screen.distance(cursor), g.kind))
         })
-        .filter(|(distance, _)| *distance <= 8.0)
+        .filter(|(distance, _)| *distance <= GRIP_PICK_RADIUS)
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, kind)| (id, entity.geometry.clone(), kind))
 }
@@ -4376,6 +4352,15 @@ fn drawing_ui(
         state.dynamic_input.suspend();
     }
 
+    if space.mode == SpaceMode::Cad
+        && !cad_command_input_suspended(&state)
+        && state.cad_workspace.context.is_none()
+    {
+        draw_cad_grips(
+            context, &state, &selection, view_camera, view_transform, canvas_rect,
+        );
+    }
+
     let pointer = context.input(|input| input.pointer.hover_pos());
     let over_panels = pointer
         .map(|position| {
@@ -4392,6 +4377,124 @@ fn drawing_ui(
         || context.egui_is_using_pointer()
         || context.egui_wants_pointer_input();
     Ok(())
+}
+
+fn draw_cad_grips(
+    context: &egui::Context,
+    state: &ViewerState,
+    selection: &SelectionState,
+    camera: &Camera,
+    transform: &GlobalTransform,
+    canvas: egui::Rect,
+) {
+    let active = state.cad_command.active_grip();
+    if state.cad_command.is_active() && active.is_none() {
+        return;
+    }
+    let id = active.map(|(id, _, _)| id).or_else(|| {
+        (selection.selected.len() == 1)
+            .then(|| cad_core::EntityId(*selection.selected.first().unwrap()))
+    });
+    let Some(document) = state.drawing.as_ref().map(|drawing| drawing.document()) else {
+        return;
+    };
+    let Some(entity) = id.and_then(|id| document.entity(id)) else {
+        return;
+    };
+    if !entity.visible
+        || document
+            .layer(entity.layer_id)
+            .is_some_and(|layer| layer.locked || !layer.visible)
+    {
+        return;
+    }
+    let preview = active.and_then(|(_, kind, point)| {
+        cad_core::properties::move_grip(
+            &entity.geometry,
+            kind,
+            cad_core::model::Point3::new(point[0], point[1], point[2]),
+        )
+        .ok()
+    });
+    let projected: Vec<_> =
+        cad_core::properties::grips(preview.as_ref().unwrap_or(&entity.geometry))
+            .into_iter()
+            .filter_map(|grip| {
+                let point = active
+                    .filter(|(_, kind, _)| *kind == grip.kind)
+                    .map(|(_, _, point)| point)
+                    .unwrap_or([grip.point.x, grip.point.y, grip.point.z]);
+                state
+                    .view
+                    .project(camera, transform, point)
+                    .map(|screen| (grip, screen))
+            })
+            .collect();
+    let pointer = context
+        .input(|input| input.pointer.hover_pos())
+        .filter(|point| canvas.contains(*point) && !context.egui_wants_pointer_input());
+    let hovered = pointer.filter(|_| active.is_none()).and_then(|pointer| {
+        projected
+            .iter()
+            .enumerate()
+            .map(|(index, (_, screen))| (index, screen.distance(Vec2::new(pointer.x, pointer.y))))
+            .filter(|(_, distance)| *distance <= GRIP_PICK_RADIUS)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
+    });
+    let painter = context
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("cad_grips"),
+        ))
+        .with_clip_rect(canvas);
+    for (index, (grip, screen)) in projected.iter().enumerate() {
+        let position = egui::pos2(screen.x, screen.y);
+        if !canvas.contains(position) {
+            continue;
+        }
+        let color = if active.is_some_and(|(_, kind, _)| kind == grip.kind) {
+            egui::Color32::from_rgb(255, 80, 80)
+        } else if hovered == Some(index) {
+            egui::Color32::from_rgb(255, 190, 65)
+        } else {
+            egui::Color32::from_rgb(90, 165, 255)
+        };
+        let rect = egui::Rect::from_center_size(position, egui::Vec2::splat(GRIP_SIZE));
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(16, 25, 39));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.5, color),
+            egui::StrokeKind::Inside,
+        );
+        if active.is_some_and(|(_, kind, _)| kind == grip.kind) {
+            painter.rect_filled(rect.shrink(1.5), 0.0, color);
+        }
+    }
+    if let Some(index) = hovered {
+        let (grip, screen) = &projected[index];
+        let galley = painter.layout_no_wrap(
+            grip.label.clone(),
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+        let size = galley.size() + egui::vec2(12.0, 8.0);
+        let anchor = egui::pos2(
+            (screen.x + 14.0)
+                .min(canvas.right() - size.x)
+                .max(canvas.left()),
+            (screen.y + 16.0)
+                .min(canvas.bottom() - size.y)
+                .max(canvas.top()),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(anchor, size),
+            3.0,
+            egui::Color32::from_rgb(24, 32, 46),
+        );
+        painter.galley(anchor + egui::vec2(6.0, 4.0), galley, egui::Color32::WHITE);
+    }
 }
 
 /// Small clickable orientation cube in the top-right corner.
