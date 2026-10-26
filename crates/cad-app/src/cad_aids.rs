@@ -225,83 +225,200 @@ impl DraftingAids {
         }
         Ok(point)
     }
-    pub fn controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("捕捉与绘图辅助").show(ui, |ui| {
-            ui.checkbox(&mut self.enabled, "几何捕捉 F3");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.grid, "网格 F7");
-                ui.checkbox(&mut self.grid_snap, "网格捕捉 F9");
-            });
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut self.ortho, "正交 F8").changed() && self.ortho {
-                    self.polar = false;
+    pub fn snap_settings(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(320.0);
+        let mut changed = ui.checkbox(&mut self.enabled, "对象捕捉 F3").changed();
+        changed |= ui
+            .checkbox(&mut self.project, "将捕捉点投影到工作平面")
+            .changed();
+        ui.separator();
+        for kind in [
+            SnapKind::Endpoint,
+            SnapKind::Midpoint,
+            SnapKind::Center,
+            SnapKind::Quadrant,
+            SnapKind::Intersection,
+            SnapKind::Perpendicular,
+            SnapKind::Tangent,
+            SnapKind::Nearest,
+        ] {
+            let mut enabled = self.modes.contains(&kind);
+            if ui.checkbox(&mut enabled, kind.label()).changed() {
+                if enabled {
+                    self.modes.insert(kind);
+                } else {
+                    self.modes.remove(&kind);
                 }
-                if ui.checkbox(&mut self.polar, "极轴 F10").changed() && self.polar {
-                    self.ortho = false;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("网格 mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.spacing)
-                        .range(0.000001..=1e9)
-                        .speed(0.1),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("极轴角度 °");
-                ui.add(
-                    egui::DragValue::new(&mut self.angle)
-                        .range(0.1..=90.0)
-                        .speed(1.0),
-                );
-            });
-            ui.checkbox(&mut self.project, "将捕捉点投影到工作平面");
-            for kind in [
-                SnapKind::Endpoint,
-                SnapKind::Midpoint,
-                SnapKind::Center,
-                SnapKind::Quadrant,
-                SnapKind::Intersection,
-                SnapKind::Perpendicular,
-                SnapKind::Tangent,
-                SnapKind::Nearest,
-            ] {
-                let mut enabled = self.modes.contains(&kind);
-                if ui.checkbox(&mut enabled, kind.label()).changed() {
-                    if enabled {
-                        self.modes.insert(kind);
-                    } else {
-                        self.modes.remove(&kind);
-                    }
-                }
+                changed = true;
             }
-            ui.small("几何捕捉优先，其次正交/极轴，最后网格；数值输入不受辅助约束。");
-            ui.small(
-                "Tab 切换捕捉候选，Shift+Tab 反向。交点、垂足和切点按当前支持的曲线类型提供。",
-            );
-        });
-        ui.small(format!(
-            "捕捉 {} · 方向 {} · 网格捕捉 {}",
-            if self.enabled { "开" } else { "关" },
-            if self.ortho {
-                "正交"
-            } else if self.polar {
-                "极轴"
-            } else {
-                "自由"
-            },
-            if self.grid_snap { "开" } else { "关" }
-        ));
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Tab / Shift+Tab 切换候选；交点、垂足和切点按支持的曲线类型提供。",
+                )
+                .small(),
+            )
+            .wrap(),
+        );
         if self.clipped {
             ui.small("交点仅搜索当前 24 个邻近图元，可放大视图缩小范围");
         }
+        if changed {
+            self.clear();
+        }
+    }
+    pub fn grid_settings(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(320.0);
+        let mut changed = ui.checkbox(&mut self.grid, "显示栅格 F7").changed();
+        changed |= ui.checkbox(&mut self.grid_snap, "栅格捕捉 F9").changed();
+        ui.horizontal(|ui| {
+            ui.label("栅格间距 mm");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.spacing)
+                        .range(0.000001..=1e9)
+                        .speed(0.1),
+                )
+                .changed();
+        });
         if !self.spacing.is_finite() || self.spacing <= 0.0 {
             self.spacing = 10.0;
+            changed = true;
         }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("显示与捕捉独立开关，共用间距；显示密度随缩放自动调整。")
+                    .small(),
+            )
+            .wrap(),
+        );
+        if changed {
+            self.clear();
+        }
+    }
+    pub fn direction_settings(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        if ui.checkbox(&mut self.ortho, "正交 F8").changed() {
+            if self.ortho {
+                self.polar = false;
+            }
+            changed = true;
+        }
+        if ui.checkbox(&mut self.polar, "极轴 F10").changed() {
+            if self.polar {
+                self.ortho = false;
+            }
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("极轴增量 °");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.angle)
+                        .range(0.1..=90.0)
+                        .speed(1.0),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            for angle in [15.0, 30.0, 45.0, 90.0] {
+                if ui
+                    .selectable_label((self.angle - angle).abs() < 1e-9, format!("{angle}°"))
+                    .clicked()
+                {
+                    self.angle = angle;
+                    changed = true;
+                }
+            }
+        });
         if !self.angle.is_finite() || self.angle <= 0.0 {
             self.angle = 15.0;
+            changed = true;
         }
+        ui.small("正交与极轴互斥；方向沿当前工作平面。");
+        if changed {
+            self.clear();
+        }
+    }
+    pub fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(320.0);
+        ui.menu_button("对象捕捉与投影", |ui| self.snap_settings(ui));
+        ui.menu_button("栅格显示与捕捉", |ui| self.grid_settings(ui));
+        ui.menu_button("正交与极轴", |ui| self.direction_settings(ui));
+        ui.separator();
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "几何捕捉优先，其次正交/极轴，最后栅格；显式坐标不受辅助约束。",
+                )
+                .small(),
+            )
+            .wrap(),
+        );
+    }
+    pub fn snap_button(&mut self, ui: &mut egui::Ui, compact: bool) -> bool {
+        if ui
+            .toggle_value(
+                &mut self.enabled,
+                if compact { "捕捉" } else { "对象捕捉 F3" },
+            )
+            .on_hover_text("对象捕捉 F3；右侧下拉选择端点、中点、圆心等类型")
+            .changed()
+        {
+            self.clear();
+        }
+        ui.push_id("snap_status_settings", |ui| {
+            ui.menu_button("▾", |ui| self.snap_settings(ui))
+        })
+        .inner
+        .inner
+        .is_some()
+    }
+    pub fn status_buttons(&mut self, ui: &mut egui::Ui, compact: bool) -> bool {
+        let mut open = self.snap_button(ui, compact);
+        let before = (self.grid, self.grid_snap, self.ortho, self.polar);
+        ui.toggle_value(&mut self.grid, if compact { "栅格" } else { "栅格 F7" })
+            .on_hover_text("显示栅格 F7");
+        open |= ui
+            .push_id("grid_status_settings", |ui| {
+                ui.menu_button("▾", |ui| self.grid_settings(ui))
+            })
+            .inner
+            .inner
+            .is_some();
+        ui.toggle_value(
+            &mut self.grid_snap,
+            if compact { "栅捕" } else { "栅格捕捉 F9" },
+        )
+        .on_hover_text("栅格捕捉 F9，与显示栅格独立开关");
+        if ui
+            .toggle_value(&mut self.ortho, if compact { "正交" } else { "正交 F8" })
+            .on_hover_text("正交 F8")
+            .changed()
+            && self.ortho
+        {
+            self.polar = false;
+        }
+        if ui
+            .toggle_value(&mut self.polar, if compact { "极轴" } else { "极轴 F10" })
+            .on_hover_text("极轴 F10，与正交互斥")
+            .changed()
+            && self.polar
+        {
+            self.ortho = false;
+        }
+        open |= ui
+            .push_id("direction_status_settings", |ui| {
+                ui.menu_button("▾", |ui| self.direction_settings(ui))
+            })
+            .inner
+            .inner
+            .is_some();
+        if before != (self.grid, self.grid_snap, self.ortho, self.polar) {
+            self.clear();
+        }
+        open
     }
     pub fn draw(&self, gizmos: &mut Gizmos, frame: ViewFrame, plane: WorkPlane) {
         if self.grid {

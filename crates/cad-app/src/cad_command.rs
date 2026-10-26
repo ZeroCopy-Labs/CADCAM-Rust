@@ -2126,7 +2126,6 @@ impl CommandState {
     ) -> Option<String> {
         let mut command = None;
         ui.strong("命令参数与工作平面");
-        self.aids.controls(ui);
         if let Some((key, label)) = self.curve_parameter_option() {
             if ui.button(format!("{key} {label}")).clicked() {
                 command = Some(key.into());

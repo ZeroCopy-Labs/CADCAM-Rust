@@ -380,6 +380,7 @@ fn cad_command_input_suspended(state: &ViewerState) -> bool {
         || state.file_ui.report_open
         || state.performance.open
         || state.trajectory_view.open
+        || state.cad_workspace.drafting_menu_open
 }
 
 fn cad_command_submission(state: &ViewerState, raw: &str) -> String {
@@ -2513,6 +2514,7 @@ fn drawing_ui(
 ) -> Result {
     let (view_camera, view_transform) = view_camera.into_inner();
     let context = contexts.ctx_mut()?;
+    let drafting_menu_was_open = state.cad_workspace.drafting_menu_open;
     install_cjk_font(context, &mut fonts_loaded);
     context.set_visuals(egui::Visuals::dark());
 
@@ -3208,6 +3210,52 @@ fn drawing_ui(
         } = &mut *state;
         dynamic_input.sync(cad_command, command_input);
     }
+    let status_rect = if space.mode == SpaceMode::Cad {
+        let enabled = !state.gcode_settings_open
+            && !state.file_ui.report_open
+            && !state.performance.open
+            && !state.trajectory_view.open
+            && state.cad_workspace.context.is_none();
+        Some(
+            egui::Panel::bottom("cad_drafting_status")
+                .exact_size(30.0)
+                .frame(
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(8, 2))
+                        .fill(egui::Color32::from_rgb(24, 31, 42)),
+                )
+                .show(&mut root, |ui| {
+                    let dynamic_enabled = state.dynamic_input.enabled;
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let ViewerState {
+                            cad_command,
+                            dynamic_input,
+                            command_input,
+                            cad_workspace,
+                            ..
+                        } = &mut *state;
+                        let (request, open) = cad_workspace::drafting_status(
+                            ui,
+                            cad_command,
+                            dynamic_input,
+                            command_input,
+                        );
+                        cad_workspace.drafting_menu_open = open;
+                        if request.is_some() {
+                            command_request = request;
+                        }
+                    });
+                    if dynamic_enabled != state.dynamic_input.enabled {
+                        state.command_focus = true;
+                    }
+                })
+                .response
+                .rect,
+        )
+    } else {
+        state.cad_workspace.drafting_menu_open = false;
+        None
+    };
     let command_dimensions = state.command_open.then(|| {
         let history_lines = if state.cad_workspace.history {
             state.messages.len().min(COMMAND_MAX_HISTORY_LINES)
@@ -3345,66 +3393,6 @@ fn drawing_ui(
         }
     });
     let command_rect = command_panel.response.rect;
-    let status_rect = if space.mode == SpaceMode::Cad {
-        Some(
-            egui::Panel::bottom("cad_drafting_status")
-                .show(&mut root, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        let aids = &mut state.cad_command.aids;
-                        for (value, label) in [
-                            (&mut aids.enabled, "对象捕捉 F3"),
-                            (&mut aids.grid, "栅格 F7"),
-                            (&mut aids.grid_snap, "栅格捕捉 F9"),
-                        ] {
-                            ui.toggle_value(value, label);
-                        }
-                        if ui.toggle_value(&mut aids.ortho, "正交 F8").changed() && aids.ortho {
-                            aids.polar = false;
-                        }
-                        if ui.toggle_value(&mut aids.polar, "极轴 F10").changed() && aids.polar {
-                            aids.ortho = false;
-                        }
-                        ui.separator();
-                        ui.menu_button("工作平面 ▾", |ui| {
-                            for name in ["XY", "YZ", "ZX", "3P"] {
-                                if ui
-                                    .add_enabled(
-                                        !state.cad_command.is_active(),
-                                        egui::Button::new(if name == "3P" {
-                                            "三点工作平面"
-                                        } else {
-                                            name
-                                        }),
-                                    )
-                                    .clicked()
-                                {
-                                    command_request = Some(format!("UCS {name}"));
-                                    ui.close();
-                                }
-                            }
-                        });
-                        if ui.button("绘图设置").clicked() {
-                            state.cad_workspace.reveal(cad_workspace::Pane::Tools);
-                        }
-                        let enabled = state.dynamic_input.enabled;
-                        if ui.selectable_label(enabled, "动态输入 F12").clicked() {
-                            let ViewerState {
-                                dynamic_input,
-                                cad_command,
-                                command_input,
-                                ..
-                            } = &mut *state;
-                            dynamic_input.toggle(cad_command, command_input);
-                            state.command_focus = true;
-                        }
-                    });
-                })
-                .response
-                .rect,
-        )
-    } else {
-        None
-    };
     let task_panel = egui::Panel::bottom("calculation_status").show(&mut root, |ui| {
         ui.horizontal_wrapped(|ui| {
             if state.tasks.busy() {
@@ -4287,6 +4275,7 @@ fn drawing_ui(
         && !state.file_ui.report_open
         && !state.performance.open
         && !state.trajectory_view.open
+        && !state.cad_workspace.drafting_menu_open
     {
         let can_undo = state.drawing.as_ref().is_some_and(|d| d.can_undo());
         let can_redo = state.drawing.as_ref().is_some_and(|d| d.can_redo());
@@ -4323,6 +4312,7 @@ fn drawing_ui(
         && !state.file_ui.report_open
         && !state.performance.open
         && !state.trajectory_view.open
+        && !state.cad_workspace.drafting_menu_open
         && state.cad_workspace.context.is_none()
     {
         let submission = {
@@ -4376,6 +4366,8 @@ fn drawing_ui(
         .unwrap_or(false);
     ui_state.pointer_over_ui = state.gcode_settings_open
         || state.file_ui.report_open
+        || drafting_menu_was_open
+        || state.cad_workspace.drafting_menu_open
         || state.cad_workspace.context.is_some()
         || over_panels
         || context.egui_is_using_pointer()

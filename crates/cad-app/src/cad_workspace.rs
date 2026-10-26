@@ -19,6 +19,7 @@ pub struct Workspace {
     pub pane: Pane,
     pub history: bool,
     pub context: Option<egui::Pos2>,
+    pub drafting_menu_open: bool,
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -27,6 +28,7 @@ impl Default for Workspace {
             pane: Pane::Properties,
             history: false,
             context: None,
+            drafting_menu_open: false,
         }
     }
 }
@@ -229,6 +231,121 @@ impl Workspace {
         }
         action
     }
+}
+
+pub fn drafting_status(
+    ui: &mut egui::Ui,
+    command: &mut super::cad_command::CommandState,
+    dynamic: &mut super::cad_input::DynamicInput,
+    draft: &mut String,
+) -> (Option<String>, bool) {
+    let width = ui.available_width();
+    let mut request = None;
+    let mut open = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        if width >= 650.0 {
+            let compact = width < 920.0;
+            open |= command.aids.status_buttons(ui, compact);
+            ui.separator();
+            dynamic_button(ui, command, dynamic, draft, compact);
+            open |= plane_menu(ui, command, &mut request);
+            open |= ui
+                .menu_button("绘图设置", |ui| command.aids.settings_ui(ui))
+                .inner
+                .is_some();
+        } else {
+            if width >= 350.0 {
+                open |= command.aids.snap_button(ui, true);
+                if ui
+                    .toggle_value(&mut command.aids.ortho, "正交")
+                    .on_hover_text("正交 F8")
+                    .changed()
+                {
+                    if command.aids.ortho {
+                        command.aids.polar = false;
+                    }
+                    command.aids.clear();
+                }
+                dynamic_button(ui, command, dynamic, draft, true);
+            }
+            open |= ui
+                .menu_button(
+                    if width >= 350.0 {
+                        "更多绘图辅助"
+                    } else {
+                        "绘图辅助"
+                    },
+                    |ui| {
+                        command.aids.settings_ui(ui);
+                        ui.separator();
+                        dynamic_button(ui, command, dynamic, draft, false);
+                        plane_menu(ui, command, &mut request);
+                    },
+                )
+                .inner
+                .is_some();
+        }
+    });
+    (request, open)
+}
+
+fn dynamic_button(
+    ui: &mut egui::Ui,
+    command: &super::cad_command::CommandState,
+    dynamic: &mut super::cad_input::DynamicInput,
+    draft: &mut String,
+    compact: bool,
+) {
+    if ui
+        .selectable_label(
+            dynamic.enabled,
+            if compact {
+                "动态"
+            } else {
+                "动态输入 F12"
+            },
+        )
+        .on_hover_text("动态输入 F12；切换时保留坐标草稿的含义")
+        .clicked()
+    {
+        dynamic.toggle(command, draft);
+    }
+}
+
+fn plane_menu(
+    ui: &mut egui::Ui,
+    command: &super::cad_command::CommandState,
+    request: &mut Option<String>,
+) -> bool {
+    ui.menu_button("工作平面", |ui| {
+        let origin = command.plane.origin;
+        ui.label(format!(
+            "原点：{:.3}, {:.3}, {:.3} mm",
+            origin.x, origin.y, origin.z
+        ));
+        for name in ["XY", "YZ", "ZX", "3P"] {
+            if ui
+                .add_enabled(
+                    !command.is_active(),
+                    egui::Button::new(if name == "3P" {
+                        "三点工作平面"
+                    } else {
+                        name
+                    }),
+                )
+                .clicked()
+            {
+                *request = Some(format!("UCS {name}"));
+                ui.close();
+            }
+        }
+        if command.is_active() {
+            ui.small("完成或取消当前命令后可切换工作平面。");
+        }
+    })
+    .inner
+    .is_some()
 }
 
 #[derive(Default)]
@@ -461,7 +578,7 @@ fn utility_menu(
             workspace.reveal(Pane::Properties);
             ui.close();
         }
-        if button(ui, "SETTINGS", "绘图设置与图纸检查").clicked() {
+        if button(ui, "SETTINGS", "命令参数与图纸检查").clicked() {
             workspace.reveal(Pane::Tools);
             ui.close();
         }
