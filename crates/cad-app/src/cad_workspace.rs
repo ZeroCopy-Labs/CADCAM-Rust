@@ -20,6 +20,8 @@ pub struct Workspace {
     pub history: bool,
     pub context: Option<egui::Pos2>,
     pub drafting_menu_open: bool,
+    pub coordinates_local: bool,
+    pub coordinate_rect: Option<egui::Rect>,
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -29,6 +31,8 @@ impl Default for Workspace {
             history: false,
             context: None,
             drafting_menu_open: false,
+            coordinates_local: false,
+            coordinate_rect: None,
         }
     }
 }
@@ -235,15 +239,45 @@ impl Workspace {
 
 pub fn drafting_status(
     ui: &mut egui::Ui,
+    workspace: &mut Workspace,
     command: &mut super::cad_command::CommandState,
     dynamic: &mut super::cad_input::DynamicInput,
     draft: &mut String,
-) -> (Option<String>, bool) {
+) -> Option<String> {
     let width = ui.available_width();
     let mut request = None;
     let mut open = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
+        let coordinate_width = if width >= 900.0 {
+            320.0
+        } else if width >= 600.0 {
+            270.0
+        } else if width >= 360.0 {
+            230.0
+        } else {
+            (width - 140.0).max(40.0)
+        };
+        let mode = ui
+            .add(
+                egui::Button::new(if workspace.coordinates_local {
+                    "平面"
+                } else {
+                    "WCS"
+                })
+                .sense(egui::Sense::CLICK),
+            )
+            .on_hover_text("点击切换 WCS X/Y/Z 与当前取点平面 U/V/N；仅改变显示，单位为 mm");
+        if mode.clicked() {
+            workspace.coordinates_local = !workspace.coordinates_local;
+        }
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2((coordinate_width - mode.rect.width() - 3.0).max(0.0), 22.0),
+            egui::Sense::hover(),
+        );
+        workspace.coordinate_rect = Some(rect);
+        ui.separator();
+        let width = ui.available_width();
         if width >= 650.0 {
             let compact = width < 920.0;
             open |= command.aids.status_buttons(ui, compact);
@@ -287,7 +321,85 @@ pub fn drafting_status(
                 .is_some();
         }
     });
-    (request, open)
+    workspace.drafting_menu_open = open;
+    request
+}
+
+pub fn paint_coordinates(
+    context: &egui::Context,
+    workspace: &Workspace,
+    point: Option<cad_core::model::Point3>,
+    plane: cad_core::model::WorkPlane,
+) {
+    let Some(rect) = workspace.coordinate_rect else {
+        return;
+    };
+    let values = point
+        .map(|point| {
+            if workspace.coordinates_local {
+                plane.to_local(point)
+            } else {
+                [point.x, point.y, point.z]
+            }
+        })
+        .filter(|values| values.iter().all(|value| value.is_finite()));
+    let axes = if workspace.coordinates_local {
+        ["U", "V", "N"]
+    } else {
+        ["X", "Y", "Z"]
+    };
+    let painter = context
+        .layer_painter(egui::LayerId::background())
+        .with_clip_rect(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(15, 22, 32));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(62, 78, 97)),
+        egui::StrokeKind::Inside,
+    );
+    for (index, axis) in axes.iter().enumerate() {
+        let value = values
+            .map(|values| {
+                let value = if values[index] == 0.0 {
+                    0.0
+                } else {
+                    values[index]
+                };
+                let fixed = format!("{value:.3}");
+                if fixed.len() > 10 || value != 0.0 && value.abs() < 0.001 {
+                    format!("{value:.3e}")
+                } else {
+                    fixed
+                }
+            })
+            .unwrap_or_else(|| "—".into());
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * index as f32 / 3.0, rect.top()),
+            egui::pos2(
+                rect.left() + rect.width() * (index + 1) as f32 / 3.0,
+                rect.bottom(),
+            ),
+        )
+        .shrink2(egui::vec2(4.0, 2.0));
+        if cell.width() <= 0.0 {
+            continue;
+        }
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            format!("{axis} {value}"),
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_rgb(222, 232, 244),
+        );
+        job.wrap.max_width = cell.width();
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        painter.with_clip_rect(cell).galley(
+            egui::pos2(cell.left(), cell.center().y - galley.size().y * 0.5),
+            galley,
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 fn dynamic_button(

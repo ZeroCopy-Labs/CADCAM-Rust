@@ -2515,6 +2515,7 @@ fn drawing_ui(
     let (view_camera, view_transform) = view_camera.into_inner();
     let context = contexts.ctx_mut()?;
     let drafting_menu_was_open = state.cad_workspace.drafting_menu_open;
+    let pointer_was_over_ui = ui_state.pointer_over_ui;
     install_cjk_font(context, &mut fonts_loaded);
     context.set_visuals(egui::Visuals::dark());
 
@@ -3234,13 +3235,13 @@ fn drawing_ui(
                             cad_workspace,
                             ..
                         } = &mut *state;
-                        let (request, open) = cad_workspace::drafting_status(
+                        let request = cad_workspace::drafting_status(
                             ui,
+                            cad_workspace,
                             cad_command,
                             dynamic_input,
                             command_input,
                         );
-                        cad_workspace.drafting_menu_open = open;
                         if request.is_some() {
                             command_request = request;
                         }
@@ -3254,6 +3255,7 @@ fn drawing_ui(
         )
     } else {
         state.cad_workspace.drafting_menu_open = false;
+        state.cad_workspace.coordinate_rect = None;
         None
     };
     let command_dimensions = state.command_open.then(|| {
@@ -4372,6 +4374,27 @@ fn drawing_ui(
         || over_panels
         || context.egui_is_using_pointer()
         || context.egui_wants_pointer_input();
+    if space.mode == SpaceMode::Cad {
+        let (point, plane) = if !ui_state.pointer_over_ui
+            && !pointer_was_over_ui
+            && !cad_command_input_suspended(&state)
+        {
+            pointer
+                .filter(|point| canvas_rect.contains(*point))
+                .map(|point| {
+                    state.cad_command.cursor_coordinates(
+                        state.view,
+                        view_camera,
+                        view_transform,
+                        Vec2::new(point.x, point.y),
+                    )
+                })
+                .unwrap_or((None, state.cad_command.plane))
+        } else {
+            (None, state.cad_command.plane)
+        };
+        cad_workspace::paint_coordinates(context, &state.cad_workspace, point, plane);
+    }
     Ok(())
 }
 

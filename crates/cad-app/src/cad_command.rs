@@ -1953,7 +1953,30 @@ impl CommandState {
         self.hover = None;
         self.pointer_point = None;
     }
-
+    pub fn cursor_coordinates(
+        &self,
+        frame: super::cad_view::ViewFrame,
+        camera: &Camera,
+        transform: &GlobalTransform,
+        cursor: Vec2,
+    ) -> (Option<Point3>, WorkPlane) {
+        let plane = self.point_plane();
+        let point = if self.takes_point() || matches!(self.step, Some(Step::Grip(_))) {
+            if self.ray_error.is_empty() {
+                self.hover.map(as_point)
+            } else {
+                None
+            }
+        } else {
+            frame
+                .ray(camera, transform, cursor)
+                .and_then(|(origin, direction)| plane.intersect_ray(origin, direction).ok())
+        };
+        (
+            point.filter(|point| array(*point).iter().all(|value| value.is_finite())),
+            plane,
+        )
+    }
     pub fn preview(&self) -> Option<MoveCommit> {
         let (ids, base, target) = match &self.step {
             Some(Step::Target { ids, base }) => (ids, base, self.hover?),
