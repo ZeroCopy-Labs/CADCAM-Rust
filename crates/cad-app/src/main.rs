@@ -62,6 +62,9 @@ const COMMAND_VERTICAL_PADDING: f32 = 12.0;
 const PICK_TOLERANCE: f32 = 12.0;
 const GRIP_SIZE: f32 = 7.0;
 const GRIP_PICK_RADIUS: f32 = 8.0;
+const GRIP_OBJECT_LIMIT: usize = 100;
+const CAD_SELECTION_COLOR: Color = Color::srgb(0.35, 0.65, 1.0);
+const CAD_HOVER_COLOR: Color = Color::srgb(1.0, 0.745, 0.255);
 
 /// Everything the viewer keeps after a drawing is loaded.
 #[derive(Resource, Default)]
@@ -185,9 +188,15 @@ struct MainCamera;
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct DashedAxisGizmos;
 
-/// Thick yellow overlay for selected entities.
+/// Thick overlay for selected entities.
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct SelectedGizmos;
+
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct MajorGridGizmos;
+
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct MinorGridGizmos;
 
 /// Current selection and in-progress rubber-band box.
 #[derive(Resource, Default)]
@@ -202,8 +211,38 @@ struct SelectionState {
     hover_hits: Vec<u32>,
     hover_index: usize,
     hover_cursor: Option<Vec2>,
+    grip_hits: Vec<GripHit>,
+    grip_index: usize,
+    grip_cursor: Option<Vec2>,
+    ellipse_drag: Option<(Vec2, bool)>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GripHit {
+    id: cad_core::EntityId,
+    kind: cad_core::properties::GripKind,
+}
+struct ProjectedGrip {
+    hit: GripHit,
+    label: String,
+    point: cad_core::model::Point3,
+    screen: Vec2,
+    arrow: Option<Vec2>,
 }
 impl SelectionState {
+    fn hovered_grip(&self) -> Option<GripHit> {
+        self.grip_hits.get(self.grip_index).copied()
+    }
+    fn clear_grips(&mut self) {
+        self.grip_hits.clear();
+        self.grip_index = 0;
+        self.grip_cursor = None;
+    }
+    fn cycle_grip(&mut self, reverse: bool) {
+        let n = self.grip_hits.len();
+        if n > 0 {
+            self.grip_index = (self.grip_index + if reverse { n - 1 } else { 1 }) % n;
+        }
+    }
     fn hovered(&self) -> Option<u32> {
         self.hover_hits.get(self.hover_index).copied()
     }
@@ -308,6 +347,8 @@ fn main() {
         .insert_resource(UiState::default())
         .init_gizmo_group::<DashedAxisGizmos>()
         .init_gizmo_group::<SelectedGizmos>()
+        .init_gizmo_group::<MajorGridGizmos>()
+        .init_gizmo_group::<MinorGridGizmos>()
         .add_systems(Startup, (setup_camera, configure_gizmos))
         .add_systems(
             Update,
@@ -357,6 +398,10 @@ fn setup_camera(mut commands: Commands, mut egui_settings: ResMut<bevy_egui::Egu
 }
 
 fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    let (grid, _) = store.config_mut::<MajorGridGizmos>();
+    grid.line.width = 1.8;
+    let (grid, _) = store.config_mut::<MinorGridGizmos>();
+    grid.line.width = 0.7;
     let (negative_axes, _) = store.config_mut::<DashedAxisGizmos>();
     negative_axes.line.width = 1.5;
     negative_axes.line.style = GizmoLineStyle::Dashed {
@@ -543,7 +588,7 @@ fn submit_command(
                 }
             },
             _ if state.cad_command.begin_named(&upper, &selection.selected) => Ok(None),
-            _ => Err("可用命令见顶部默认功能区及绘图/编辑菜单：LINE、PLINE、RECTANGLE、CIRCLE、ARC、ELLIPSE、SPLINE、COPY、ROTATE、SCALE、MIRROR、ARRAYRECT、ARRAYPOLAR".into()),
+            _ => Err("可用命令见顶部默认功能区及绘图/编辑菜单：LINE、PLINE、RECTANGLE、CIRCLE、ARC、ELLIPSE、ELLIPSEARC、SPLINE、COPY、ROTATE、SCALE、MIRROR、ARRAYRECT、ARRAYPOLAR".into()),
         }
     };
     if result.is_ok() {
@@ -874,6 +919,7 @@ fn switch_space(
     }
 
     space.mode = mode;
+    selection.clear_grips();
     selection.drag_start = None;
     selection.drag_current = None;
 }
@@ -941,6 +987,9 @@ fn draw_scene(
     mut gizmos: Gizmos,
     mut selected_gizmos: Gizmos<SelectedGizmos>,
     mut negative_axes: Gizmos<DashedAxisGizmos>,
+    mut major_grid: Gizmos<MajorGridGizmos>,
+    mut minor_grid: Gizmos<MinorGridGizmos>,
+    camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let drawing_started = std::time::Instant::now();
     let text_ids: BTreeSet<_> = state
@@ -964,18 +1013,22 @@ fn draw_scene(
                 .map(|unit_id| selection.cam_selected.contains(&unit_id))
                 .unwrap_or(false),
         };
-        let is_hovered =
-            space.mode == SpaceMode::Cad && selection.hovered() == Some(path.entity_id);
+        let is_hovered = space.mode == SpaceMode::Cad
+            && selection.hovered_grip().map(|grip| grip.id.0).or(selection.hovered()) == Some(path.entity_id);
         let pending_delete = state
             .cad_command
             .removed_preview_ids()
             .is_some_and(|ids| ids.contains(&cad_core::EntityId(path.entity_id)));
         let color = if pending_delete {
             Color::srgb(1.0, 0.18, 0.18)
-        } else if is_hovered && !is_selected {
-            Color::srgb(1.0, 0.5, 0.12)
+        } else if is_hovered {
+            CAD_HOVER_COLOR
         } else if is_selected {
-            Color::srgb(1.0, 0.82, 0.22)
+            if space.mode == SpaceMode::Cad {
+                CAD_SELECTION_COLOR
+            } else {
+                Color::srgb(1.0, 0.82, 0.22)
+            }
         } else if space.mode == SpaceMode::Cad
             && state.cad_command.curve_boundaries().is_some_and(|ids| ids.contains(&path.entity_id))
         {
@@ -1060,6 +1113,10 @@ fn draw_scene(
         })
         .unwrap_or(100.0);
     if space.mode == SpaceMode::Cad {
+        state.cad_command.aids.draw(
+            &mut minor_grid, &mut major_grid, state.view,
+            state.cad_command.point_plane(), camera.0, camera.1,
+        );
         state
             .cad_command
             .draw_plane(&mut gizmos, extent as f64, state.view);
@@ -1115,8 +1172,12 @@ fn selection_input(
         selection.hover_cursor = None;
         selection.hover_index = 0;
         selection.filter = Default::default();
+        selection.clear_grips();
     }
     selection.selected.retain(|id| valid.contains(id));
+    if space.mode != SpaceMode::Cad || !state.cad_command.is_active() {
+        selection.ellipse_drag = None;
+    }
     let valid_units: BTreeSet<cam::UnitId> = state.cam.units.iter().map(|unit| unit.id).collect();
     selection.cam_selected.retain(|id| valid_units.contains(id));
 
@@ -1124,6 +1185,8 @@ fn selection_input(
         return Ok(());
     }
     let Some(cursor) = window.cursor_position() else {
+        selection.ellipse_drag = None;
+        selection.clear_grips();
         if state.dynamic_input.enabled && state.cad_command.is_active() {
             state.cad_command.pause_pointer();
         } else {
@@ -1139,6 +1202,8 @@ fn selection_input(
         || context.egui_wants_pointer_input()
         || context.egui_is_using_pointer();
     if ui_active {
+        selection.ellipse_drag = None;
+        selection.clear_grips();
         selection.hover_hits.clear();
         selection.hover_cursor = None;
         selection.hover_index = 0;
@@ -1155,6 +1220,29 @@ fn selection_input(
         return Ok(());
     }
     let (camera, camera_transform) = camera.into_inner();
+    if space.mode == SpaceMode::Cad && !state.cad_command.is_active() {
+        let mut hits: Vec<_> = projected_grips(&state, &selection, camera, camera_transform)
+            .into_iter()
+            .map(|grip| (grip.screen.distance(cursor), grip.hit))
+            .filter(|(distance, _)| *distance <= GRIP_PICK_RADIUS)
+            .collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let hits: Vec<_> = hits.into_iter().map(|(_, hit)| hit).collect();
+        if selection
+            .grip_cursor
+            .is_none_or(|point| point.distance(cursor) > 3.0)
+            || selection.grip_hits != hits
+        {
+            selection.grip_index = 0;
+        }
+        selection.grip_cursor = Some(cursor);
+        selection.grip_hits = hits;
+        selection.grip_index = selection
+            .grip_index
+            .min(selection.grip_hits.len().saturating_sub(1));
+    } else {
+        selection.clear_grips();
+    }
     if space.mode == SpaceMode::Cad
         && !state.cad_command.is_active()
         && mouse.just_pressed(MouseButton::Left)
@@ -1167,21 +1255,30 @@ fn selection_input(
             KeyCode::ControlRight,
         ])
     {
-        if let Some((id, geometry, kind)) =
-            pick_grip(&state, &selection, camera, camera_transform, cursor)
-        {
-            if state
-                .cad_command
-                .begin_grip(id, geometry, kind, None)
-                .is_ok()
-            {
-                state.command_open = true;
-                state.command_input.clear();
-                state.dynamic_input.reset_fields();
-                state.dynamic_input.request_focus();
-                selection.drag_start = None;
-                selection.drag_current = None;
-                return Ok(());
+        if let Some(hit) = selection.hovered_grip() {
+            let geometry = state
+                .drawing
+                .as_ref()
+                .and_then(|drawing| drawing.document().entity(hit.id))
+                .map(|entity| entity.geometry.clone());
+            if let Some(geometry) = geometry {
+                let range_arrow = matches!(&geometry, cad_core::Geometry::Ellipse(_))
+                    && matches!(hit.kind, cad_core::properties::GripKind::Start | cad_core::properties::GripKind::End);
+                if state
+                    .cad_command
+                    .begin_grip(hit.id, geometry, hit.kind, None, &selection.selected)
+                    .is_ok()
+                {
+                    selection.clear_grips();
+                    if range_arrow { selection.ellipse_drag = Some((cursor, false)); }
+                    state.command_open = true;
+                    state.command_input.clear();
+                    state.dynamic_input.reset_fields();
+                    state.dynamic_input.request_focus();
+                    selection.drag_start = None;
+                    selection.drag_current = None;
+                    return Ok(());
+                }
             }
         }
     }
@@ -1248,6 +1345,14 @@ fn selection_input(
         && !state.cad_command.selecting()
     {
         selection.hover_hits.clear();
+        let mut drag_release = false;
+        if let Some((start, moved)) = &mut selection.ellipse_drag {
+            *moved |= cursor.distance(*start) > 3.0;
+            drag_release = mouse.just_released(MouseButton::Left) && *moved;
+            if mouse.just_released(MouseButton::Left) {
+                selection.ellipse_drag = None;
+            }
+        }
         let accepted = {
             let ViewerState {
                 drawing,
@@ -1266,7 +1371,7 @@ fn selection_input(
                     drawing.document(),
                     dynamic_input,
                     command_input,
-                    mouse.just_pressed(MouseButton::Left),
+                    mouse.just_pressed(MouseButton::Left) || drag_release,
                 )
             })
         };
@@ -1368,6 +1473,7 @@ fn selection_input(
                         filter, selected, ..
                     } = &mut *selection;
                     filter.apply(selected, chosen, shift, alt, ctrl);
+                    selection.clear_grips();
                 }
                 SpaceMode::Cam => {
                     let hit = pick_entity(&mut state, camera, camera_transform, cursor)
@@ -1403,6 +1509,7 @@ fn selection_input(
                         filter, selected, ..
                     } = &mut *selection;
                     filter.apply(selected, chosen, shift, alt, ctrl);
+                    selection.clear_grips();
                 }
                 SpaceMode::Cam => {
                     let chosen = box_select_units(&mut state, camera, camera_transform, start, end);
@@ -1418,43 +1525,132 @@ fn selection_input(
     Ok(())
 }
 
-fn pick_grip(
+fn projected_grips(
     state: &ViewerState,
     selection: &SelectionState,
     camera: &Camera,
     transform: &GlobalTransform,
-    cursor: Vec2,
-) -> Option<(
-    cad_core::EntityId,
-    cad_core::Geometry,
-    cad_core::properties::GripKind,
-)> {
-    if selection.selected.len() != 1 {
-        return None;
-    }
-    let doc = state.drawing.as_ref()?.document();
-    let id = cad_core::EntityId(*selection.selected.first()?);
-    let entity = doc.entity(id)?;
-    if !entity.visible {
-        return None;
-    }
-    if doc
-        .layer(entity.layer_id)
-        .is_some_and(|l| l.locked || !l.visible)
+) -> Vec<ProjectedGrip> {
+    let active = state.cad_command.active_grip();
+    if state.cad_command.is_active() && active.is_none()
+        || selection.selected.len() > GRIP_OBJECT_LIMIT && active.is_none()
     {
-        return None;
+        return Vec::new();
     }
-    cad_core::properties::grips(&entity.geometry)
-        .into_iter()
-        .filter_map(|g| {
-            state
+    let Some(document) = state.drawing.as_ref().map(|drawing| drawing.document()) else {
+        return Vec::new();
+    };
+    let Some(viewport) = camera.logical_viewport_rect() else {
+        return Vec::new();
+    };
+    let mut ids = state
+        .cad_command
+        .grip_ids()
+        .unwrap_or(&selection.selected)
+        .clone();
+    if let Some((id, _, _)) = active {
+        ids.insert(id.0);
+    }
+    let preview = state.cad_command.grip_geometry();
+    let moved = state.cad_command.transform_preview();
+    let mut projected = Vec::new();
+    for id in ids {
+        let Some(entity) = document.entity(cad_core::EntityId(id)) else {
+            continue;
+        };
+        if !entity.visible
+            || document
+                .layer(entity.layer_id)
+                .is_some_and(|layer| !layer.visible || layer.locked)
+        {
+            continue;
+        }
+        let owner = active.is_some_and(|(owner, _, _)| owner == entity.id);
+        let geometry = if owner {
+            preview.as_ref().unwrap_or(&entity.geometry)
+        } else {
+            &entity.geometry
+        };
+        let mut grips = cad_core::properties::grips(geometry);
+        if let Some((_, kind, _)) = active.filter(|_| owner) {
+            if !grips.iter().any(|grip| grip.kind == kind) {
+                if let Some(grip) = cad_core::properties::grips(&entity.geometry)
+                    .into_iter()
+                    .find(|grip| grip.kind == kind)
+                {
+                    grips.push(grip);
+                }
+            }
+        }
+        for grip in grips {
+            let mut point = [grip.point.x, grip.point.y, grip.point.z];
+            if owner {
+                if let Some((_, _, marker)) = active.filter(|(_, kind, _)| *kind == grip.kind) {
+                    point = marker;
+                }
+            } else if let Some((ids, transforms)) = &moved {
+                if ids.contains(&id) {
+                    point = transforms[0].point(point);
+                }
+            }
+            if let Some(screen) = state
                 .view
-                .project(camera, transform, [g.point.x, g.point.y, g.point.z])
-                .map(|screen| (screen.distance(cursor), g.kind))
-        })
-        .filter(|(distance, _)| *distance <= GRIP_PICK_RADIUS)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, kind)| (id, entity.geometry.clone(), kind))
+                .project(camera, transform, point)
+                .filter(|screen| viewport.contains(*screen))
+            {
+                let arrow = if let cad_core::Geometry::Ellipse(ellipse) = geometry {
+                    if matches!(
+                        grip.kind,
+                        cad_core::properties::GripKind::Start | cad_core::properties::GripKind::End
+                    ) {
+                        let start = grip.kind == cad_core::properties::GripKind::Start;
+                        let parameter =
+                            ellipse.start_parameter + if start { 0.0 } else { ellipse.sweep_parameter };
+                        let tangent = (ellipse.major_axis * -parameter.sin()
+                            + ellipse.minor_axis * parameter.cos())
+                        .normalize()
+                            * (state.view.pixel_size * if start { -16.0 } else { 16.0 });
+                        state
+                            .view
+                            .project(
+                                camera,
+                                transform,
+                                [
+                                    point[0] + tangent.x,
+                                    point[1] + tangent.y,
+                                    point[2] + tangent.z,
+                                ],
+                            )
+                            .map(|tip| tip - screen)
+                            .filter(|d| d.length() > 0.1)
+                            .map(|d| d.normalize())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                projected.push(ProjectedGrip {
+                    hit: GripHit {
+                        id: entity.id,
+                        kind: grip.kind,
+                    },
+                    label: format!(
+                        "{} · 图层 {} · {}",
+                        entity.geometry.kind(),
+                        document
+                            .layer(entity.layer_id)
+                            .map_or("?", |layer| layer.name.as_str()),
+                        grip.label
+                    ),
+                    point: cad_core::model::Point3::new(point[0], point[1], point[2]),
+                    screen,
+                    arrow,
+                });
+            }
+        }
+    }
+    projected
 }
 
 fn update_picking(state: &mut ViewerState, camera: &Camera, transform: &GlobalTransform) {
@@ -2623,7 +2819,10 @@ fn drawing_ui(
                     aids.ortho = false;
                 }
             }
-            let can_cycle = if state.cad_command.takes_point() {
+            let grip_cycle = !state.cad_command.is_active() && !selection.grip_hits.is_empty();
+            let can_cycle = if grip_cycle {
+                true
+            } else if state.cad_command.takes_point() {
                 state.cad_command.aids.has_candidates()
             } else {
                 (!state.cad_command.is_active()
@@ -2633,7 +2832,9 @@ fn drawing_ui(
             };
             let reverse = can_cycle && input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
             if can_cycle && (reverse || input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-                if state.cad_command.takes_point() {
+                if grip_cycle {
+                    selection.cycle_grip(reverse);
+                } else if state.cad_command.takes_point() {
                     state.cad_command.cycle_snap(reverse);
                 } else if !state.cad_command.is_active()
                     || state.cad_command.selecting()
@@ -2954,6 +3155,7 @@ fn drawing_ui(
                             cad_core::geometry_edit::SketchKind::ArcCenterEnd,
                             cad_core::geometry_edit::SketchKind::ArcCenterAngle,
                             cad_core::geometry_edit::SketchKind::Ellipse,
+                            cad_core::geometry_edit::SketchKind::EllipseArc,
                             cad_core::geometry_edit::SketchKind::Spline,
                         ] {
                             if ui.button(kind.label()).clicked() {
@@ -3170,6 +3372,7 @@ fn drawing_ui(
         }
     }
     if select_all {
+        selection.clear_grips();
         selection.selected = state
             .display
             .entities
@@ -3324,6 +3527,20 @@ fn drawing_ui(
                         state.cad_command.prompt(),
                         state.cad_command.error_message()
                     )
+                } else if !selection.selected.is_empty() && space.mode == SpaceMode::Cad {
+                    let hint = if selection.selected.len() > GRIP_OBJECT_LIMIT {
+                        format!("已选择 {} 个图元；超过 {GRIP_OBJECT_LIMIT} 个时隐藏夹点，可用 M 整体移动；Esc 清除选择", selection.selected.len())
+                    } else {
+                        format!(
+                            "已选择 {} 个图元；点击夹点编辑，M 移动选择集；Tab 切换重叠候选；Esc 清除选择",
+                            selection.selected.len()
+                        )
+                    };
+                    if let Some(message) = state.messages.last() {
+                        format!("{message} · {hint}")
+                    } else {
+                        hint
+                    }
                 } else {
                     state
                         .messages
@@ -4064,27 +4281,6 @@ fn drawing_ui(
         }
     }
 
-    if let Some(position) = context.input(|input| input.pointer.hover_pos()) {
-        let over_ui = menu_rect.expand(6.0).contains(position)
-            || feature_rect.expand(8.0).contains(position)
-            || command_rect.expand(6.0).contains(position)
-            || progress_rect.contains(position)
-            || context.egui_wants_pointer_input();
-        if !over_ui {
-            let size = PICK_TOLERANCE * 2.0;
-            let rect = egui::Rect::from_center_size(position, egui::vec2(size, size));
-            let painter = context.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("pick_box"),
-            ));
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(245, 205, 90));
-            painter.line_segment([rect.left_top(), rect.right_top()], stroke);
-            painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
-            painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
-            painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
-        }
-    }
-
     if state.cad_command.is_active() {
         save_drawing = false;
         save_project = false;
@@ -4206,12 +4402,9 @@ fn drawing_ui(
                 );
             }
         }
-        state
-            .cad_command
-            .aids
-            .marker_ui(context, state.view, view_camera, view_transform);
         if let Some(entity) = selection
             .hovered()
+            .filter(|_| selection.hovered_grip().is_none())
             .and_then(|id| state.display.entities.iter().find(|e| e.id == id))
         {
             if let Some(cursor) = context.input(|input| input.pointer.hover_pos()) {
@@ -4348,14 +4541,21 @@ fn drawing_ui(
         state.dynamic_input.suspend();
     }
 
-    if space.mode == SpaceMode::Cad
+    let grip_snap = if space.mode == SpaceMode::Cad
         && !cad_command_input_suspended(&state)
         && state.cad_workspace.context.is_none()
     {
         draw_cad_grips(
             context, &state, &selection, view_camera, view_transform, canvas_rect,
-        );
-    }
+        )
+    } else {
+        None
+    };
+    let grip_snap = grip_snap.filter(|_| {
+        state.cad_command.aids.enabled
+            && state.cad_command.aids.magnet
+            && selection.drag_start.is_none()
+    });
 
     let pointer = context.input(|input| input.pointer.hover_pos());
     let over_panels = pointer
@@ -4382,12 +4582,13 @@ fn drawing_ui(
             pointer
                 .filter(|point| canvas_rect.contains(*point))
                 .map(|point| {
-                    state.cad_command.cursor_coordinates(
+                    let (point, plane) = state.cad_command.cursor_coordinates(
                         state.view,
                         view_camera,
                         view_transform,
                         Vec2::new(point.x, point.y),
-                    )
+                    );
+                    (grip_snap.or(point), plane)
                 })
                 .unwrap_or((None, state.cad_command.plane))
         } else {
@@ -4395,7 +4596,91 @@ fn drawing_ui(
         };
         cad_workspace::paint_coordinates(context, &state.cad_workspace, point, plane);
     }
+    if !ui_state.pointer_over_ui && !cad_command_input_suspended(&state) {
+        if let Some(position) = pointer.filter(|position| canvas_rect.contains(*position)) {
+            let snap = if space.mode == SpaceMode::Cad && !pointer_was_over_ui {
+                state
+                    .cad_command
+                    .snap_point()
+                    .or(grip_snap)
+                    .and_then(|point| {
+                        state.view.project(
+                            view_camera, view_transform, [point.x, point.y, point.z],
+                        )
+                    })
+                    .map(|point| egui::pos2(point.x, point.y))
+                    .filter(|point| {
+                        canvas_rect.contains(*point) && point.distance(position) <= PICK_TOLERANCE
+                    })
+            } else {
+                None
+            };
+            if snap.is_some() && state.cad_command.takes_point() {
+                state.cad_command.aids.marker_ui(
+                    context, state.view, view_camera, view_transform, canvas_rect,
+                );
+            }
+            let position = if state.cad_command.aids.magnet {
+                snap.unwrap_or(position)
+            } else {
+                position
+            };
+            draw_canvas_cursor(context, &state.cad_command, space.mode, canvas_rect, position);
+        }
+    }
     Ok(())
+}
+
+fn draw_canvas_cursor(
+    context: &egui::Context,
+    command: &cad_command::CommandState,
+    mode: SpaceMode,
+    canvas: egui::Rect,
+    position: egui::Pos2,
+) {
+    let painter = context
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("cad_cursor"),
+        ))
+        .with_clip_rect(canvas);
+    let selecting = command.selecting() || command.picking_curve();
+    let pickbox = mode == SpaceMode::Cam || !command.is_active() || selecting;
+    let size = if mode == SpaceMode::Cam {
+        PICK_TOLERANCE * 2.0
+    } else {
+        8.0
+    };
+    let color = if mode == SpaceMode::Cam {
+        egui::Color32::from_rgb(245, 205, 90)
+    } else {
+        egui::Color32::from_rgb(222, 232, 244)
+    };
+    let stroke = egui::Stroke::new(1.0, color);
+    if mode == SpaceMode::Cad {
+        context.set_cursor_icon(egui::CursorIcon::None);
+        if !selecting {
+            let gap = if pickbox { size * 0.5 } else { 0.0 };
+            for direction in [egui::vec2(1.0, 0.0), egui::vec2(0.0, 1.0)] {
+                painter.line_segment(
+                    [position - direction * 32.0, position - direction * gap],
+                    stroke,
+                );
+                painter.line_segment(
+                    [position + direction * gap, position + direction * 32.0],
+                    stroke,
+                );
+            }
+        }
+    }
+    if pickbox {
+        painter.rect_stroke(
+            egui::Rect::from_center_size(position, egui::Vec2::splat(size)),
+            0.0,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 fn draw_cad_grips(
@@ -4405,54 +4690,31 @@ fn draw_cad_grips(
     camera: &Camera,
     transform: &GlobalTransform,
     canvas: egui::Rect,
-) {
-    let active = state.cad_command.active_grip();
-    if state.cad_command.is_active() && active.is_none() {
-        return;
-    }
-    let id = active.map(|(id, _, _)| id).or_else(|| {
-        (selection.selected.len() == 1)
-            .then(|| cad_core::EntityId(*selection.selected.first().unwrap()))
-    });
-    let Some(document) = state.drawing.as_ref().map(|drawing| drawing.document()) else {
-        return;
-    };
-    let Some(entity) = id.and_then(|id| document.entity(id)) else {
-        return;
-    };
-    if !entity.visible
-        || document
-            .layer(entity.layer_id)
-            .is_some_and(|layer| layer.locked || !layer.visible)
-    {
-        return;
-    }
-    let preview = state.cad_command.grip_geometry();
-    let projected: Vec<_> =
-        cad_core::properties::grips(preview.as_ref().unwrap_or(&entity.geometry))
-            .into_iter()
-            .filter_map(|grip| {
-                let point = active
-                    .filter(|(_, kind, _)| *kind == grip.kind)
-                    .map(|(_, _, point)| point)
-                    .unwrap_or([grip.point.x, grip.point.y, grip.point.z]);
-                state
-                    .view
-                    .project(camera, transform, point)
-                    .map(|screen| (grip, screen))
-            })
-            .collect();
+) -> Option<cad_core::model::Point3> {
+    let active = state
+        .cad_command
+        .active_grip()
+        .map(|(id, kind, _)| GripHit { id, kind });
+    let mut projected = projected_grips(state, selection, camera, transform);
     let pointer = context
         .input(|input| input.pointer.hover_pos())
         .filter(|point| canvas.contains(*point) && !context.egui_wants_pointer_input());
-    let hovered = pointer.filter(|_| active.is_none()).and_then(|pointer| {
-        projected
-            .iter()
-            .enumerate()
-            .map(|(index, (_, screen))| (index, screen.distance(Vec2::new(pointer.x, pointer.y))))
-            .filter(|(_, distance)| *distance <= GRIP_PICK_RADIUS)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(index, _)| index)
+    let hovered = pointer.filter(|_| active.is_none()).and_then(|point| {
+        selection.hovered_grip().filter(|hit| {
+            projected.iter().any(|grip| {
+                grip.hit == *hit
+                    && grip.screen.distance(Vec2::new(point.x, point.y)) <= GRIP_PICK_RADIUS
+            })
+        })
+    });
+    projected.sort_by_key(|grip| {
+        if Some(grip.hit) == active {
+            2
+        } else if Some(grip.hit) == hovered {
+            1
+        } else {
+            0
+        }
     });
     let painter = context
         .layer_painter(egui::LayerId::new(
@@ -4460,18 +4722,36 @@ fn draw_cad_grips(
             egui::Id::new("cad_grips"),
         ))
         .with_clip_rect(canvas);
-    for (index, (grip, screen)) in projected.iter().enumerate() {
-        let position = egui::pos2(screen.x, screen.y);
+    for grip in &projected {
+        let position = egui::pos2(grip.screen.x, grip.screen.y);
         if !canvas.contains(position) {
             continue;
         }
-        let color = if active.is_some_and(|(_, kind, _)| kind == grip.kind) {
+        let color = if Some(grip.hit) == active {
             egui::Color32::from_rgb(255, 80, 80)
-        } else if hovered == Some(index) {
+        } else if Some(grip.hit) == hovered {
             egui::Color32::from_rgb(255, 190, 65)
         } else {
             egui::Color32::from_rgb(90, 165, 255)
         };
+        if let Some(direction) = grip.arrow {
+            let direction = egui::vec2(direction.x, direction.y);
+            let normal = egui::vec2(-direction.y, direction.x);
+            painter.line_segment(
+                [position - direction * 10.0, position - direction * 4.0],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    position + direction * 6.0,
+                    position - direction * 4.0 + normal * 4.5,
+                    position - direction * 4.0 - normal * 4.5,
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            continue;
+        }
         let rect = egui::Rect::from_center_size(position, egui::Vec2::splat(GRIP_SIZE));
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(16, 25, 39));
         painter.rect_stroke(
@@ -4480,23 +4760,29 @@ fn draw_cad_grips(
             egui::Stroke::new(1.5, color),
             egui::StrokeKind::Inside,
         );
-        if active.is_some_and(|(_, kind, _)| kind == grip.kind) {
+        if Some(grip.hit) == active {
             painter.rect_filled(rect.shrink(1.5), 0.0, color);
         }
     }
-    if let Some(index) = hovered {
-        let (grip, screen) = &projected[index];
-        let galley = painter.layout_no_wrap(
-            grip.label.clone(),
-            egui::FontId::proportional(13.0),
-            egui::Color32::WHITE,
-        );
+    if let Some(grip) = hovered.and_then(|hit| projected.iter().find(|grip| grip.hit == hit)) {
+        let text = if selection.grip_hits.len() > 1 {
+            format!(
+                "{} · 候选 {}/{} · Tab 切换",
+                grip.label,
+                selection.grip_index + 1,
+                selection.grip_hits.len()
+            )
+        } else {
+            grip.label.clone()
+        };
+        let galley =
+            painter.layout_no_wrap(text, egui::FontId::proportional(13.0), egui::Color32::WHITE);
         let size = galley.size() + egui::vec2(12.0, 8.0);
         let anchor = egui::pos2(
-            (screen.x + 14.0)
+            (grip.screen.x + 14.0)
                 .min(canvas.right() - size.x)
                 .max(canvas.left()),
-            (screen.y + 16.0)
+            (grip.screen.y + 16.0)
                 .min(canvas.bottom() - size.y)
                 .max(canvas.top()),
         );
@@ -4506,6 +4792,9 @@ fn draw_cad_grips(
             egui::Color32::from_rgb(24, 32, 46),
         );
         painter.galley(anchor + egui::vec2(6.0, 4.0), galley, egui::Color32::WHITE);
+        Some(grip.point)
+    } else {
+        None
     }
 }
 
@@ -5618,6 +5907,7 @@ fn apply_cad_action(
                 Some(cad_core::model::Point3::new(
                     target[0], target[1], target[2],
                 )),
+                &selection.selected,
             ) {
                 Ok(()) => {
                     state.command_open = true;
@@ -5882,6 +6172,7 @@ fn apply_cad_action(
         .map(|entity| entity.id)
         .collect();
     selection.selected.retain(|id| valid.contains(id));
+    selection.clear_grips();
     selection
         .cam_selected
         .retain(|id| state.cam.unit(*id).is_some());

@@ -60,6 +60,7 @@ pub enum SketchKind {
     ArcCenterEnd,
     ArcCenterAngle,
     Ellipse,
+    EllipseArc,
     Spline,
 }
 impl SketchKind {
@@ -76,6 +77,7 @@ impl SketchKind {
             Self::ArcCenterEnd => "圆弧（圆心/起点/终点方向）",
             Self::ArcCenterAngle => "圆弧（圆心/起点/扫角）",
             Self::Ellipse => "椭圆",
+            Self::EllipseArc => "椭圆弧",
             Self::Spline => "控制点样条",
         }
     }
@@ -92,6 +94,7 @@ impl SketchKind {
             Self::ArcCenterEnd => "ARCCE",
             Self::ArcCenterAngle => "ARCCA",
             Self::Ellipse => "ELLIPSE",
+            Self::EllipseArc => "ELLIPSEARC",
             Self::Spline => "SPLINE",
         }
     }
@@ -107,6 +110,9 @@ impl SketchKind {
     pub fn is_arc(self) -> bool {
         matches!(self, Self::Arc | Self::ArcCenterEnd | Self::ArcCenterAngle)
     }
+    pub fn is_ellipse(self) -> bool {
+        matches!(self, Self::Ellipse | Self::EllipseArc)
+    }
     pub fn required(self) -> usize {
         match self {
             Self::Line
@@ -118,6 +124,7 @@ impl SketchKind {
             | Self::ArcCenterAngle => 2,
             Self::Arc | Self::ArcCenterEnd | Self::Ellipse | Self::Circle3P => 3,
             Self::Spline => 4,
+            Self::EllipseArc => 5,
         }
     }
 }
@@ -132,6 +139,28 @@ pub struct Sketch {
     pub sweep_degrees: Option<f64>,
 }
 impl Sketch {
+    pub fn ellipse(&self) -> Result<Ellipse, String> {
+        if self.points.len() < 3 {
+            return Err("椭圆需要中心、长半轴端点和短半轴点".into());
+        }
+        let major = delta(self.points[0], self.points[1]);
+        let a = major.length();
+        if !a.is_finite() || a <= 1e-9 {
+            return Err("长半轴必须大于零".into());
+        }
+        let dir = self.plane.normal().cross(major * (1.0 / a));
+        let b = delta(self.points[0], self.points[2]).dot(dir).abs();
+        if !b.is_finite() || b <= 1e-9 || b > a {
+            return Err("短半轴必须大于零且不超过长半轴".into());
+        }
+        Ok(Ellipse {
+            center: self.points[0],
+            major_axis: major,
+            minor_axis: dir * b,
+            start_parameter: 0.0,
+            sweep_parameter: TAU,
+        })
+    }
     pub fn new(kind: SketchKind, plane: WorkPlane, degree: u32) -> Self {
         Self {
             kind,
@@ -149,7 +178,9 @@ impl Sketch {
         if self.kind != SketchKind::Line && self.plane.to_local(p)[2].abs() > 1e-5 {
             return Err("该工具在当前工作平面绘制；请切换平面或启用投影捕捉".into());
         }
-        if self.points.last().is_some_and(|q| length(*q, p) <= 1e-9) {
+        if self.points.last().is_some_and(|q| length(*q, p) <= 1e-9)
+            && !(self.kind == SketchKind::EllipseArc && self.points.len() >= 3)
+        {
             return Err("相邻点不能重合".into());
         }
         self.points.push(p);
@@ -330,21 +361,17 @@ impl Sketch {
                     plane,
                 })]
             }
-            SketchKind::Ellipse => {
-                let major = delta(p[0], p[1]);
-                let a = major.length();
-                let dir = plane.normal.cross(major * (1.0 / a));
-                let b = delta(p[0], p[2]).dot(dir).abs();
-                if b <= 1e-9 || b > a {
-                    return Err("短半轴必须大于零且不超过长半轴".into());
+            SketchKind::Ellipse | SketchKind::EllipseArc => {
+                let mut ellipse = self.ellipse()?;
+                if self.kind == SketchKind::EllipseArc {
+                    ellipse.start_parameter = ellipse.parameter_at(p[3])?;
+                    let end = ellipse.parameter_at(p[4])?;
+                    ellipse.sweep_parameter = (end - ellipse.start_parameter).rem_euclid(TAU);
+                    if ellipse.sweep_parameter < 1e-10 {
+                        ellipse.sweep_parameter = TAU;
+                    }
                 }
-                vec![Geometry::Ellipse(Ellipse {
-                    center: p[0],
-                    major_axis: major,
-                    minor_axis: dir * b,
-                    start_parameter: 0.0,
-                    sweep_parameter: TAU,
-                })]
+                vec![Geometry::Ellipse(ellipse)]
             }
             SketchKind::Spline => {
                 let mut control = p.clone();

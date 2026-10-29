@@ -410,6 +410,7 @@ fn entity_properties(geometry: &Geometry) -> Vec<(&'static str, String)> {
             ("平面法向", format_vector(arc.plane.normal)),
         ],
         Geometry::Ellipse(ellipse) => vec![
+            ("形态", if ellipse.is_full() { "完整椭圆" } else { "椭圆弧" }.into()),
             ("中心", format_point(ellipse.center)),
             ("长半轴", format!("{:.3}", ellipse.major_axis.length())),
             ("短半轴", format!("{:.3}", ellipse.minor_axis.length())),

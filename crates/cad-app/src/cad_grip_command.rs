@@ -17,6 +17,7 @@ enum Mode {
 pub struct Session {
     pub id: EntityId,
     pub kind: GripKind,
+    pub ids: BTreeSet<u32>,
     geometry: Geometry,
     label: String,
     grip: Point3,
@@ -36,6 +37,7 @@ impl Session {
         kind: GripKind,
         target: Option<Point3>,
         plane: WorkPlane,
+        selected: &BTreeSet<u32>,
     ) -> Result<Self, String> {
         let grip = properties::grips(&geometry)
             .into_iter()
@@ -53,13 +55,8 @@ impl Session {
         let session = Self {
             id,
             kind,
-            mode: if kind == GripKind::Center
-                || matches!((&geometry, kind), (Geometry::Line(_), GripKind::Midpoint))
-            {
-                Mode::Move
-            } else {
-                Mode::Stretch
-            },
+            ids: selected.iter().copied().chain([id.0]).collect(),
+            mode: Mode::Stretch,
             geometry,
             label: grip
                 .label
@@ -121,6 +118,17 @@ impl Session {
         }
         None
     }
+    fn ellipse_range(&self) -> Option<&cad_core::model::Ellipse> {
+        if self.mode == Mode::Stretch
+            && !self.picking_base
+            && matches!(self.kind, GripKind::Start | GripKind::End)
+        {
+            if let Geometry::Ellipse(ellipse) = &self.geometry {
+                return Some(ellipse);
+            }
+        }
+        None
+    }
     pub fn can_length(&self) -> bool {
         matches!(
             (&self.geometry, self.kind),
@@ -154,6 +162,8 @@ impl Session {
     pub fn reference(&self) -> Point3 {
         if self.picking_base {
             self.base
+        } else if let Some(ellipse) = self.ellipse_range() {
+            self.command_point(ellipse.center)
         } else if self.length {
             self.command_point(self.opposite())
         } else if let Some(center) = self.radius() {
@@ -167,6 +177,8 @@ impl Session {
         Spec {
             kind: if self.picking_base {
                 Kind::Coordinates
+            } else if self.ellipse_range().is_some() {
+                Kind::EllipseParameter
             } else if self.length {
                 Kind::TargetLength
             } else if self.radius().is_some() {
@@ -177,7 +189,15 @@ impl Session {
             reference: Some(array(self.reference())),
             plane: self.plane(),
             point: Some(point),
-            value: cad_core::curves::distance(self.reference(), as_point(point)),
+            value: self.ellipse_range().map_or_else(
+                || cad_core::curves::distance(self.reference(), as_point(point)),
+                |ellipse| {
+                    ellipse
+                        .parameter_at(self.grip_point(as_point(point)))
+                        .unwrap_or(ellipse.start_parameter)
+                        .to_degrees()
+                },
+            ),
             secondary: 0.,
         }
     }
@@ -205,6 +225,10 @@ impl Session {
             "端点最终长度"
         } else if self.radius().is_some() {
             "修改半径"
+        } else if self.ellipse_range().is_some() {
+            "调整覆盖范围（可输入参数角）"
+        } else if self.whole_move() {
+            "夹点移动"
         } else {
             "拉伸"
         };
@@ -216,8 +240,13 @@ impl Session {
             "点击目标/输入确认；空 Enter/空格切换拉伸/移动"
         };
         format!(
-            "{} · {mode}{}：{action}；S 拉伸/M 移动/C 复制/B 基点{}；Esc 取消",
+            "{} · {mode}{}{}：{action}；S 拉伸/M 移动/C 复制/B 基点{}；Esc 取消",
             self.label,
+            if self.mode == Mode::Move {
+                format!(" · {} 个图元", self.ids.len())
+            } else {
+                " · 当前图元".into()
+            },
             if self.copies {
                 "（创建副本）"
             } else {
@@ -242,6 +271,11 @@ impl Session {
             return parse_point(text, self.plane(), array(self.reference()));
         }
         let value = number(text)?;
+        if let Some(ellipse) = self.ellipse_range() {
+            return finite(array(
+                self.command_point(ellipse.point_at(value.to_radians())),
+            ));
+        }
         let reference = self.reference();
         let mut direction = Vector3::new(
             point[0] - reference.x,
@@ -295,7 +329,42 @@ impl Session {
             .or(hover.map(as_point))
             .and_then(|point| self.geometry(point).ok())
     }
+    pub fn move_preview(
+        &self,
+        hover: Option<[f64; 3]>,
+    ) -> Option<(BTreeSet<u32>, AffineTransform)> {
+        if self.mode != Mode::Move || self.picking_base {
+            return None;
+        }
+        let point = self.target.or(hover.map(as_point))?;
+        let transform = AffineTransform::translation([
+            point.x - self.base.x,
+            point.y - self.base.y,
+            point.z - self.base.z,
+        ])
+        .ok()?;
+        Some((self.ids.clone(), transform))
+    }
     pub fn marker(&self, hover: Option<[f64; 3]>) -> [f64; 3] {
+        if self.ellipse_range().is_some() {
+            return self
+                .preview(hover)
+                .and_then(|geometry| {
+                    if let Geometry::Ellipse(ellipse) = geometry {
+                        Some(array(ellipse.point_at(
+                            ellipse.start_parameter
+                                + if self.kind == GripKind::Start {
+                                    0.0
+                                } else {
+                                    ellipse.sweep_parameter
+                                },
+                        )))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(array(self.grip));
+        }
         if self.picking_base {
             array(self.grip)
         } else {
@@ -324,9 +393,13 @@ impl Session {
     fn commit(&self) -> Result<CommandCommit, String> {
         let point = self.target.ok_or("请先指定目标")?;
         let geometry = self.geometry(point)?;
-        if self.whole_move() {
+        if self.mode == Mode::Move || self.whole_move() && self.copies {
             Ok(CommandCommit::Transform {
-                ids: BTreeSet::from([self.id.0]),
+                ids: if self.mode == Mode::Move {
+                    self.ids.clone()
+                } else {
+                    BTreeSet::from([self.id.0])
+                },
                 transforms: vec![AffineTransform::translation([
                     point.x - self.base.x,
                     point.y - self.base.y,

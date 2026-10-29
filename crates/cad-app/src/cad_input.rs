@@ -24,6 +24,7 @@ pub enum Kind {
     RectangleWidth,
     RectangleAngle,
     ArcSweep,
+    EllipseParameter,
 }
 #[derive(Clone, Copy)]
 pub struct Spec {
@@ -62,6 +63,7 @@ impl Spec {
             Kind::RectangleWidth => &["矩形宽度 mm"],
             Kind::RectangleAngle => &["矩形旋转 °"],
             Kind::ArcSweep => &["圆弧扫角 °"],
+            Kind::EllipseParameter => &["椭圆参数角 °"],
         }
     }
     fn values(self) -> [f64; 3] {
@@ -128,6 +130,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("ARCCE", "", "圆心/起点/终点方向圆弧"),
     ("ARCCA", "", "圆心/起点/扫角圆弧"),
     ("ELLIPSE", "EL", "椭圆"),
+    ("ELLIPSEARC", "EA", "椭圆弧"),
     ("SPLINE", "SPL", "样条"),
     ("MOVE", "M", "移动"),
     ("COPY", "CO", "复制"),
@@ -380,6 +383,8 @@ impl DynamicInput {
                         && matches!(typed.to_uppercase().as_str(), "R" | "D" | "2P" | "3P")
                     || !command.arc_options().is_empty()
                         && matches!(typed.to_uppercase().as_str(), "C" | "A" | "E" | "3P")
+                    || !command.ellipse_options().is_empty()
+                        && matches!(typed.to_uppercase().as_str(), "A" | "E")
                     || command.rectangle_corner()
                         && matches!(typed.to_uppercase().as_str(), "D" | "R")
                     || command.copy_mode().is_some()
@@ -695,6 +700,7 @@ impl DynamicInput {
                             }
                             Kind::RectangleAngle => "相对工作平面 U 轴的角度；正角绕法向按右手方向",
                             Kind::ArcSweep => "非零且绝对值小于 360°；正角逆时针，负角顺时针",
+                            Kind::EllipseParameter => "参数角：0° 在长轴正向，90° 在短轴正向；覆盖沿参数正向",
                         });
                         let mut fields = self.fields(spec, text);
                         let target = self.field;

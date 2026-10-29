@@ -17,6 +17,7 @@ struct Candidate {
 }
 pub struct DraftingAids {
     pub enabled: bool,
+    pub magnet: bool,
     pub grid: bool,
     pub grid_snap: bool,
     pub ortho: bool,
@@ -35,6 +36,7 @@ impl Default for DraftingAids {
     fn default() -> Self {
         Self {
             enabled: true,
+            magnet: true,
             grid: false,
             grid_snap: false,
             ortho: false,
@@ -63,6 +65,12 @@ fn array(p: Point3) -> [f64; 3] {
     [p.x, p.y, p.z]
 }
 impl DraftingAids {
+    pub fn snap_point(&self, point: Point3) -> Option<Point3> {
+        self.marker
+            .as_ref()
+            .filter(|marker| self.enabled && snap::vector(marker.point, point).length() < 1e-6)
+            .map(|_| point)
+    }
     pub fn has_candidates(&self) -> bool {
         !self.candidates.is_empty()
     }
@@ -229,6 +237,10 @@ impl DraftingAids {
         ui.set_max_width(320.0);
         let mut changed = ui.checkbox(&mut self.enabled, "对象捕捉 F3").changed();
         changed |= ui
+            .checkbox(&mut self.magnet, "自动吸附（磁吸）")
+            .on_hover_text("取点时将十字光标吸附到捕捉点；关闭只取消光标吸附，仍保留精确捕捉。")
+            .changed();
+        changed |= ui
             .checkbox(&mut self.project, "将捕捉点投影到工作平面")
             .changed();
         ui.separator();
@@ -288,7 +300,7 @@ impl DraftingAids {
         }
         ui.add(
             egui::Label::new(
-                egui::RichText::new("显示与捕捉独立开关，共用间距；显示密度随缩放自动调整。")
+                egui::RichText::new("每 5 格显示粗主线；显示随视角与缩放按 5 倍层级稀疏，捕捉间距保持设置值。")
                     .small(),
             )
             .wrap(),
@@ -420,32 +432,90 @@ impl DraftingAids {
         }
         open
     }
-    pub fn draw(&self, gizmos: &mut Gizmos, frame: ViewFrame, plane: WorkPlane) {
-        if self.grid {
-            let center = plane.to_local(Point3::new(
-                frame.origin[0],
-                frame.origin[1],
-                frame.origin[2],
-            ));
-            let step = self.spacing * ((frame.pixel_size * 18.0 / self.spacing).ceil().max(1.0));
-            let radius = (frame.pixel_size * 900.0 / step).ceil().clamp(1.0, 80.0) as i32;
-            let u = (center[0] / step).round() * step;
-            let v = (center[1] / step).round() * step;
-            for i in -radius..=radius {
-                for (a, b) in [
-                    (
-                        [u + i as f64 * step, v - radius as f64 * step, 0.0],
-                        [u + i as f64 * step, v + radius as f64 * step, 0.0],
-                    ),
-                    (
-                        [u - radius as f64 * step, v + i as f64 * step, 0.0],
-                        [u + radius as f64 * step, v + i as f64 * step, 0.0],
-                    ),
-                ] {
-                    let a = frame.point(array(plane.to_world(a)));
-                    let b = frame.point(array(plane.to_world(b)));
-                    if a.is_finite() && b.is_finite() {
-                        gizmos.line(a, b, Color::srgb(0.13, 0.2, 0.25));
+    pub fn draw(
+        &self,
+        gizmos: &mut Gizmos<super::MinorGridGizmos>,
+        major_grid: &mut Gizmos<super::MajorGridGizmos>,
+        frame: ViewFrame,
+        plane: WorkPlane,
+        camera: &Camera,
+        transform: &GlobalTransform,
+    ) {
+        if !self.grid {
+            return;
+        }
+        let Some(viewport) = camera.logical_viewport_rect() else {
+            return;
+        };
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for cursor in [
+            viewport.min,
+            Vec2::new(viewport.max.x, viewport.min.y),
+            viewport.max,
+            Vec2::new(viewport.min.x, viewport.max.y),
+        ] {
+            let Some((origin, direction)) = frame.ray(camera, transform, cursor) else {
+                return;
+            };
+            let normal = plane.normal();
+            let denominator = normal.dot(direction);
+            if denominator.abs() < 1e-4 {
+                return;
+            }
+            // Extend the plane beyond the camera near plane; rendering clips it.
+            let distance = Vector3::new(
+                plane.origin.x - origin.x,
+                plane.origin.y - origin.y,
+                plane.origin.z - origin.z,
+            )
+            .dot(normal)
+                / denominator;
+            let point = Point3::new(
+                origin.x + direction.x * distance,
+                origin.y + direction.y * distance,
+                origin.z + direction.z * distance,
+            );
+            let local = plane.to_local(point);
+            for axis in 0..2 {
+                if !local[axis].is_finite() {
+                    return;
+                }
+                min[axis] = min[axis].min(local[axis]);
+                max[axis] = max[axis].max(local[axis]);
+            }
+        }
+        let span = [max[0] - min[0], max[1] - min[1]];
+        let density = (span[0] / viewport.width().max(1.0) as f64)
+            .max(span[1] / viewport.height().max(1.0) as f64);
+        let target = (density * 16.0).max(span[0] / 512.0).max(span[1] / 512.0);
+        // Powers of five keep major lines aligned through density changes.
+        let level = (target / self.spacing).log(5.0).ceil().max(0.0);
+        let step = self.spacing * 5.0_f64.powf(level);
+        if !step.is_finite() || step <= 0.0 {
+            return;
+        }
+        for axis in 0..2 {
+            let first = (min[axis] / step).floor() - 1.0;
+            let count = (span[axis] / step).ceil() as usize + 4;
+            for i in 0..count {
+                let index = first + i as f64;
+                let mut a = [min[0] - step, min[1] - step, 0.0];
+                let mut b = [max[0] + step, max[1] + step, 0.0];
+                a[axis] = index * step;
+                b[axis] = a[axis];
+                let a = frame.point(array(plane.to_world(a)));
+                let b = frame.point(array(plane.to_world(b)));
+                if a.is_finite() && b.is_finite() {
+                    if index.rem_euclid(5.0) < 0.5 {
+                        let color = if index.abs() < 0.5 {
+                            Color::srgb(0.28, 0.37, 0.44)
+                        } else {
+                            Color::srgb(0.21, 0.29, 0.35)
+                        };
+                        major_grid.line(a, b, color);
+                    } else {
+                        gizmos.line(a, b, Color::srgb(0.12, 0.18, 0.23));
                     }
                 }
             }
@@ -457,6 +527,7 @@ impl DraftingAids {
         frame: ViewFrame,
         camera: &Camera,
         transform: &GlobalTransform,
+        canvas: egui::Rect,
     ) {
         let Some(marker) = &self.marker else {
             return;
@@ -465,10 +536,12 @@ impl DraftingAids {
             return;
         };
         let p = egui::pos2(p.x, p.y);
-        let painter = context.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("snap_marker"),
-        ));
+        let painter = context
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("snap_marker"),
+            ))
+            .with_clip_rect(canvas);
         painter.rect_stroke(
             egui::Rect::from_center_size(p, egui::vec2(12.0, 12.0)),
             0.0,

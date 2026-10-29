@@ -94,6 +94,18 @@ pub fn grips(g: &Geometry) -> Vec<Grip> {
         }
         Geometry::Ellipse(e) => {
             push(GripKind::Center, "中心：移动整个椭圆".into(), e.center);
+            if !e.is_full() {
+                push(
+                    GripKind::Start,
+                    "起始箭头：调整椭圆弧起始范围".into(),
+                    e.point_at(e.start_parameter),
+                );
+            }
+            push(
+                GripKind::End,
+                "结束箭头：调整椭圆弧结束范围".into(),
+                e.point_at(e.start_parameter + e.sweep_parameter),
+            );
             push(
                 GripKind::Major,
                 "长半轴：调整长度和方向".into(),
@@ -249,6 +261,25 @@ pub fn move_grip(g: &Geometry, kind: GripKind, p: Point3) -> Result<Geometry, St
             *a = result;
         }
         (Geometry::Ellipse(e), GripKind::Center) => e.center = p,
+        (Geometry::Ellipse(e), GripKind::Start | GripKind::End) => {
+            in_plane(
+                e.center,
+                Plane::new(e.major_axis.cross(e.minor_axis), e.major_axis),
+                p,
+            )?;
+            let parameter = e.parameter_at(p)?;
+            let end = e.start_parameter + e.sweep_parameter;
+            if kind == GripKind::Start {
+                e.start_parameter = parameter;
+                e.sweep_parameter = (end - parameter).rem_euclid(std::f64::consts::TAU);
+            } else {
+                e.sweep_parameter =
+                    (parameter - e.start_parameter).rem_euclid(std::f64::consts::TAU);
+            }
+            if e.sweep_parameter < 1e-10 {
+                e.sweep_parameter = std::f64::consts::TAU;
+            }
+        }
         (Geometry::Ellipse(e), GripKind::Major | GripKind::Minor) => {
             let normal = e.major_axis.cross(e.minor_axis).normalize();
             let plane = Plane::new(normal, e.major_axis);

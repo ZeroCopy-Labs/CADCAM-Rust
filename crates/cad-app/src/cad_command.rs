@@ -199,6 +199,14 @@ impl CommandState {
     pub fn arc_sweep_input(&self) -> bool {
         matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::ArcCenterAngle && sketch.points.len()==2)
     }
+    pub fn ellipse_options(&self) -> &'static [(&'static str, &'static str)] {
+        if matches!(&self.step, Some(Step::Draw {sketch, confirmed:false}) if sketch.kind.is_ellipse() && sketch.points.len() < 3)
+        {
+            &[("E", "完整椭圆"), ("A", "椭圆弧")]
+        } else {
+            &[]
+        }
+    }
     pub fn rectangle_drawing(&self) -> bool {
         matches!(&self.step,Some(Step::Draw{sketch,..}) if sketch.kind==SketchKind::Rectangle)
     }
@@ -488,6 +496,42 @@ impl CommandState {
         if !self.takes_point() {
             return None;
         }
+        if let Some(Step::Draw { sketch, .. }) = &self.step {
+            if sketch.kind.is_ellipse() && sketch.points.len() == 2 {
+                let c = sketch.points[0];
+                let u = cad_core::snap::vector(c, sketch.points[1]).normalize();
+                let v = sketch.plane.normal().cross(u);
+                let value = self
+                    .hover
+                    .map(as_point)
+                    .map_or(0.0, |p| cad_core::snap::vector(c, p).dot(v).abs());
+                return Some(Spec {
+                    kind: Kind::Distance,
+                    reference: None,
+                    plane: self.point_plane(),
+                    point: self.hover,
+                    value,
+                    secondary: 0.0,
+                });
+            }
+            if sketch.kind == SketchKind::EllipseArc && sketch.points.len() >= 3 {
+                let ellipse = sketch.ellipse().ok()?;
+                let value = self
+                    .hover
+                    .map(as_point)
+                    .and_then(|p| ellipse.parameter_at(p).ok())
+                    .unwrap_or(0.0)
+                    .to_degrees();
+                return Some(Spec {
+                    kind: Kind::EllipseParameter,
+                    reference: None,
+                    plane: self.point_plane(),
+                    point: self.hover,
+                    value,
+                    secondary: 0.0,
+                });
+            }
+        }
         let reference = self.snap_reference().map(array);
         let radius = matches!(&self.step, Some(Step::Draw { sketch, .. }) if matches!(sketch.kind,SketchKind::Circle | SketchKind::CircleDiameter) && !sketch.points.is_empty());
         Some(Spec {
@@ -543,7 +587,7 @@ impl CommandState {
         }
     }
     pub fn refresh_input_preview(&mut self, dynamic: &super::cad_input::DynamicInput, text: &str) {
-        if let Some(result) = self.circle_value_point(text) {
+        if let Some(result) = self.circle_value_point(text).or_else(|| self.ellipse_value_point(text)) {
             match result {
                 Ok(point) => {
                     self.hover = Some(point);
@@ -658,6 +702,50 @@ impl CommandState {
                 .unwrap_or(sketch.plane.x_axis);
             let d = direction * value;
             finite([c.x + d.x, c.y + d.y, c.z + d.z])
+        })())
+    }
+    fn ellipse_value_point(&self, text: &str) -> Option<Result<[f64; 3], String>> {
+        let Some(Step::Draw {
+            sketch,
+            confirmed: false,
+        }) = &self.step
+        else {
+            return None;
+        };
+        if !sketch.kind.is_ellipse()
+            || sketch.points.len() < 2
+            || text.trim().is_empty()
+            || is_point_expression(text)
+            || !text
+                .trim()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+        {
+            return None;
+        }
+        Some((|| {
+            let value = number(text)?;
+            if sketch.points.len() == 2 {
+                if value <= 1e-9 {
+                    return Err("短半轴必须大于零".into());
+                }
+                let center = sketch.points[0];
+                let direction = sketch
+                    .plane
+                    .normal()
+                    .cross(cad_core::snap::vector(center, sketch.points[1]).normalize());
+                if value > cad_core::snap::vector(center, sketch.points[1]).length() {
+                    return Err("短半轴不能超过长半轴".into());
+                }
+                finite([
+                    center.x + direction.x * value,
+                    center.y + direction.y * value,
+                    center.z + direction.z * value,
+                ])
+            } else {
+                finite(array(sketch.ellipse()?.point_at(value.to_radians())))
+            }
         })())
     }
     fn rectangle_target(&self, point: [f64; 3]) -> Result<[f64; 3], String> {
@@ -857,6 +945,19 @@ impl CommandState {
             }
             Some(Step::Grip(s)) => return s.prompt(),
             Some(Step::Draw { sketch, confirmed }) => {
+                if sketch.kind.is_ellipse() && !confirmed {
+                    return format!(
+                        "{}：{}；U 撤回取点，Esc 取消",
+                        sketch.kind.label(),
+                        match sketch.points.len() {
+                            0 => "指定中心；E 完整椭圆 / A 椭圆弧",
+                            1 => "指定长半轴端点",
+                            2 => "指定短半轴点或输入短半轴长度",
+                            3 => "指定起始方向点或输入起始参数角（0° 在长轴正向）",
+                            _ => "指定结束方向点或输入结束参数角，沿参数正向覆盖；同角为整椭圆",
+                        }
+                    );
+                }
                 if sketch.kind.is_arc() && !confirmed {
                     return format!(
                         "{}：{}；U 撤回取点，Esc 取消",
@@ -975,8 +1076,9 @@ impl CommandState {
         geometry: Geometry,
         kind: GripKind,
         target: Option<Point3>,
+        selected: &BTreeSet<u32>,
     ) -> Result<(), String> {
-        let session = grip::Session::new(id, geometry, kind, target, self.plane)?;
+        let session = grip::Session::new(id, geometry, kind, target, self.plane, selected)?;
         self.cancel();
         self.pointer_point = target.map(array);
         self.step = Some(Step::Grip(session));
@@ -996,6 +1098,13 @@ impl CommandState {
             None
         }
     }
+    pub fn grip_ids(&self) -> Option<&BTreeSet<u32>> {
+        if let Some(Step::Grip(s)) = &self.step {
+            Some(&s.ids)
+        } else {
+            None
+        }
+    }
     pub fn grip_option(&self, text: &str) -> bool {
         matches!(self.step, Some(Step::Grip(_))) && grip::Session::option(text)
     }
@@ -1009,7 +1118,7 @@ impl CommandState {
             None
         }
     }
-    fn point_plane(&self) -> WorkPlane {
+    pub fn point_plane(&self) -> WorkPlane {
         if let Some(Step::TransformPick(s)) = &self.step {
             return s.point_plane(&self.tools, self.plane);
         }
@@ -1081,6 +1190,7 @@ impl CommandState {
             SketchKind::ArcCenterEnd,
             SketchKind::ArcCenterAngle,
             SketchKind::Ellipse,
+            SketchKind::EllipseArc,
             SketchKind::Spline,
         ] {
             if name == kind.command()
@@ -1182,7 +1292,8 @@ impl CommandState {
             Some(Step::Paste { base, .. } | Step::ArraySpacing { base, .. }) => *base,
             Some(Step::Grip(s)) => array(s.reference()),
             Some(Step::Draw { sketch, .. })
-                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
+                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2
+                    || sketch.kind.is_ellipse() && sketch.points.len() >= 2 =>
             {
                 array(sketch.points[0])
             }
@@ -1210,7 +1321,8 @@ impl CommandState {
             }
             Some(Step::Grip(_)) => Some(as_point(self.reference())),
             Some(Step::Draw { sketch, .. })
-                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2 =>
+                if sketch.kind == SketchKind::ArcCenterEnd && sketch.points.len() == 2
+                    || sketch.kind.is_ellipse() && sketch.points.len() >= 2 =>
             {
                 Some(sketch.points[0])
             }
@@ -1539,8 +1651,20 @@ impl CommandState {
                 }));
             }
         }
+        let ellipse_point = self.ellipse_value_point(text);
         if let Some(Step::Draw { sketch, confirmed }) = &mut self.step {
             let upper = text.trim().to_uppercase();
+            if sketch.kind.is_ellipse() && matches!(upper.as_str(), "A" | "ARC" | "E" | "ELLIPSE") {
+                if sketch.points.len() >= 3 {
+                    return Err("请先用 U 撤回范围取点，再切换椭圆形式".into());
+                }
+                sketch.kind = if matches!(upper.as_str(), "A" | "ARC") {
+                    SketchKind::EllipseArc
+                } else {
+                    SketchKind::Ellipse
+                };
+                return Ok(None);
+            }
             if sketch.kind.is_arc()
                 && matches!(
                     upper.as_str(),
@@ -1647,11 +1771,14 @@ impl CommandState {
                     normal: sketch.plane.normal(),
                 }));
             }
+            if let Some(point) = ellipse_point {
+                self.accept_point(point?)?;
+                return self.finish_ready(selected);
+            }
             if !text.contains([',', ' ', '<'])
                 && !text.starts_with(['@', '#'])
-                && ((matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
-                    && sketch.points.len() >= 1)
-                    || (sketch.kind == SketchKind::Ellipse && sketch.points.len() >= 2))
+                && matches!(sketch.kind, SketchKind::Circle | SketchKind::CircleDiameter)
+                && !sketch.points.is_empty()
             {
                 let radius = number(text)?;
                 if radius <= 1e-9 {
@@ -1814,6 +1941,12 @@ impl CommandState {
                     next.points.pop();
                 }
                 next.push(as_point(point))?;
+                if next.kind.is_ellipse() && next.points.len() >= 3 {
+                    let ellipse = next.ellipse()?;
+                    if next.points.len() >= 4 {
+                        ellipse.parameter_at(next.points[3])?;
+                    }
+                }
                 let done = *confirmed
                     // Center/angle arcs wait for a separate scalar confirmation.
                     || !next.kind.continuous() && next.kind!=SketchKind::ArcCenterAngle && next.points.len() >= next.kind.required();
@@ -1916,7 +2049,7 @@ impl CommandState {
             .and_then(finite)
             .inspect(|point| self.pointer_point = Some(*point))
             .and_then(|point| self.constrained_point(dynamic, draft, point))
-            .and_then(|point| self.circle_value_point(draft).unwrap_or(Ok(point)))
+            .and_then(|point| self.circle_value_point(draft).or_else(|| self.ellipse_value_point(draft)).unwrap_or(Ok(point)))
             .and_then(|point| self.rectangle_target(point))
             .and_then(finite);
         match point {
@@ -1952,6 +2085,13 @@ impl CommandState {
         self.aids.clear();
         self.hover = None;
         self.pointer_point = None;
+    }
+    pub fn snap_point(&self) -> Option<Point3> {
+        if !self.takes_point() || !self.ray_error.is_empty() {
+            return None;
+        }
+        // Numeric constraints may move the target away from the geometric snap.
+        self.aids.snap_point(as_point(self.hover?))
     }
     pub fn cursor_coordinates(
         &self,
@@ -1990,6 +2130,9 @@ impl CommandState {
     }
 
     pub fn drawing_preview(&self) -> Vec<Vec<[f64; 3]>> {
+        if matches!(&self.step, Some(Step::Grip(s)) if s.move_preview(self.hover).is_some()) {
+            return Vec::new();
+        }
         if let Some(Step::CurvePick(s)) = &self.step {
             if let Some(edit) = s.preview() {
                 return edit
@@ -2068,6 +2211,18 @@ impl CommandState {
         if sketch.kind == SketchKind::ArcCenterAngle && sketch.sweep_degrees.is_none() {
             sketch.sweep_degrees = Some(90.);
         }
+        if sketch.kind == SketchKind::EllipseArc && sketch.points.len() >= 3 && sketch.points.len() < 5
+        {
+            if let Ok(mut ellipse) = sketch.ellipse() {
+                if sketch.points.len() == 4 {
+                    if let Ok(start) = ellipse.parameter_at(sketch.points[3]) {
+                        ellipse.start_parameter = start;
+                        ellipse.sweep_parameter = std::f64::consts::FRAC_PI_2;
+                    }
+                }
+                return super::display::tessellate_geometry(&Geometry::Ellipse(ellipse));
+            }
+        }
         match sketch.geometry() {
             Ok(geometry) => geometry
                 .iter()
@@ -2117,6 +2272,11 @@ impl CommandState {
         Vec::new()
     }
     pub fn transform_preview(&self) -> Option<(BTreeSet<u32>, Vec<AffineTransform>)> {
+        if let Some(Step::Grip(s)) = &self.step {
+            return s
+                .move_preview(self.hover)
+                .map(|(ids, transform)| (ids, vec![transform]));
+        }
         if let Some(Step::TransformPick(s)) = &self.step {
             let c = s.preview(&self.tools, self.plane, self.hover.map(as_point))?;
             return Some((c.ids, vec![c.transform]));
@@ -2371,7 +2531,6 @@ impl CommandState {
 
     pub fn draw_plane(&self, gizmos: &mut Gizmos, extent: f64, frame: super::cad_view::ViewFrame) {
         let plane = self.point_plane();
-        self.aids.draw(gizmos, frame, plane);
         let length = (extent * 0.2).clamp(5.0, 1000.0);
         let origin = frame.point(array(plane.origin));
         if !origin.is_finite() {

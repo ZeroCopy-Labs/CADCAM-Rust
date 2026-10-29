@@ -88,8 +88,8 @@ impl Workspace {
                     if command.active_grip().is_some() {
                         ui.separator();
                         for (option, label) in [
-                            ("S", "拉伸  S"),
-                            ("M", "移动整个对象  M"),
+                            ("S", "拉伸当前图元  S"),
+                            ("M", "移动选择集  M"),
                             ("C", "切换创建副本  C"),
                             ("B", "重新指定基点  B"),
                         ] {
@@ -138,6 +138,11 @@ impl Workspace {
                         }
                         if ui.button("撤回圆弧上一取点  U").clicked() {
                             action = Some("U".into());
+                        }
+                    }
+                    for &(option, label) in command.ellipse_options() {
+                        if ui.button(format!("{label}  {option}")).clicked() {
+                            action = Some(option.into());
                         }
                     }
                     if command.rectangle_drawing() {
@@ -473,6 +478,7 @@ const DRAW: &[(&str, &str)] = &[
     ("ARC", "圆弧"),
     ("RECTANGLE", "矩形"),
     ("ELLIPSE", "椭圆"),
+    ("ELLIPSEARC", "椭圆弧"),
     ("SPLINE", "样条曲线"),
     ("HOLE", "圆孔"),
     ("SLOT", "长圆孔"),
@@ -973,10 +979,11 @@ fn icon(painter: &egui::Painter, rect: egui::Rect, command: &str, color: egui::C
             painter.circle_stroke(rect.center(), 7., stroke);
             painter.circle_filled(rect.center(), 1.3, color);
         }
-        "ELLIPSE" => {
+        "ELLIPSE" | "ELLIPSEARC" => {
             let points = (0..=32)
                 .map(|i| {
-                    let t = i as f32 * std::f32::consts::TAU / 32.;
+                    let t = i as f32 * std::f32::consts::TAU / 32.
+                        * if command == "ELLIPSEARC" { 0.75 } else { 1.0 };
                     p(8.5 + 8. * t.cos(), 8.5 + 4.5 * t.sin())
                 })
                 .collect();

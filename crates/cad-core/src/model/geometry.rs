@@ -237,6 +237,37 @@ pub struct Ellipse {
     pub sweep_parameter: f64,
 }
 
+impl Ellipse {
+    pub fn is_full(&self) -> bool {
+        self.sweep_parameter >= std::f64::consts::TAU - 1e-10
+    }
+
+    pub fn point_at(&self, parameter: f64) -> Point3 {
+        let d = self.major_axis * parameter.cos() + self.minor_axis * parameter.sin();
+        Point3::new(self.center.x + d.x, self.center.y + d.y, self.center.z + d.z)
+    }
+
+    /// Parameter of the radial intersection with the supporting ellipse.
+    pub fn parameter_at(&self, point: Point3) -> Result<f64, String> {
+        let a = self.major_axis.length();
+        let b = self.minor_axis.length();
+        if a <= GEOMETRY_EPSILON || b <= GEOMETRY_EPSILON {
+            return Err("椭圆半轴必须大于零".into());
+        }
+        let d = Vector3::new(
+            point.x - self.center.x,
+            point.y - self.center.y,
+            point.z - self.center.z,
+        );
+        let x = d.dot(self.major_axis) / (a * a);
+        let y = d.dot(self.minor_axis) / (b * b);
+        if !x.is_finite() || !y.is_finite() || x.hypot(y) <= 1e-12 {
+            return Err("请指定椭圆中心以外的有效方向点".into());
+        }
+        Ok(y.atan2(x).rem_euclid(std::f64::consts::TAU))
+    }
+}
+
 /// A NURBS spline.
 ///
 /// The knot vector, control points, weights and flags are preserved as-is from
