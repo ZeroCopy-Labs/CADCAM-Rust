@@ -45,6 +45,7 @@ mod cad_view;
 mod cad_workspace;
 mod cam;
 mod cam_analysis;
+mod cam_fly;
 mod cam_sync;
 mod cam_trajectory;
 mod cam_transfer;
@@ -1120,6 +1121,30 @@ fn draw_scene(
         state
             .cad_command
             .draw_plane(&mut gizmos, extent as f64, state.view);
+    }
+    if space.mode == SpaceMode::Cam {
+        let current = state
+            .derived
+            .trajectory_current()
+            .then_some(state.derived.inputs);
+        let center = state
+            .analysis
+            .tube_section
+            .as_ref()
+            .map(|s| [s.center_y, s.center_z]);
+        let ViewerState {
+            trajectory_view,
+            trajectory,
+            view,
+            ..
+        } = &mut *state;
+        trajectory_view.draw_overlay(
+            &mut selected_gizmos,
+            *view,
+            trajectory.as_ref(),
+            current,
+            center,
+        );
     }
     let axis = extent * 0.6;
     let z_axis = axis * 0.5;
@@ -2346,6 +2371,7 @@ fn cam_analysis_ui(
                     .default_open(false)
                     .show(ui, |ui| {
                         ui.label(format!("加工单元：{}", trajectory.unit_count));
+                        ui.label(format!("飞扫孔：{} · 飞扫加工段：{}", trajectory.fly_unit_count, trajectory.fly_pass_count));
                         ui.label(format!("运动段：{}", trajectory.moves.len()));
                         ui.label(format!("切削段：{}", trajectory.cutting_move_count));
                         ui.label(format!("旋转安全 Z：{:.3}", trajectory.safe_z));
@@ -3459,7 +3485,28 @@ fn drawing_ui(
     } else {
         state.cad_workspace.drafting_menu_open = false;
         state.cad_workspace.coordinate_rect = None;
-        None
+        let current = state
+            .derived
+            .trajectory_current()
+            .then_some(state.derived.inputs);
+        let mut rebuild = false;
+        let rect = egui::Panel::bottom("cam_trajectory_bar")
+            .resizable(false)
+            .default_size(90.0)
+            .show(&mut root, |ui| {
+                let ViewerState {
+                    trajectory_view,
+                    trajectory,
+                    ..
+                } = &mut *state;
+                rebuild = trajectory_view.controls(ui, trajectory.as_ref(), current);
+            })
+            .response
+            .rect;
+        if rebuild {
+            rebuild_state_trajectory(&mut state);
+        }
+        Some(rect)
     };
     let command_dimensions = state.command_open.then(|| {
         let history_lines = if state.cad_workspace.history {
@@ -5386,6 +5433,37 @@ fn gcode_safety_tab(ui: &mut egui::Ui, state: &mut ViewerState) {
                         );
                     });
                 transfer_settings_ui(ui, &mut profile.transfer);
+                ui.separator();
+                ui.checkbox(&mut profile.fly.enabled, "启用沿 X 往返飞扫")
+                    .on_hover_text(
+                        "同区位成排闭合孔，去程切一侧、返程切另一侧；断面、跨区位及非单向轮廓沿用普通加工",
+                    );
+                egui::Grid::new("gcode_fly_options")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        gcode_number_row(
+                            ui,
+                            "孔列对齐容差",
+                            &mut profile.fly.row_tolerance,
+                            0.1,
+                            "同排孔横向中心允许的差值，单位 mm",
+                        );
+                        gcode_number_row(
+                            ui,
+                            "最大孔间距",
+                            &mut profile.fly.max_gap,
+                            1.0,
+                            "超过此 X 间距分为不同飞扫批次，单位 mm",
+                        );
+                        gcode_number_row(
+                            ui,
+                            "关光连接公差",
+                            &mut profile.fly.link_tolerance,
+                            0.01,
+                            "孔间切向连接在工件坐标中的离散弦差，单位 mm",
+                        );
+                    });
+                ui.small("孔间关光，以切削运动代码输出离散线段；开关光复用单元开始/结束。实际连续运动取决于控制器和所配指令，进给由自定义代码设置。配置过切时沿用普通加工。");
                 ui.separator();
                 ui.checkbox(&mut profile.use_initial_position, "启用初始机床位置")
                     .on_hover_text("从下方配置的机床位置经安全净空进入第一个加工单元");

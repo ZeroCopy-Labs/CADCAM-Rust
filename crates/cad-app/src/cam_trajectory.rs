@@ -5,7 +5,7 @@
 //! validated machine post-processor.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cam::CamModel;
 use crate::cam_analysis::{
@@ -95,6 +95,7 @@ pub struct RotaryConfig {
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub transfer: TransferConfig,
+    pub fly: crate::cam_fly::FlyConfig,
     pub initial_position: Option<MachinePose>,
     pub return_position: Option<MachinePose>,
     pub overcut_distance: f64,
@@ -112,6 +113,7 @@ impl Default for RotaryConfig {
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             transfer: TransferConfig::default(),
+            fly: crate::cam_fly::FlyConfig::default(),
             initial_position: None,
             return_position: None,
             overcut_distance: 0.0,
@@ -139,6 +141,8 @@ pub enum ArcPlane {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MachineMoveKind {
     Rapid,
+    /// Laser-off motion at the configured cutting feed, used between fly passes.
+    FlyTransfer,
     Cutting,
     Arc {
         clockwise: bool,
@@ -182,6 +186,8 @@ pub struct MachineTrajectory {
     pub cutting_move_count: usize,
     pub safe_z: f64,
     pub unit_count: usize,
+    pub fly_unit_count: usize,
+    pub fly_pass_count: usize,
     pub a_min: f64,
     pub a_max: f64,
 }
@@ -193,6 +199,12 @@ pub fn build_trajectory(
     analysis: &CamAnalysis,
     config: RotaryConfig,
 ) -> MachineTrajectory {
+    if let Some(error) = config.fly.validation_error() {
+        return MachineTrajectory {
+            error: Some(error.into()),
+            ..Default::default()
+        };
+    }
     if let Some(error) = analysis.grouping_errors.first() {
         return MachineTrajectory {
             error: Some(error.clone()),
@@ -268,12 +280,18 @@ pub fn build_trajectory(
     let mut unit_ranges = Vec::new();
     let mut unit_rules = Vec::new();
     let mut unit_count = 0usize;
+    let mut processed = BTreeSet::new();
+    let mut fly_units = BTreeSet::new();
+    let mut fly_pass_count = 0;
     let mut previous_end = config.initial_position;
     let mut previous_surface: Option<TubeZone> = None;
     let mut corrected_sections = BTreeMap::new();
 
     for group in &analysis.plan.groups {
-        for unit in &group.units {
+        for operation in
+            crate::cam_fly::operations(group, display, cam, config.fly, config.overcut_distance)
+        {
+            let unit = &operation.unit;
             let side = analysis.end_cut_side(unit.unit_id);
             let wall_cut = config.end_cut_correction && side != EndCutSide::Section;
             if config.end_cut_correction
@@ -289,22 +307,25 @@ pub fn build_trajectory(
                     ..Default::default()
                 };
             }
-            let Some(mut path) = oriented_unit_path_from(
-                display,
-                cam,
-                unit.unit_id,
-                unit.direction,
-                Some(unit.start_point),
-            ) else {
+            let Some(mut path) = operation.path.or_else(|| {
+                oriented_unit_path_from(
+                    display,
+                    cam,
+                    unit.unit_id,
+                    unit.direction,
+                    Some(unit.start_point),
+                )
+            }) else {
                 continue;
             };
             if path.len() < 2 {
                 continue;
             }
-            let closed = cam
-                .unit(unit.unit_id)
-                .map(|machining_unit| machining_unit.closed)
-                .unwrap_or(false);
+            let closed = !operation.flying
+                && cam
+                    .unit(unit.unit_id)
+                    .map(|machining_unit| machining_unit.closed)
+                    .unwrap_or(false);
             if closed {
                 // Close the path if the source tessellation omitted the final
                 // coincident point.
@@ -362,7 +383,11 @@ pub fn build_trajectory(
             for (point, (raw_angle, mode)) in path.iter().zip(point_poses.iter()) {
                 let angle = wrap_angle_180(*raw_angle + wrap_angle_180(config.a_offset_degrees));
                 let aligned = if poses.is_empty() {
-                    align_entry_angle(previous_a, angle, config.keep_continuous_angle)
+                    if operation.gap_points > 0 {
+                        unwrap_angle(previous_a, angle)
+                    } else {
+                        align_entry_angle(previous_a, angle, config.keep_continuous_angle)
+                    }
                 } else {
                     unwrap_angle(previous_a, angle)
                 };
@@ -493,15 +518,17 @@ pub fn build_trajectory(
                 None
             };
             let local = surface.is_some() && surface == previous_surface;
-            moves.extend(transfer_moves(
-                previous_end,
-                first,
-                safe_z,
-                local,
-                config.transfer,
-                config.same_zone_clearance,
-                config.output_decimals,
-            ));
+            if operation.gap_points == 0 {
+                moves.extend(transfer_moves(
+                    previous_end,
+                    first,
+                    safe_z,
+                    local,
+                    config.transfer,
+                    config.same_zone_clearance,
+                    config.output_decimals,
+                ));
+            }
             if let Some(arc) = arc_cut_info(
                 display,
                 cam,
@@ -510,7 +537,9 @@ pub fn build_trajectory(
                 center_y,
                 center_z,
                 config.machining_z_offset,
-            ) {
+            )
+            .filter(|_| !operation.flying)
+            {
                 if arc.full_circle && poses.len() >= 4 {
                     let mid = poses[arc.mid_index];
                     moves.push(MachineMove {
@@ -560,9 +589,13 @@ pub fn build_trajectory(
                     }
                 }
             } else {
-                for pose in poses.iter().skip(1) {
+                for (i, pose) in poses.iter().enumerate().skip(1) {
                     moves.push(MachineMove {
-                        kind: MachineMoveKind::Cutting,
+                        kind: if i < operation.gap_points {
+                            MachineMoveKind::FlyTransfer
+                        } else {
+                            MachineMoveKind::Cutting
+                        },
                         pose: *pose,
                     });
                 }
@@ -575,7 +608,13 @@ pub fn build_trajectory(
             unit_rules.push(unit_rule_keys(display, cam, unit));
             previous_end = moves.last().map(|movement| movement.pose);
             previous_surface = surface;
-            unit_count += 1;
+            if processed.insert(unit.unit_id) {
+                unit_count += 1;
+            }
+            if operation.flying {
+                fly_units.insert(unit.unit_id);
+                fly_pass_count += 1;
+            }
         }
     }
 
@@ -642,6 +681,8 @@ pub fn build_trajectory(
         cutting_move_count,
         safe_z,
         unit_count,
+        fly_unit_count: fly_units.len(),
+        fly_pass_count,
         a_min: if a_min.is_finite() { a_min } else { 0.0 },
         a_max: if a_max.is_finite() { a_max } else { 0.0 },
     }
@@ -1070,6 +1111,8 @@ fn build_without_tube_section(
         cutting_move_count,
         safe_z,
         unit_count,
+        fly_unit_count: 0,
+        fly_pass_count: 0,
         a_min: if a_min.is_finite() { a_min } else { 0.0 },
         a_max: if a_max.is_finite() { a_max } else { 0.0 },
     }

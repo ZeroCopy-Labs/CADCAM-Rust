@@ -43,6 +43,7 @@ pub struct GCodeProfile {
     pub rotation_safety_clearance: f64,
     pub same_zone_clearance: f64,
     pub transfer: crate::cam_trajectory::TransferConfig,
+    pub fly: crate::cam_fly::FlyConfig,
     pub arc_output: bool,
     pub keep_continuous_angle: bool,
     pub use_initial_position: bool,
@@ -91,6 +92,7 @@ impl Default for GCodeProfile {
             rotation_safety_clearance: 5.0,
             same_zone_clearance: 0.0,
             transfer: crate::cam_trajectory::TransferConfig::default(),
+            fly: crate::cam_fly::FlyConfig::default(),
             arc_output: true,
             keep_continuous_angle: true,
             use_initial_position: false,
@@ -112,6 +114,7 @@ impl GCodeProfile {
             .wall_validation_error()
             .or_else(|| self.a_validation_error())
             .or_else(|| self.transfer.validation_error())
+            .or_else(|| self.fly.validation_error())
             .or_else(|| self.smoothing_validation_error())
         {
             return Some(error);
@@ -186,6 +189,7 @@ impl GCodeProfile {
             rotation_safety_clearance: self.rotation_safety_clearance,
             same_zone_clearance: self.same_zone_clearance,
             transfer: self.transfer,
+            fly: self.fly,
             initial_position: self.use_initial_position.then_some(MachinePose {
                 x: self.initial_x,
                 y: self.initial_y,
@@ -419,6 +423,7 @@ fn push_movement(
 ) {
     match movement.kind {
         MachineMoveKind::Rapid => lines.push(rapid_line(movement, profile)),
+        MachineMoveKind::FlyTransfer => lines.push(cutting_line(movement, profile)),
         MachineMoveKind::Cutting => lines.push(cutting_line(movement, profile)),
         MachineMoveKind::Arc {
             clockwise,
@@ -663,6 +668,8 @@ mod tests {
             cutting_move_count: 1,
             safe_z: 10.0,
             unit_count: 1,
+            fly_unit_count: 0,
+            fly_pass_count: 0,
             a_min: 0.0,
             a_max: 0.0,
         };
